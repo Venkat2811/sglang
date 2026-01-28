@@ -8,6 +8,12 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputChecker,
     DispatchOutputFormat,
 )
+from sglang.srt.layers.moe.token_dispatcher.broker import (
+    BrokerDispatcher,
+    BrokerDispatcherConfig,
+    BrokerDispatchOutput,
+    BrokerCombineInput,
+)
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPConfig,
     DeepEPDispatcher,
@@ -35,6 +41,10 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
 __all__ = [
     "BaseDispatcher",
     "BaseDispatcherConfig",
+    "BrokerDispatcher",
+    "BrokerDispatcherConfig",
+    "BrokerDispatchOutput",
+    "BrokerCombineInput",
     "CombineInput",
     "CombineInputChecker",
     "CombineInputFormat",
