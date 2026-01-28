@@ -76,6 +76,35 @@ class P2PWork:
     payload: Optional[torch.Tensor]
 
 
+@dataclass
+class RecvState:
+    """State for an async recv_object operation.
+    
+    Used for non-blocking recv with polling to reduce PP bubble time.
+    """
+    phase: str  # "size" | "data" | "complete"
+    src: int  # Source rank (local rank in group)
+    size_tensor: Optional[torch.Tensor] = None
+    size_work: Optional[torch.distributed.Work] = None
+    data_tensor: Optional[torch.Tensor] = None
+    data_work: Optional[torch.distributed.Work] = None
+    result: Optional[Any] = None
+
+
+@dataclass
+class TensorRecvState:
+    """State for async tensor dict recv.
+    
+    Used for non-blocking recv_tensor_dict with polling.
+    """
+    metadata_state: RecvState
+    src: int
+    phase: str  # "metadata" | "tensors" | "complete"
+    all_gather_group: Optional["GroupCoordinator"] = None
+    tensor_works: Optional[List[Tuple[str, torch.Tensor, torch.distributed.Work, Any, bool]]] = None
+    tensor_dict: Optional[Dict[str, Any]] = None
+
+
 def _split_tensor_dict(
     tensor_dict: Dict[str, Union[torch.Tensor, Any]]
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
@@ -994,6 +1023,10 @@ class GroupCoordinator:
 
         NOTE: `dst` is the local rank of the destination rank.
         """
+        import time
+
+        _pp_debug = envs.SGLANG_PP_DEBUG.get()
+        _rank = self.rank_in_group
 
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
         assert dst != self.rank_in_group, (
@@ -1003,26 +1036,42 @@ class GroupCoordinator:
         send_func = torch.distributed.isend if async_send else torch.distributed.send
 
         # Serialize object to tensor and get the size as well
+        if _pp_debug:
+            _t0 = time.perf_counter()
         object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+        if _pp_debug:
+            _t1 = time.perf_counter()
+            print(f"[PP SEND_OBJ R{_rank}] pickle.dumps time={(_t1-_t0)*1e6:.1f}us size={object_tensor.numel()}bytes dst={dst}")
         size_tensor = torch.tensor(
             [object_tensor.numel()], dtype=torch.long, device="cpu"
         )
 
         # Send object size
         p2p_work = []
+        if _pp_debug:
+            _t2 = time.perf_counter()
         size_work = send_func(
             size_tensor,
             self.ranks[dst],
             group=self.cpu_group,
         )
+        if _pp_debug:
+            _t3 = time.perf_counter()
+            print(f"[PP SEND_OBJ R{_rank}] send size_tensor time={(_t3-_t2)*1e6:.1f}us")
         if async_send:
             p2p_work.append(P2PWork(size_work, size_tensor))
 
+        if _pp_debug:
+            _t4 = time.perf_counter()
         object_work = send_func(
             object_tensor,
             self.ranks[dst],
             group=self.cpu_group,
         )
+        if _pp_debug:
+            _t5 = time.perf_counter()
+            print(f"[PP SEND_OBJ R{_rank}] send object_tensor time={(_t5-_t4)*1e6:.1f}us")
+            print(f"[PP SEND R{_rank}] send_object (metadata) time={(_t5-_t0)*1e6:.1f}us dst={dst}")
         if async_send:
             p2p_work.append(P2PWork(object_work, object_tensor))
 
@@ -1034,6 +1083,10 @@ class GroupCoordinator:
     ) -> Any:
         """Receive the input object list from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
+        import time
+
+        _pp_debug = envs.SGLANG_PP_DEBUG.get()
+        _rank = self.rank_in_group
 
         assert src < self.world_size, f"Invalid src rank ({src})"
         assert (
@@ -1044,10 +1097,15 @@ class GroupCoordinator:
 
         # Receive object size
         # We have to use irecv here to make it work for both isend and send.
+        if _pp_debug:
+            _t0 = time.perf_counter()
         work = torch.distributed.irecv(
             size_tensor, src=self.ranks[src], group=self.cpu_group
         )
         work.wait()
+        if _pp_debug:
+            _t1 = time.perf_counter()
+            print(f"[PP RECV_OBJ R{_rank}] recv size_tensor time={(_t1-_t0)*1e6:.1f}us src={src}")
 
         # Tensor to receive serialized objects into.
         object_tensor: Any = torch.empty(  # type: ignore[call-overload]
@@ -1056,13 +1114,95 @@ class GroupCoordinator:
             device="cpu",
         )
 
+        if _pp_debug:
+            _t2 = time.perf_counter()
         work = torch.distributed.irecv(
             object_tensor, src=self.ranks[src], group=self.cpu_group
         )
         work.wait()
+        if _pp_debug:
+            _t3 = time.perf_counter()
+            print(f"[PP RECV_OBJ R{_rank}] recv object_tensor time={(_t3-_t2)*1e6:.1f}us size={size_tensor.item()}bytes")
 
+        if _pp_debug:
+            _t4 = time.perf_counter()
         obj = pickle.loads(object_tensor.numpy())
+        if _pp_debug:
+            _t5 = time.perf_counter()
+            print(f"[PP RECV_OBJ R{_rank}] pickle.loads time={(_t5-_t4)*1e6:.1f}us")
+            print(f"[PP RECV R{_rank}] recv_object (metadata) time={(_t5-_t0)*1e6:.1f}us src={src}")
         return obj
+
+    def recv_object_start(
+        self,
+        src: int,
+    ) -> RecvState:
+        """Start an async recv_object operation. Returns state for polling.
+        
+        This is used for non-blocking recv to reduce PP bubble time.
+        Call recv_object_poll() to check completion, or recv_object_wait() to block.
+        
+        NOTE: `src` is the local rank of the source rank.
+        """
+        assert src < self.world_size, f"Invalid src rank ({src})"
+        assert (
+            src != self.rank_in_group
+        ), "Invalid source rank. Source rank is the same as the current rank."
+
+        size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
+        work = torch.distributed.irecv(
+            size_tensor, src=self.ranks[src], group=self.cpu_group
+        )
+
+        return RecvState(
+            phase="size",
+            src=src,
+            size_tensor=size_tensor,
+            size_work=work,
+        )
+
+    def recv_object_poll(self, state: RecvState) -> Tuple[bool, Optional[Any]]:
+        """Poll recv_object operation. Returns (is_complete, result).
+        
+        Non-blocking check for recv completion. Allows CPU to do other work
+        while waiting for data from previous PP stage.
+        """
+        if state.phase == "size":
+            if state.size_work.is_completed():
+                # Size received, start data phase
+                object_tensor = torch.empty(
+                    state.size_tensor.item(),
+                    dtype=torch.uint8,
+                    device="cpu",
+                )
+                work = torch.distributed.irecv(
+                    object_tensor, src=self.ranks[state.src], group=self.cpu_group
+                )
+                state.phase = "data"
+                state.data_tensor = object_tensor
+                state.data_work = work
+            else:
+                return False, None
+
+        if state.phase == "data":
+            if state.data_work.is_completed():
+                state.result = pickle.loads(state.data_tensor.numpy())
+                state.phase = "complete"
+                return True, state.result
+            else:
+                return False, None
+
+        if state.phase == "complete":
+            return True, state.result
+
+        return False, None
+
+    def recv_object_wait(self, state: RecvState) -> Any:
+        """Block until recv_object completes. Fallback for compatibility."""
+        while True:
+            is_complete, result = self.recv_object_poll(state)
+            if is_complete:
+                return result
 
     def broadcast_tensor_dict(
         self,
@@ -1260,6 +1400,127 @@ class GroupCoordinator:
             else:
                 tensor_dict[key] = value
         return tensor_dict
+
+    def recv_tensor_dict_start(
+        self,
+        src: Optional[int] = None,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+    ) -> Optional[TensorRecvState]:
+        """Start async tensor dict recv. Returns state for polling.
+        
+        This is used for non-blocking recv to reduce PP bubble time.
+        Call recv_tensor_dict_poll() to check completion.
+        
+        NOTE: `src` is the local rank of the source rank.
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return None
+
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        # Start metadata recv
+        metadata_state = self.recv_object_start(src)
+
+        return TensorRecvState(
+            metadata_state=metadata_state,
+            src=src,
+            phase="metadata",
+            all_gather_group=all_gather_group,
+            tensor_works=[],
+            tensor_dict={},
+        )
+
+    def recv_tensor_dict_poll(
+        self,
+        state: TensorRecvState,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """Poll tensor dict recv. Returns (is_complete, result).
+        
+        Non-blocking check for recv completion. Allows CPU to do other work
+        while waiting for data from previous PP stage.
+        """
+        if state is None:
+            return True, None
+
+        all_gather_group = state.all_gather_group
+        all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
+        all_gather_rank = (
+            0 if all_gather_group is None else all_gather_group.rank_in_group
+        )
+
+        group = self.device_group
+        metadata_group = self.cpu_group
+
+        if state.phase == "metadata":
+            is_complete, metadata = self.recv_object_poll(state.metadata_state)
+            if not is_complete:
+                return False, None
+
+            # Metadata received, start all tensor recvs
+            for key, value in metadata:
+                if isinstance(value, TensorMetadata):
+                    tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                    if tensor.numel() == 0:
+                        # Skip empty tensors
+                        state.tensor_dict[key] = tensor
+                        continue
+
+                    # send-allgather: send only a slice, then do allgather.
+                    use_all_gather = (
+                        all_gather_group is not None
+                        and tensor.numel() % all_gather_size == 0
+                    )
+
+                    orig_shape = None
+                    if use_all_gather:
+                        orig_shape = tensor.shape
+                        tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+
+                    comm_group = metadata_group if tensor.is_cpu else group
+                    work = torch.distributed.irecv(
+                        tensor, src=self.ranks[state.src], group=comm_group
+                    )
+                    state.tensor_works.append((key, tensor, work, orig_shape, use_all_gather))
+                else:
+                    state.tensor_dict[key] = value
+
+            state.phase = "tensors"
+
+        if state.phase == "tensors":
+            # Check if all tensor recvs are complete
+            all_complete = all(w.is_completed() for _, _, w, _, _ in state.tensor_works)
+            if not all_complete:
+                return False, None
+
+            # Finalize tensors (allgather if needed)
+            for key, tensor, work, orig_shape, use_all_gather in state.tensor_works:
+                if use_all_gather:
+                    tensor = all_gather_group.all_gather(tensor, dim=0)
+                    tensor = tensor.reshape(orig_shape)
+                state.tensor_dict[key] = tensor
+
+            state.phase = "complete"
+            return True, state.tensor_dict
+
+        if state.phase == "complete":
+            return True, state.tensor_dict
+
+        return False, None
+
+    def recv_tensor_dict_wait(
+        self,
+        state: TensorRecvState,
+    ) -> Optional[Dict[str, Any]]:
+        """Block until recv_tensor_dict completes. Fallback for compatibility."""
+        if state is None:
+            return None
+        while True:
+            is_complete, result = self.recv_tensor_dict_poll(state)
+            if is_complete:
+                return result
 
     def barrier(self):
         """Barrier synchronization among the group.

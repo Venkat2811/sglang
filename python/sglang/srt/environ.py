@@ -235,6 +235,10 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
 
+    # Scheduler: Pipeline Parallelism (PP)
+    SGLANG_PP_NONBLOCKING_RECV = EnvBool(False)  # Enable non-blocking recv + poll for PP
+    SGLANG_PP_DEBUG = EnvBool(False)  # Enable PP debug timing logs
+
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)

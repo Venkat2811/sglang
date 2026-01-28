@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode, poll_and_all_reduce
-from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.distributed.parallel_state import P2PWork, TensorRecvState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -76,6 +76,23 @@ class SchedulerPPMixin:
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
+
+                # Non-blocking recv is DISABLED for now.
+                # 
+                # The PP event loop has TWO recv operations:
+                # 1. _pp_recv_proxy_tensors() - hidden states from prev stage
+                # 2. _pp_recv_dict_from_prev_stage() - output tensors
+                #
+                # Making only #1 non-blocking causes race conditions because
+                # the irecv operations for #1 consume data meant for #2.
+                # 
+                # To properly implement non-blocking recv, ALL recv operations
+                # in the PP loop must be converted to use the async infrastructure.
+                #
+                # For now, use --pp-async-batch-depth 2 which provides 12% improvement
+                # for single-user workloads by overlapping at the microbatch level.
+                use_nonblocking_recv = False  # DISABLED - needs full loop refactor
+
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.recv_requests()
                     self.process_input_requests(recv_reqs)
@@ -90,9 +107,19 @@ class SchedulerPPMixin:
                     self.mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                pp_proxy_tensors = None
                 if self.cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    if use_nonblocking_recv:
+                        # Non-blocking path: start recv early, poll/wait later
+                        self._pp_start_proxy_recv(mb_id)
+                        # Try polling first, fallback to blocking wait
+                        is_ready, pp_proxy_tensors = self._pp_poll_proxy_recv(mb_id)
+                        if not is_ready:
+                            pp_proxy_tensors = self._pp_wait_proxy_recv(mb_id)
+                    else:
+                        # Original blocking path
+                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -530,6 +557,11 @@ class SchedulerPPMixin:
         self.send_output_work = []
         self.launch_event = None
 
+        # Non-blocking recv state tracking (for SGLANG_PP_NONBLOCKING_RECV)
+        self.pending_proxy_recv: Dict[int, TensorRecvState] = {}
+        self.pp_nonblocking_recv_enabled = envs.SGLANG_PP_NONBLOCKING_RECV.get()
+        self.pp_debug = envs.SGLANG_PP_DEBUG.get()
+
     def profile_and_init_predictor(self: Scheduler):
         """
         Profile prefill latency for dynamic chunk sizing.
@@ -937,6 +969,60 @@ class SchedulerPPMixin:
                 )
             )
         return pp_proxy_tensors
+
+    def _pp_start_proxy_recv(self: Scheduler, mb_id: int) -> None:
+        """Start async recv for proxy tensors (non-blocking).
+        
+        Called early in the loop to initiate recv while CPU can do other work.
+        """
+        if self.pp_group.is_first_rank:
+            return
+        if mb_id in self.pending_proxy_recv:
+            return  # Already started
+
+        state = self.pp_group.recv_tensor_dict_start(
+            all_gather_group=(
+                self.attn_tp_group if self.require_attn_tp_allgather else None
+            )
+        )
+        if state is not None:
+            self.pending_proxy_recv[mb_id] = state
+
+    def _pp_poll_proxy_recv(
+        self: Scheduler, mb_id: int
+    ) -> Tuple[bool, Optional[PPProxyTensors]]:
+        """Poll for proxy tensor recv completion.
+        
+        Returns (is_complete, result). If not complete, returns (False, None).
+        """
+        if self.pp_group.is_first_rank:
+            return True, None
+
+        if mb_id not in self.pending_proxy_recv:
+            return False, None
+
+        state = self.pending_proxy_recv[mb_id]
+        is_complete, tensor_dict = self.pp_group.recv_tensor_dict_poll(state)
+
+        if is_complete:
+            del self.pending_proxy_recv[mb_id]
+            return True, PPProxyTensors(tensor_dict) if tensor_dict else None
+
+        return False, None
+
+    def _pp_wait_proxy_recv(self: Scheduler, mb_id: int) -> Optional[PPProxyTensors]:
+        """Block until proxy recv completes (fallback)."""
+        if self.pp_group.is_first_rank:
+            return None
+
+        if mb_id not in self.pending_proxy_recv:
+            # Not started yet, do blocking recv
+            return self._pp_recv_proxy_tensors()
+
+        state = self.pending_proxy_recv[mb_id]
+        result = self.pp_group.recv_tensor_dict_wait(state)
+        del self.pending_proxy_recv[mb_id]
+        return PPProxyTensors(result) if result else None
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
