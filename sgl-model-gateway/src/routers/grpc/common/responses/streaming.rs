@@ -367,7 +367,11 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub fn emit_completed(&mut self, usage: Option<&serde_json::Value>) -> serde_json::Value {
+    pub fn emit_completed_with_status(
+        &mut self,
+        status: ResponseStatus,
+        usage: Option<&serde_json::Value>,
+    ) -> serde_json::Value {
         // Build output array from tracked items
         let output: Vec<serde_json::Value> = self
             .output_items
@@ -401,7 +405,7 @@ impl ResponseStreamEventEmitter {
             "id": self.response_id,
             "object": "response",
             "created_at": self.created_at,
-            "status": "completed",
+            "status": status,
             "model": self.model,
             "output": output
         });
@@ -449,6 +453,10 @@ impl ResponseStreamEventEmitter {
             "sequence_number": self.next_sequence(),
             "response": response_obj
         })
+    }
+
+    pub fn emit_completed(&mut self, usage: Option<&serde_json::Value>) -> serde_json::Value {
+        self.emit_completed_with_status(ResponseStatus::Completed, usage)
     }
 
     /// Helper to add optional fields to JSON object
@@ -699,7 +707,11 @@ impl ResponseStreamEventEmitter {
     ///
     /// This constructs the final ResponsesResponse from all accumulated output items
     /// for persistence. Should be called after streaming is complete.
-    pub fn finalize(&self, usage: Option<Usage>) -> ResponsesResponse {
+    pub fn finalize_with_status(
+        &self,
+        usage: Option<Usage>,
+        status: ResponseStatus,
+    ) -> ResponsesResponse {
         // Build output array from tracked items
         let output: Vec<ResponseOutputItem> = self
             .output_items
@@ -729,11 +741,15 @@ impl ResponseStreamEventEmitter {
         // Build response using builder
         ResponsesResponse::builder(&self.response_id, &self.model)
             .created_at(self.created_at as i64)
-            .status(ResponseStatus::Completed)
+            .status(status)
             .output(output)
             .maybe_copy_from_request(self.original_request.as_ref())
             .maybe_usage(responses_usage)
             .build()
+    }
+
+    pub fn finalize(&self, usage: Option<Usage>) -> ResponsesResponse {
+        self.finalize_with_status(usage, ResponseStatus::Completed)
     }
 
     /// Emit reasoning item wrapper events (added + done)

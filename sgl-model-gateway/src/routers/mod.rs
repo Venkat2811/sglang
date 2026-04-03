@@ -32,6 +32,7 @@ pub mod mesh;
 pub mod openai;
 pub mod parse;
 pub mod persistence_utils;
+pub mod responses_validation;
 pub mod router_manager;
 pub mod tokenize;
 pub mod ws_responses;

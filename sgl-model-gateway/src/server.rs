@@ -47,7 +47,7 @@ use crate::{
         generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::{RerankRequest, V1RerankReqInput},
-        responses::{ResponsesGetParams, ResponsesRequest},
+        responses::ResponsesGetParams,
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
@@ -60,6 +60,7 @@ use crate::{
             get_worker_states, set_global_rate_limit, trigger_graceful_shutdown, update_app_config,
         },
         parse,
+        responses_validation::ValidatedResponsesJson,
         router_manager::RouterManager,
         tokenize, RouterTrait,
     },
@@ -229,7 +230,7 @@ async fn v1_rerank(
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ResponsesRequest>,
+    ValidatedResponsesJson(body): ValidatedResponsesJson,
 ) -> Response {
     state
         .router
