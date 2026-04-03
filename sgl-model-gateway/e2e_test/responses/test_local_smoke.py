@@ -64,6 +64,19 @@ def _response_output_text(completed_event: dict) -> str:
     return ""
 
 
+def _collect_http_event_types(client, model: str) -> list[str]:
+    """Collect the logical event sequence from the HTTP streaming Responses path."""
+    response = client.responses.create(
+        model=model,
+        input="Reply with the single word: hello",
+        stream=True,
+        temperature=0,
+        max_output_tokens=16,
+        store=False,
+    )
+    return [event.type for event in response]
+
+
 @pytest.mark.e2e
 @pytest.mark.model("qwen-0.5b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
@@ -124,3 +137,17 @@ class TestResponsesLocalSmoke:
         assert completed["response"]["status"] == "completed"
         assert len(completed["response"]["output"]) > 0
         assert _response_output_text(completed).strip()
+
+    def test_http_ws_event_type_parity(self, setup_backend):
+        """HTTP SSE and WS should expose the same logical event sequence locally."""
+        _, model, client, gateway = setup_backend
+
+        http_event_types = _collect_http_event_types(client, model)
+        ws_event_types = [
+            event["type"]
+            for event in asyncio.run(
+                _collect_ws_events(_gateway_ws_url(gateway.base_url), model)
+            )
+        ]
+
+        assert ws_event_types == http_event_types
