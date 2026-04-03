@@ -16,7 +16,10 @@ use smg::{
     },
     routers::{
         router_manager::{router_ids, RouterManager},
-        ws_responses::{serve_responses_ws, CachedWsResponse, WsClientError, WsResponsesExecutor},
+        ws_responses::{
+            serve_responses_ws_with_config, CachedWsResponse, WsClientError, WsResponsesExecutor,
+            WsRuntimeConfig,
+        },
         RouterTrait,
     },
 };
@@ -122,6 +125,7 @@ impl WsResponsesExecutor for StubWsExecutor {
 #[derive(Clone)]
 struct StubWsRouter {
     executor: Arc<dyn WsResponsesExecutor>,
+    runtime_config: WsRuntimeConfig,
 }
 
 impl fmt::Debug for StubWsRouter {
@@ -150,7 +154,13 @@ impl RouterTrait for StubWsRouter {
     }
 
     async fn route_responses_ws(&self, headers: HeaderMap, socket: WebSocket) {
-        serve_responses_ws(socket, headers, self.executor.clone()).await;
+        serve_responses_ws_with_config(
+            socket,
+            headers,
+            self.executor.clone(),
+            self.runtime_config.clone(),
+        )
+        .await;
     }
 
     fn router_type(&self) -> &'static str {
@@ -159,8 +169,18 @@ impl RouterTrait for StubWsRouter {
 }
 
 async fn build_stub_app(executor: Arc<dyn WsResponsesExecutor>) -> axum::Router {
+    build_stub_app_with_runtime_config(executor, WsRuntimeConfig::default()).await
+}
+
+async fn build_stub_app_with_runtime_config(
+    executor: Arc<dyn WsResponsesExecutor>,
+    runtime_config: WsRuntimeConfig,
+) -> axum::Router {
     let ctx = create_test_app_context().await;
-    let router = Arc::new(StubWsRouter { executor });
+    let router = Arc::new(StubWsRouter {
+        executor,
+        runtime_config,
+    });
     create_test_app_with_context(router, ctx)
 }
 
@@ -178,17 +198,24 @@ async fn recv_json(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) -> serde_json::Value {
-    let message = tokio::time::timeout(Duration::from_secs(3), socket.next())
-        .await
-        .expect("timed out waiting for websocket message")
-        .expect("websocket stream ended")
-        .expect("websocket receive failed");
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(3), socket.next())
+            .await
+            .expect("timed out waiting for websocket message")
+            .expect("websocket stream ended")
+            .expect("websocket receive failed");
 
-    match message {
-        tokio_tungstenite::tungstenite::Message::Text(text) => {
-            serde_json::from_str(text.as_ref()).expect("message should be valid JSON")
+        match message {
+            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                return serde_json::from_str(text.as_ref()).expect("message should be valid JSON");
+            }
+            tokio_tungstenite::tungstenite::Message::Ping(_) => continue,
+            tokio_tungstenite::tungstenite::Message::Pong(_) => continue,
+            tokio_tungstenite::tungstenite::Message::Close(frame) => {
+                panic!("unexpected websocket close frame: {:?}", frame)
+            }
+            other => panic!("unexpected websocket message: {:?}", other),
         }
-        other => panic!("unexpected websocket message: {:?}", other),
     }
 }
 
@@ -256,7 +283,8 @@ impl WsResponsesExecutor for SemanticWsExecutor {
         }
 
         let previous_response = if let Some(previous_id) = request.previous_response_id.as_deref() {
-            if let Some(cached) = cached_response.filter(|cached| cached.response.id == previous_id) {
+            if let Some(cached) = cached_response.filter(|cached| cached.response.id == previous_id)
+            {
                 Some(cached)
             } else {
                 self.durable_store
@@ -299,19 +327,19 @@ impl WsResponsesExecutor for SemanticWsExecutor {
         let _ = outbound_tx.send(Message::Text(created.to_string().into()));
 
         let response = ResponsesResponse::builder(response_id.clone(), request.model.clone())
-        .copy_from_request(&request)
-        .status(ResponseStatus::Completed)
-        .output(vec![ResponseOutputItem::Message {
-            id: "msg_ws_semantic".to_string(),
-            role: "assistant".to_string(),
-            content: vec![ResponseContentPart::OutputText {
-                text: output_text.to_string(),
-                annotations: vec![],
-                logprobs: None,
-            }],
-            status: "completed".to_string(),
-        }])
-        .build();
+            .copy_from_request(&request)
+            .status(ResponseStatus::Completed)
+            .output(vec![ResponseOutputItem::Message {
+                id: "msg_ws_semantic".to_string(),
+                role: "assistant".to_string(),
+                content: vec![ResponseContentPart::OutputText {
+                    text: output_text.to_string(),
+                    annotations: vec![],
+                    logprobs: None,
+                }],
+                status: "completed".to_string(),
+            }])
+            .build();
 
         let completed = serde_json::json!({
             "type": "response.completed",
@@ -424,6 +452,85 @@ async fn test_v1_responses_ws_rejects_binary_messages() {
 }
 
 #[tokio::test]
+async fn test_v1_responses_ws_replies_to_ping_and_keeps_session_healthy() {
+    let url = serve_app(build_stub_app(Arc::new(StubWsExecutor::immediate())).await).await;
+    let (mut socket, _) = connect_async(format!("{}/v1/responses", url))
+        .await
+        .unwrap();
+
+    let ping_payload = vec![0x1, 0x2, 0x3, 0x4];
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Ping(
+            ping_payload.clone().into(),
+        ))
+        .await
+        .unwrap();
+
+    let pong = tokio::time::timeout(Duration::from_secs(3), socket.next())
+        .await
+        .expect("timed out waiting for pong")
+        .expect("websocket stream ended")
+        .expect("websocket receive failed");
+
+    match pong {
+        tokio_tungstenite::tungstenite::Message::Pong(payload) => {
+            assert_eq!(payload.as_ref(), ping_payload.as_slice());
+        }
+        other => panic!("expected pong after ping, got {:?}", other),
+    }
+
+    let events = send_ws_request_and_collect(
+        &mut socket,
+        serde_json::json!({
+            "type": "response.create",
+            "response": {
+                "model": "mock-model",
+                "input": "Hello websocket after ping",
+                "store": false
+            }
+        }),
+    )
+    .await;
+
+    let completed = events.last().unwrap();
+    assert_eq!(completed["type"], "response.completed");
+}
+
+#[tokio::test]
+async fn test_v1_responses_ws_closes_when_session_lifetime_expires() {
+    let url = serve_app(
+        build_stub_app_with_runtime_config(
+            Arc::new(StubWsExecutor::immediate()),
+            WsRuntimeConfig {
+                max_session_lifetime: Duration::from_millis(50),
+            },
+        )
+        .await,
+    )
+    .await;
+    let (mut socket, _) = connect_async(format!("{}/v1/responses", url))
+        .await
+        .unwrap();
+
+    let close_message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("timed out waiting for websocket close")
+        .expect("websocket stream ended without close frame")
+        .expect("websocket receive failed");
+
+    match close_message {
+        tokio_tungstenite::tungstenite::Message::Close(frame) => {
+            let frame = frame.expect("expected server close frame");
+            assert_eq!(
+                frame.reason.to_string(),
+                "WebSocket Responses session lifetime expired."
+            );
+        }
+        other => panic!("expected websocket close frame, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn test_v1_responses_ws_response_create_streams_events() {
     let url = serve_app(build_stub_app(Arc::new(StubWsExecutor::immediate())).await).await;
     let (mut socket, _) = connect_async(format!("{}/v1/responses", url))
@@ -455,6 +562,25 @@ async fn test_v1_responses_ws_response_create_streams_events() {
         completed["response"]["output"][0]["content"][0]["text"],
         "stub websocket output"
     );
+}
+
+#[tokio::test]
+async fn test_v1_responses_ws_accepts_transcript_fixture_request() {
+    let url = serve_app(build_stub_app(Arc::new(StubWsExecutor::immediate())).await).await;
+    let (mut socket, _) = connect_async(format!("{}/v1/responses", url))
+        .await
+        .unwrap();
+
+    let request = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../fixtures/responses_ws/transcript_request.json"
+    ))
+    .expect("transcript fixture should be valid JSON");
+
+    let events = send_ws_request_and_collect(&mut socket, request).await;
+    let completed = events.last().unwrap();
+
+    assert_eq!(events[0]["type"], "response.created");
+    assert_eq!(completed["type"], "response.completed");
 }
 
 #[tokio::test]
@@ -508,6 +634,7 @@ async fn test_v1_responses_ws_via_router_manager_streams_events() {
         router_ids::GRPC_REGULAR,
         Arc::new(StubWsRouter {
             executor: Arc::new(StubWsExecutor::immediate()),
+            runtime_config: WsRuntimeConfig::default(),
         }),
     );
 
@@ -716,4 +843,32 @@ async fn test_v1_responses_ws_rejects_unsupported_parameters() {
         assert_eq!(error["type"], "error");
         assert_eq!(error["code"], "unsupported_parameter");
     }
+}
+
+#[tokio::test]
+async fn test_v1_responses_ws_errors_echo_event_id() {
+    let url = serve_app(build_stub_app(Arc::new(SemanticWsExecutor::new())).await).await;
+    let (mut socket, _) = connect_async(format!("{}/v1/responses", url))
+        .await
+        .unwrap();
+
+    let events = send_ws_request_and_collect(
+        &mut socket,
+        serde_json::json!({
+            "type": "response.create",
+            "event_id": "evt_ws_123",
+            "response": {
+                "model": "mock-model",
+                "input": "Conversation websocket request",
+                "conversation": "conv_test_123"
+            }
+        }),
+    )
+    .await;
+
+    let error = events.last().unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["code"], "unsupported_parameter");
+    assert_eq!(error["event_id"], "evt_ws_123");
+    assert!(error["message"].is_string());
 }
