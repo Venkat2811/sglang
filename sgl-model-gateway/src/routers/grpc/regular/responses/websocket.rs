@@ -50,6 +50,9 @@ impl WsResponsesExecutor for GrpcWsResponsesExecutor {
         outbound_tx: mpsc::UnboundedSender<Message>,
     ) -> Result<CachedWsResponse, WsClientError> {
         request.normalize();
+        // WebSocket Responses is inherently event-streamed, so force streaming
+        // on the downstream chat pipeline regardless of the client payload.
+        request.stream = Some(true);
         request
             .validate()
             .map_err(|err| WsClientError::new("invalid_request", err.to_string()))?;

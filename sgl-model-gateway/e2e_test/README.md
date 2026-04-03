@@ -17,6 +17,14 @@ export SHOW_WORKER_LOGS=1
 export SHOW_ROUTER_LOGS=1
 ```
 
+Install local editable packages with `uv` so the router subprocesses see current
+gateway and `sglang` code:
+
+```bash
+cd sgl-model-gateway/e2e_test
+uv pip install -p .venv/bin/python -e ../../python -e ../bindings/python
+```
+
 Optional:
 
 ```bash
@@ -34,15 +42,43 @@ Run the local Responses smoke tier:
 
 ```bash
 cd sgl-model-gateway/e2e_test
-pytest --workers 1 --tests-per-worker 1 responses/test_local_smoke.py
+uv run --python .venv/bin/python \
+  pytest --workers 1 --tests-per-worker 1 responses/test_local_smoke.py
 ```
 
 Run a single test first if startup or model readiness is uncertain:
 
 ```bash
 cd sgl-model-gateway/e2e_test
-pytest --workers 1 --tests-per-worker 1 \
+uv run --python .venv/bin/python \
+  pytest --workers 1 --tests-per-worker 1 \
   responses/test_local_smoke.py -k basic_response_creation
+```
+
+Run the real WebSocket smoke path:
+
+```bash
+cd sgl-model-gateway/e2e_test
+uv run --python .venv/bin/python \
+  pytest --workers 1 --tests-per-worker 1 \
+  responses/test_local_smoke.py -k websocket_response_create
+```
+
+## WS Microbenchmark
+
+Run the lightweight local WS benchmark harness:
+
+```bash
+cd sgl-model-gateway/e2e_test
+uv run --python .venv/bin/python \
+  pytest --workers 1 --tests-per-worker 1 benchmarks/test_ws_microbench.py -q
+```
+
+Optional profile overrides:
+
+```bash
+export SGLANG_WS_BENCH_CONCURRENCY=1,2,4
+export SGLANG_WS_BENCH_SAMPLES_PER_CONCURRENCY=2
 ```
 
 ## Notes

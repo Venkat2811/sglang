@@ -13,6 +13,7 @@ dependencies = [
   "pytest",
   "pytest-parallel",
   "pytest-rerunfailures",
+  "websockets",
 ]
 
 [project.optional-dependencies]
