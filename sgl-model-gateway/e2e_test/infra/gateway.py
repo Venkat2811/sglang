@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -23,6 +24,11 @@ logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SGLANG_PYTHON = _REPO_ROOT / "python"
 _GATEWAY_BINDINGS_SRC = _REPO_ROOT / "sgl-model-gateway" / "bindings" / "python" / "src"
+
+
+def _python_executable() -> str:
+    """Use the active interpreter so uv/venv installs are visible to subprocesses."""
+    return sys.executable
 
 
 def _build_subprocess_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
@@ -352,7 +358,7 @@ class Gateway:
     def _build_base_cmd(self) -> list[str]:
         """Build the base command for launching the router."""
         return [
-            "python3",
+            _python_executable(),
             "-m",
             "sglang_router.launch_router",
             "--host",
