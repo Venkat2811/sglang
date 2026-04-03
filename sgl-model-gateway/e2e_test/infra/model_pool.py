@@ -6,6 +6,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -38,6 +39,11 @@ logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SGLANG_PYTHON = _REPO_ROOT / "python"
 _GATEWAY_BINDINGS_SRC = _REPO_ROOT / "sgl-model-gateway" / "bindings" / "python" / "src"
+
+
+def _python_executable() -> str:
+    """Use the active interpreter so uv/venv installs are visible to subprocesses."""
+    return sys.executable
 
 
 def _extend_pythonpath(env: dict[str, str]) -> dict[str, str]:
@@ -510,7 +516,7 @@ class ModelPool:
 
         # Build command
         cmd = [
-            "python3",
+            _python_executable(),
             "-m",
             "sglang.launch_server",
             "--model-path",
