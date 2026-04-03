@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from ctypes import CDLL, c_int, get_errno
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SGLANG_PYTHON = _REPO_ROOT / "python"
 _GATEWAY_BINDINGS_SRC = _REPO_ROOT / "sgl-model-gateway" / "bindings" / "python" / "src"
+_PR_SET_PDEATHSIG = 1
 
 
 def _python_executable() -> str:
@@ -54,6 +56,22 @@ def _extend_pythonpath(env: dict[str, str]) -> dict[str, str]:
         parts.append(existing)
     env["PYTHONPATH"] = os.pathsep.join(parts)
     return env
+
+
+def _set_parent_death_signal() -> None:
+    """Ensure worker subprocesses die if the pytest parent process exits.
+
+    Local E2E runs on a single GPU are painful when a benchmark or smoke test
+    exits without cleaning up the worker process tree. On Linux, use
+    ``PR_SET_PDEATHSIG`` so the launched server receives ``SIGTERM`` if the
+    parent process disappears unexpectedly.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+
+    libc = CDLL(None, use_errno=True)
+    if libc.prctl(c_int(_PR_SET_PDEATHSIG), c_int(signal.SIGTERM), 0, 0, 0) != 0:
+        logger.debug("Failed to set PR_SET_PDEATHSIG (errno=%s)", get_errno())
 
 
 @dataclass(frozen=True)
@@ -576,6 +594,7 @@ class ModelPool:
             env=env,
             stdout=None if show_output else subprocess.PIPE,
             stderr=None if show_output else subprocess.PIPE,
+            preexec_fn=_set_parent_death_signal if sys.platform.startswith("linux") else None,
             start_new_session=True,
         )
 

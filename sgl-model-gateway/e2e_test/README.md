@@ -100,6 +100,6 @@ uv run --python .venv/bin/python \
   are not intended to be the first green path on a 12 GB developer GPU.
 - Keep the small-model smoke path green before expanding to heavier semantic
   or compatibility coverage.
-- Benchmark runs can leave a local worker alive if the test process is
-  interrupted. Kill stale `sglang.launch_server` processes before rerunning if
-  the 3060 appears unexpectedly full.
+- Normal pytest exit now tears down the pooled local worker automatically.
+- If a run is hard-killed, kill stale `sglang.launch_server` processes before
+  rerunning if the 3060 appears unexpectedly full.
