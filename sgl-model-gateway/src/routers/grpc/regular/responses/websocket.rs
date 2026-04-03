@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use axum::{extract::ws::Message, http::HeaderMap};
 use serde_json::json;
 use tokio::sync::mpsc;
-use validator::Validate;
 
 use super::{
     common::{load_conversation_history_with_cache, normalize_request_input_items},
@@ -27,6 +26,7 @@ use crate::{
             },
             harmony::HarmonyDetector,
         },
+        responses_validation::normalize_and_validate_responses_request,
         ws_responses::{
             CachedWsResponse, WsClientError, WsResponseCreateOptions, WsResponsesExecutor,
         },
@@ -63,8 +63,8 @@ impl WsResponsesExecutor for GrpcWsResponsesExecutor {
         // on the downstream chat pipeline regardless of the client payload.
         request.stream = Some(true);
         request.background = Some(false);
-        request
-            .validate()
+
+        normalize_and_validate_responses_request(&mut request)
             .map_err(|err| WsClientError::new("invalid_request", err.to_string()))?;
 
         if request.conversation.is_some() {
