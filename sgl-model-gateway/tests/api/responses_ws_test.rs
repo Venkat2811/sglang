@@ -716,7 +716,7 @@ async fn test_v1_responses_ws_closes_when_session_lifetime_expires() {
             let frame = frame.expect("expected server close frame");
             assert_eq!(
                 frame.reason.to_string(),
-                "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue."
+                "Responses websocket connection limit reached (50 ms). Create a new websocket connection to continue."
             );
         }
         other => panic!("expected websocket close frame, got {:?}", other),
