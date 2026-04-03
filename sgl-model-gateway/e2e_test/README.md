@@ -37,6 +37,7 @@ export ROUTER_LOCAL_MODEL_PATH=/path/to/local/model/root
 Preferred local smoke model:
 
 - `qwen-0.5b` -> `Qwen/Qwen2.5-0.5B-Instruct`
+- `qwen-3b` -> `Qwen/Qwen2.5-3B-Instruct` for local function-calling work
 
 Run the local Responses smoke tier:
 
@@ -98,6 +99,8 @@ uv run --python .venv/bin/python \
 
 - The larger default e2e models such as `llama-8b`, `qwen-14b`, and `gpt-oss`
   are not intended to be the first green path on a 12 GB developer GPU.
+- `qwen-3b` is the best current local candidate for tool-call semantics on a
+  single RTX 3060-class machine.
 - Keep the small-model smoke path green before expanding to heavier semantic
   or compatibility coverage.
 - Normal pytest exit now tears down the pooled local worker automatically.
