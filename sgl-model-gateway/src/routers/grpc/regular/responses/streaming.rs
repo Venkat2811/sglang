@@ -182,6 +182,7 @@ async fn process_and_transform_stream(
 
     // Convert body to data stream
     let mut stream = body.into_data_stream();
+    let mut upstream_error_forwarded = false;
 
     // Process stream chunks (each chunk is a complete SSE event)
     while let Some(chunk_result) = stream.next().await {
@@ -213,11 +214,24 @@ async fn process_and_transform_stream(
                     // Not a valid chat chunk - might be an upstream JSON error. Preserve it.
                     debug!("Non-chunk SSE event, passing through: {}", event);
                     if let Some(raw_json) = event.strip_prefix("data: ") {
-                        sink.send_raw_json(raw_json.trim())?;
+                        let raw_json = raw_json.trim();
+                        sink.send_raw_json(raw_json)?;
+
+                        if is_upstream_error_payload(raw_json) {
+                            upstream_error_forwarded = true;
+                            break;
+                        }
                     }
                 }
             }
         }
+    }
+
+    if upstream_error_forwarded {
+        debug!(
+            "Upstream error payload was already forwarded; skipping synthetic response.completed"
+        );
+        return Ok(accumulator.finalize_with_status(ResponseStatus::Failed));
     }
 
     // Emit final response.completed event with accumulated usage
@@ -370,6 +384,17 @@ impl StreamingResponseAccumulator {
     }
 
     fn finalize(self) -> ResponsesResponse {
+        let status = match self.finish_reason.as_deref() {
+            Some("stop") | Some("length") => ResponseStatus::Completed,
+            Some("tool_calls") => ResponseStatus::InProgress,
+            Some("failed") | Some("error") => ResponseStatus::Failed,
+            _ => ResponseStatus::Completed,
+        };
+
+        self.finalize_with_status(status)
+    }
+
+    fn finalize_with_status(self, status: ResponseStatus) -> ResponsesResponse {
         let mut output: Vec<ResponseOutputItem> = Vec::new();
 
         // Add message content if present
@@ -401,14 +426,6 @@ impl StreamingResponseAccumulator {
         // Add tool calls
         output.extend(self.tool_calls);
 
-        // Determine final status
-        let status = match self.finish_reason.as_deref() {
-            Some("stop") | Some("length") => ResponseStatus::Completed,
-            Some("tool_calls") => ResponseStatus::InProgress,
-            Some("failed") | Some("error") => ResponseStatus::Failed,
-            _ => ResponseStatus::Completed,
-        };
-
         // Convert usage
         let usage = self.usage.as_ref().map(|u| {
             let usage_info = UsageInfo {
@@ -432,6 +449,13 @@ impl StreamingResponseAccumulator {
             .maybe_usage(usage)
             .build()
     }
+}
+
+fn is_upstream_error_payload(payload: &str) -> bool {
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|value| value.get("error").cloned())
+        .is_some()
 }
 
 // ============================================================================
@@ -1074,6 +1098,140 @@ struct ChatResponseAccumulator {
     tool_calls: HashMap<usize, ToolCall>,
     finish_reason: Option<String>,
     usage: Option<Usage>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::Body;
+    use bytes::Bytes;
+    use data_connector::{
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        ResponseId, ResponseStorage,
+    };
+    use futures_util::stream;
+    use serde_json::Value;
+
+    use super::*;
+    use crate::protocols::responses::{ResponseInput, ServiceTier, Truncation};
+
+    #[derive(Clone, Default)]
+    struct RecordingSink {
+        events: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl RecordingSink {
+        fn events(&self) -> Vec<Value> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl ResponseEventSink for RecordingSink {
+        fn send_event(&self, event: &Value) -> Result<(), String> {
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+
+        fn send_raw_json(&self, payload: &str) -> Result<(), String> {
+            let value = serde_json::from_str::<Value>(payload)
+                .map_err(|err| format!("failed to parse test payload: {}", err))?;
+            self.events.lock().unwrap().push(value);
+            Ok(())
+        }
+    }
+
+    fn test_responses_request() -> ResponsesRequest {
+        ResponsesRequest {
+            background: Some(false),
+            include: None,
+            input: ResponseInput::Text("trigger upstream error".to_string()),
+            instructions: None,
+            max_output_tokens: Some(64),
+            max_tool_calls: None,
+            metadata: None,
+            model: "mock-model".to_string(),
+            parallel_tool_calls: Some(true),
+            previous_response_id: None,
+            reasoning: None,
+            service_tier: Some(ServiceTier::Auto),
+            store: Some(true),
+            stream: Some(true),
+            temperature: Some(0.0),
+            tool_choice: None,
+            tools: None,
+            top_logprobs: Some(0),
+            top_p: None,
+            truncation: Some(Truncation::Disabled),
+            text: None,
+            user: None,
+            request_id: Some("resp_stream_upstream_error".to_string()),
+            priority: 0,
+            frequency_penalty: Some(0.0),
+            presence_penalty: Some(0.0),
+            stop: None,
+            top_k: -1,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            conversation: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_and_transform_stream_does_not_emit_completed_after_upstream_error() {
+        let body = Body::from_stream(stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from(
+                "data: {\"error\":{\"message\":\"upstream exploded\",\"type\":\"internal_error\"}}\n\n",
+            )),
+            Ok(Bytes::from("data: [DONE]\n\n")),
+        ]));
+        let response_storage = Arc::new(MemoryResponseStorage::new());
+        let conversation_storage = Arc::new(MemoryConversationStorage::new());
+        let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+        let sink = RecordingSink::default();
+
+        let final_response = process_and_transform_stream(
+            body,
+            test_responses_request(),
+            response_storage.clone(),
+            conversation_storage,
+            conversation_item_storage,
+            &sink,
+        )
+        .await
+        .expect("stream processing should succeed after forwarding upstream error");
+
+        let events = sink.events();
+        let event_types: Vec<_> = events
+            .iter()
+            .filter_map(|event| event.get("type").and_then(|value| value.as_str()))
+            .collect();
+
+        assert_eq!(
+            event_types,
+            vec!["response.created", "response.in_progress"],
+            "only the synthetic start events should be emitted before the upstream error",
+        );
+        assert!(
+            events.iter().any(|event| event
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(|value| value.as_str())
+                == Some("upstream exploded")),
+            "the upstream error payload should be forwarded as-is",
+        );
+        assert_eq!(final_response.status, ResponseStatus::Failed);
+
+        let response_id = ResponseId::from(final_response.id.as_str());
+        assert!(
+            response_storage
+                .get_response(&response_id)
+                .await
+                .expect("storage lookup should succeed")
+                .is_none(),
+            "failed upstream streams should not be persisted",
+        );
+    }
 }
 
 impl ChatResponseAccumulator {
