@@ -115,6 +115,52 @@ impl Default for WsRuntimeConfig {
     }
 }
 
+fn format_duration_label(duration: Duration) -> String {
+    fn pluralize(value: u128, unit: &str) -> String {
+        if unit == "ms" {
+            return format!("{} ms", value);
+        }
+
+        if value == 1 {
+            format!("1 {}", unit)
+        } else {
+            format!("{} {}s", value, unit)
+        }
+    }
+
+    let millis = duration.as_millis();
+    let seconds = duration.as_secs();
+
+    if millis == 0 {
+        return "0 ms".to_string();
+    }
+
+    if millis < 1_000 {
+        return pluralize(millis, "ms");
+    }
+
+    if seconds < 60 {
+        return pluralize(seconds as u128, "second");
+    }
+
+    if seconds < 3_600 && seconds % 60 == 0 {
+        return pluralize((seconds / 60) as u128, "minute");
+    }
+
+    if seconds % 3_600 == 0 {
+        return pluralize((seconds / 3_600) as u128, "hour");
+    }
+
+    format!("{:.1} seconds", duration.as_secs_f64())
+}
+
+fn session_lifetime_message(duration: Duration) -> String {
+    format!(
+        "Responses websocket connection limit reached ({}). Create a new websocket connection to continue.",
+        format_duration_label(duration)
+    )
+}
+
 #[derive(Debug)]
 struct ParsedClientEvent {
     event_type: String,
@@ -160,20 +206,19 @@ pub async fn serve_responses_ws_with_config(
             }
 
             tokio::time::sleep(max_session_lifetime).await;
+            let message = session_lifetime_message(max_session_lifetime);
             send_client_error_json(
                 &outbound_tx,
                 &WsClientError::new(
                     "websocket_connection_limit_reached",
-                    "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.",
+                    &message,
                 )
                 .with_type("invalid_request_error"),
                 None,
             );
             let _ = outbound_tx.send(Message::Close(Some(CloseFrame {
                 code: axum::extract::ws::close_code::NORMAL,
-                reason:
-                    "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue."
-                        .into(),
+                reason: message.into(),
             })));
         })
     };
