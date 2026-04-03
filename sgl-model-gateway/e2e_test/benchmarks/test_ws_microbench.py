@@ -8,8 +8,10 @@ writes a JSON summary for repeatable local regression checks.
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 import logging
+import operator as op
 import os
 import statistics
 import time
@@ -18,6 +20,33 @@ from pathlib import Path
 import pytest
 
 logger = logging.getLogger(__name__)
+
+CALCULATE_FUNCTION = {
+    "type": "function",
+    "name": "calculate",
+    "description": "Perform a mathematical calculation.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "expression": {
+                "type": "string",
+                "description": "The mathematical expression to evaluate.",
+            }
+        },
+        "required": ["expression"],
+    },
+}
+
+CALCULATE_TOOL_REQUEST_INSTRUCTIONS = (
+    "You are a calculator assistant. "
+    "When the user asks for a calculation, call the calculate tool exactly once "
+    "and do not answer until the tool result is provided."
+)
+
+CALCULATE_TOOL_RESULT_INSTRUCTIONS = (
+    "The calculate tool result has been provided. "
+    "Answer briefly with the final numeric result."
+)
 
 
 def _gateway_ws_url(base_url: str) -> str:
@@ -87,6 +116,77 @@ def _tool_output_chain_turn_input(turn_index: int) -> list[dict]:
                 }
             ],
         },
+    ]
+
+
+def _model_generated_tool_prompt(turn_index: int) -> str:
+    left = 15 + turn_index
+    right = 23 + (turn_index * 2)
+    return f"Calculate {left} * {right}. Use the tool."
+
+
+def _response_function_calls(output) -> list:
+    return [item for item in output if item.type == "function_call"]
+
+
+def _completed_response_function_calls(completed_event: dict) -> list[dict]:
+    return [
+        item
+        for item in completed_event.get("response", {}).get("output", [])
+        if item.get("type") == "function_call"
+    ]
+
+
+_SAFE_BINOPS = {
+    ast.Add: op.add,
+    ast.Sub: op.sub,
+    ast.Mult: op.mul,
+    ast.Div: op.truediv,
+}
+
+
+def _evaluate_expression(expression: str) -> int | float:
+    def eval_node(node):
+        if isinstance(node, ast.Expression):
+            return eval_node(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = eval_node(node.operand)
+            return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_BINOPS:
+            return _SAFE_BINOPS[type(node.op)](
+                eval_node(node.left), eval_node(node.right)
+            )
+        raise ValueError(f"unsupported expression: {expression}")
+
+    parsed = ast.parse(expression, mode="eval")
+    return eval_node(parsed)
+
+
+def _tool_output_from_http_function_call(function_call) -> list[dict]:
+    arguments = json.loads(function_call.arguments)
+    expression = arguments["expression"]
+    result = _evaluate_expression(expression)
+    return [
+        {
+            "type": "function_call_output",
+            "call_id": function_call.call_id,
+            "output": json.dumps({"result": result}),
+        }
+    ]
+
+
+def _tool_output_from_ws_function_call(function_call: dict) -> list[dict]:
+    arguments = json.loads(function_call["arguments"])
+    expression = arguments["expression"]
+    result = _evaluate_expression(expression)
+    return [
+        {
+            "type": "function_call_output",
+            "call_id": function_call["call_id"],
+            "output": json.dumps({"result": result}),
+        }
     ]
 
 
@@ -401,14 +501,101 @@ async def _run_ws_tool_output_chain_sample(
     }
 
 
+async def _run_ws_model_generated_tool_chain_sample(
+    ws_url: str, model: str, turns: int
+) -> dict[str, float | int | list[float] | list[dict[str, float]]]:
+    import websockets
+
+    connect_started_at = time.perf_counter()
+    async with websockets.connect(ws_url, open_timeout=30, close_timeout=5) as websocket:
+        connected_at = time.perf_counter()
+
+        per_turn_ms: list[float] = []
+        per_turn_requests_ms: list[dict[str, float]] = []
+        previous_response_id: str | None = None
+
+        for turn_index in range(1, turns + 1):
+            first_completed, tool_request_ms = await _collect_ws_terminal_event(
+                websocket,
+                _ws_request(
+                    model=model,
+                    input=_model_generated_tool_prompt(turn_index),
+                    instructions=CALCULATE_TOOL_REQUEST_INSTRUCTIONS,
+                    temperature=0,
+                    max_output_tokens=128,
+                    store=True,
+                    tools=[CALCULATE_FUNCTION],
+                    tool_choice="required",
+                    previous_response_id=previous_response_id,
+                ),
+            )
+
+            function_calls = _completed_response_function_calls(first_completed)
+            if not function_calls:
+                raise AssertionError("expected function call in websocket tool benchmark")
+
+            second_completed, tool_output_ms = await _collect_ws_terminal_event(
+                websocket,
+                _ws_request(
+                    model=model,
+                    input=_tool_output_from_ws_function_call(function_calls[0]),
+                    instructions=CALCULATE_TOOL_RESULT_INSTRUCTIONS,
+                    temperature=0,
+                    max_output_tokens=128,
+                    store=True,
+                    tools=[CALCULATE_FUNCTION],
+                    tool_choice="auto",
+                    previous_response_id=first_completed["response"]["id"],
+                ),
+            )
+
+            turn_total_ms = tool_request_ms + tool_output_ms
+            per_turn_ms.append(turn_total_ms)
+            per_turn_requests_ms.append(
+                {
+                    "tool_request_ms": tool_request_ms,
+                    "tool_output_ms": tool_output_ms,
+                    "turn_total_ms": turn_total_ms,
+                }
+            )
+            previous_response_id = second_completed["response"]["id"]
+
+    continuation_turns = per_turn_ms[1:]
+    continuation_mean_ms = (
+        statistics.fmean(continuation_turns) if continuation_turns else 0.0
+    )
+
+    return {
+        "connect_ms": (connected_at - connect_started_at) * 1000,
+        "turns": turns,
+        "total_chain_ms": sum(per_turn_ms),
+        "first_turn_completed_ms": per_turn_ms[0],
+        "continuation_turn_completed_ms_mean": continuation_mean_ms,
+        "continuation_turn_completed_ms_p50": _percentile(continuation_turns, 0.50),
+        "continuation_turn_completed_ms_p95": _percentile(continuation_turns, 0.95),
+        "continuation_only_total_ms": sum(continuation_turns),
+        "per_turn_completed_ms": per_turn_ms,
+        "per_turn_requests_ms": per_turn_requests_ms,
+    }
+
+
 def _collect_http_completed_ms(response_stream) -> tuple[object, float]:
     request_started_at = time.perf_counter()
+    event_types: list[str] = []
 
     for event in response_stream:
+        event_types.append(event.type)
+        if event.type in {"error", "response.failed", "response.incomplete"}:
+            raise AssertionError(
+                f"HTTP continuation benchmark terminated with {event.type}: {event_types}"
+            )
         if event.type == "response.completed":
             return event.response, (time.perf_counter() - request_started_at) * 1000
 
-    raise AssertionError("HTTP continuation benchmark ended without response.completed")
+    raise AssertionError(
+        "HTTP continuation benchmark ended without response.completed; "
+        f"events={event_types}"
+    )
 
 
 def _run_http_continuation_chain_sample(
@@ -507,6 +694,79 @@ def _run_http_tool_output_chain_sample(
         "continuation_turn_completed_ms_p95": _percentile(continuation_turns, 0.95),
         "continuation_only_total_ms": sum(continuation_turns),
         "per_turn_completed_ms": per_turn_ms,
+    }
+
+
+def _run_http_model_generated_tool_chain_sample(
+    client, model: str, turns: int
+) -> dict[str, float | int | list[float] | list[dict[str, float]]]:
+    per_turn_ms: list[float] = []
+    per_turn_requests_ms: list[dict[str, float]] = []
+    previous_response_id: str | None = None
+
+    for turn_index in range(1, turns + 1):
+        first_stream = client.responses.create(
+            model=model,
+            input=_model_generated_tool_prompt(turn_index),
+            previous_response_id=previous_response_id,
+            instructions=CALCULATE_TOOL_REQUEST_INSTRUCTIONS,
+            temperature=0,
+            max_output_tokens=128,
+            store=True,
+            stream=True,
+            tools=[CALCULATE_FUNCTION],
+            tool_choice="required",
+        )
+        first_response, tool_request_ms = _collect_http_completed_ms(first_stream)
+
+        function_calls = _response_function_calls(first_response.output)
+        if not function_calls:
+            output_types = [item.type for item in first_response.output]
+            raise AssertionError(
+                "expected function call in http tool benchmark "
+                f"at turn {turn_index}; output_types={output_types}"
+            )
+
+        second_stream = client.responses.create(
+            model=model,
+            input=_tool_output_from_http_function_call(function_calls[0]),
+            previous_response_id=first_response.id,
+            instructions=CALCULATE_TOOL_RESULT_INSTRUCTIONS,
+            temperature=0,
+            max_output_tokens=128,
+            store=True,
+            stream=True,
+            tools=[CALCULATE_FUNCTION],
+            tool_choice="auto",
+        )
+        second_response, tool_output_ms = _collect_http_completed_ms(second_stream)
+
+        turn_total_ms = tool_request_ms + tool_output_ms
+        per_turn_ms.append(turn_total_ms)
+        per_turn_requests_ms.append(
+            {
+                "tool_request_ms": tool_request_ms,
+                "tool_output_ms": tool_output_ms,
+                "turn_total_ms": turn_total_ms,
+            }
+        )
+        previous_response_id = second_response.id
+
+    continuation_turns = per_turn_ms[1:]
+    continuation_mean_ms = (
+        statistics.fmean(continuation_turns) if continuation_turns else 0.0
+    )
+
+    return {
+        "turns": turns,
+        "total_chain_ms": sum(per_turn_ms),
+        "first_turn_completed_ms": per_turn_ms[0],
+        "continuation_turn_completed_ms_mean": continuation_mean_ms,
+        "continuation_turn_completed_ms_p50": _percentile(continuation_turns, 0.50),
+        "continuation_turn_completed_ms_p95": _percentile(continuation_turns, 0.95),
+        "continuation_only_total_ms": sum(continuation_turns),
+        "per_turn_completed_ms": per_turn_ms,
+        "per_turn_requests_ms": per_turn_requests_ms,
     }
 
 
@@ -790,3 +1050,80 @@ class TestResponsesToolOutputChainCompare:
         assert ws_samples[0]["tool_turns"] == tool_turns
         assert float(http_samples[0]["total_chain_ms"]) > 0
         assert float(ws_samples[0]["total_chain_ms"]) > 0
+
+
+@pytest.mark.e2e
+@pytest.mark.slow
+@pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
+@pytest.mark.model("qwen-3b")
+@pytest.mark.gateway(extra_args=["--history-backend", "memory"])
+@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+class TestResponsesModelGeneratedToolChainCompare:
+    """Model-generated tool-call comparison for HTTP vs persistent WS."""
+
+    def test_http_vs_ws_model_generated_tool_chain_compare(self, setup_backend):
+        _, model, client, gateway = setup_backend
+
+        turn_profiles = [
+            int(value)
+            for value in os.environ.get(
+                "SGLANG_HTTP_WS_MODEL_TOOL_CHAIN_TURNS", "5"
+            ).split(",")
+            if value.strip()
+        ]
+        samples = int(os.environ.get("SGLANG_HTTP_WS_MODEL_TOOL_CHAIN_SAMPLES", "1"))
+        experiment_folder = os.environ.get(
+            "SGLANG_HTTP_WS_MODEL_TOOL_CHAIN_EXPERIMENT",
+            f"benchmark_http_ws_model_tool_chain_compare_{model.replace('/', '_')}",
+        )
+
+        profile_results = []
+        for turns in turn_profiles:
+            http_samples = [
+                _run_http_model_generated_tool_chain_sample(client, model, turns)
+                for _ in range(samples)
+            ]
+            ws_samples = [
+                asyncio.run(
+                    _run_ws_model_generated_tool_chain_sample(
+                        _gateway_ws_url(gateway.base_url), model, turns
+                    )
+                )
+                for _ in range(samples)
+            ]
+
+            profile_results.append(
+                {
+                    "turns": turns,
+                    "http": {
+                        "transport": "http",
+                        "samples": http_samples,
+                    },
+                    "websocket": {
+                        "transport": "websocket",
+                        "samples": ws_samples,
+                    },
+                    "ratios": _chain_transport_ratios(http_samples[0], ws_samples[0]),
+                }
+            )
+
+        payload = {
+            "router_url": gateway.base_url,
+            "model": model,
+            "turn_profiles": turn_profiles,
+            "samples": samples,
+            "experiment_folder": experiment_folder,
+            "results": profile_results,
+        }
+
+        summary_path = _write_summary(experiment_folder, payload)
+        logger.info(
+            "HTTP-vs-WS model-generated tool-chain summary written to %s",
+            summary_path,
+        )
+
+        assert profile_results
+        for result in profile_results:
+            assert result["turns"] > 0
+            assert float(result["http"]["samples"][0]["total_chain_ms"]) > 0
+            assert float(result["websocket"]["samples"][0]["total_chain_ms"]) > 0
