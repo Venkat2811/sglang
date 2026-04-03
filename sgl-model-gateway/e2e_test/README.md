@@ -81,9 +81,25 @@ export SGLANG_WS_BENCH_CONCURRENCY=1,2,4
 export SGLANG_WS_BENCH_SAMPLES_PER_CONCURRENCY=2
 ```
 
+## HTTP vs WS Comparison
+
+Run the apples-to-apples HTTP SSE versus WebSocket comparison on the same local
+prompt shape and model:
+
+```bash
+cd sgl-model-gateway/e2e_test
+export SGLANG_HTTP_WS_COMPARE_SAMPLES=1
+uv run --python .venv/bin/python \
+  pytest --workers 1 --tests-per-worker 1 \
+  benchmarks/test_ws_microbench.py -k http_vs_ws_transport_compare -q
+```
+
 ## Notes
 
 - The larger default e2e models such as `llama-8b`, `qwen-14b`, and `gpt-oss`
   are not intended to be the first green path on a 12 GB developer GPU.
 - Keep the small-model smoke path green before expanding to heavier semantic
   or compatibility coverage.
+- Benchmark runs can leave a local worker alive if the test process is
+  interrupted. Kill stale `sglang.launch_server` processes before rerunning if
+  the 3060 appears unexpectedly full.

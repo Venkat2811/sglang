@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::{
-    extract::ws::{Message, WebSocket},
+    extract::ws::{CloseFrame, Message, WebSocket},
     http::HeaderMap,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -12,6 +12,8 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
 
 use crate::protocols::responses::{ResponseInputOutputItem, ResponsesRequest, ResponsesResponse};
+
+const DEFAULT_WS_SESSION_LIFETIME: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Debug)]
 #[doc(hidden)]
@@ -72,6 +74,20 @@ struct WsSessionState {
     cached_response: Option<CachedWsResponse>,
 }
 
+#[derive(Clone, Debug)]
+#[doc(hidden)]
+pub struct WsRuntimeConfig {
+    pub max_session_lifetime: Duration,
+}
+
+impl Default for WsRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_session_lifetime: DEFAULT_WS_SESSION_LIFETIME,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawClientEvent {
     #[serde(rename = "type")]
@@ -86,6 +102,16 @@ pub async fn serve_responses_ws(
     headers: HeaderMap,
     executor: Arc<dyn WsResponsesExecutor>,
 ) {
+    serve_responses_ws_with_config(socket, headers, executor, WsRuntimeConfig::default()).await;
+}
+
+#[doc(hidden)]
+pub async fn serve_responses_ws_with_config(
+    socket: WebSocket,
+    headers: HeaderMap,
+    executor: Arc<dyn WsResponsesExecutor>,
+    runtime_config: WsRuntimeConfig,
+) {
     let (mut sink, mut stream) = socket.split();
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Message>();
     let session = Arc::new(Mutex::new(WsSessionState::default()));
@@ -97,6 +123,22 @@ pub async fn serve_responses_ws(
             }
         }
     });
+
+    let session_timeout = {
+        let outbound_tx = outbound_tx.clone();
+        let max_session_lifetime = runtime_config.max_session_lifetime;
+        tokio::spawn(async move {
+            if max_session_lifetime.is_zero() {
+                return;
+            }
+
+            tokio::time::sleep(max_session_lifetime).await;
+            let _ = outbound_tx.send(Message::Close(Some(CloseFrame {
+                code: axum::extract::ws::close_code::NORMAL,
+                reason: "WebSocket Responses session lifetime expired.".into(),
+            })));
+        })
+    };
 
     while let Some(message_result) = stream.next().await {
         let message = match message_result {
@@ -134,6 +176,7 @@ pub async fn serve_responses_ws(
         }
     }
 
+    session_timeout.abort();
     drop(outbound_tx);
     let _ = writer.await;
 }
