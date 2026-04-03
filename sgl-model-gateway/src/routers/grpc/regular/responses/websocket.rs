@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{extract::ws::Message, http::HeaderMap};
+use serde_json::json;
 use tokio::sync::mpsc;
 use validator::Validate;
 
@@ -12,16 +13,23 @@ use super::{
 };
 use crate::{
     core::WorkerRegistry,
-    protocols::{responses::ResponsesRequest, validated::Normalizable},
+    protocols::{
+        responses::{generate_id, ResponseStatus, ResponsesRequest, ResponsesResponse},
+        validated::Normalizable,
+    },
     routers::{
         error,
         grpc::{
             common::responses::{
-                ensure_mcp_connection, utils::validate_worker_availability, ResponsesContext,
+                ensure_mcp_connection,
+                utils::{persist_response_if_needed, validate_worker_availability},
+                ResponsesContext,
             },
             harmony::HarmonyDetector,
         },
-        ws_responses::{CachedWsResponse, WsClientError, WsResponsesExecutor},
+        ws_responses::{
+            CachedWsResponse, WsClientError, WsResponseCreateOptions, WsResponsesExecutor,
+        },
     },
 };
 
@@ -46,6 +54,7 @@ impl WsResponsesExecutor for GrpcWsResponsesExecutor {
         &self,
         headers: HeaderMap,
         mut request: ResponsesRequest,
+        options: WsResponseCreateOptions,
         cached_response: Option<CachedWsResponse>,
         outbound_tx: mpsc::UnboundedSender<Message>,
     ) -> Result<CachedWsResponse, WsClientError> {
@@ -53,16 +62,10 @@ impl WsResponsesExecutor for GrpcWsResponsesExecutor {
         // WebSocket Responses is inherently event-streamed, so force streaming
         // on the downstream chat pipeline regardless of the client payload.
         request.stream = Some(true);
+        request.background = Some(false);
         request
             .validate()
             .map_err(|err| WsClientError::new("invalid_request", err.to_string()))?;
-
-        if request.background.unwrap_or(false) {
-            return Err(WsClientError::new(
-                "unsupported_parameter",
-                "Background mode is not supported in WebSocket Responses V1.",
-            ));
-        }
 
         if request.conversation.is_some() {
             return Err(WsClientError::new(
@@ -89,6 +92,10 @@ impl WsResponsesExecutor for GrpcWsResponsesExecutor {
             load_conversation_history_with_cache(&ctx, &request, cached_response.as_ref(), true)
                 .await
                 .map_err(response_to_ws_error)?;
+
+        if options.generate == Some(false) {
+            return warmup_response_create(&ctx, &request, &modified_request, outbound_tx).await;
+        }
 
         let (has_mcp_tools, server_keys) =
             ensure_mcp_connection(&ctx.mcp_manager, request.tools.as_deref())
@@ -149,4 +156,80 @@ fn response_to_ws_error(response: axum::response::Response) -> WsClientError {
         header_code,
         format!("WebSocket Responses request failed with status {}", status),
     )
+    .with_status(status.as_u16())
+    .with_param_if_previous_response_not_found()
+}
+
+async fn warmup_response_create(
+    ctx: &ResponsesContext,
+    request: &ResponsesRequest,
+    modified_request: &ResponsesRequest,
+    outbound_tx: mpsc::UnboundedSender<Message>,
+) -> Result<CachedWsResponse, WsClientError> {
+    let response = ResponsesResponse::builder(generate_id("resp"), &request.model)
+        .copy_from_request(request)
+        .status(ResponseStatus::Completed)
+        .output(vec![])
+        .build();
+
+    let created = json!({
+        "type": "response.created",
+        "response": {
+            "id": response.id,
+            "object": "response",
+            "status": "in_progress",
+            "model": response.model,
+            "output": []
+        }
+    });
+    send_ws_message(&outbound_tx, created)?;
+
+    let completed = json!({
+        "type": "response.completed",
+        "response": response.clone(),
+    });
+    send_ws_message(&outbound_tx, completed)?;
+
+    persist_response_if_needed(
+        ctx.conversation_storage.clone(),
+        ctx.conversation_item_storage.clone(),
+        ctx.response_storage.clone(),
+        &response,
+        request,
+    )
+    .await;
+
+    Ok(CachedWsResponse {
+        response,
+        input_items: normalize_request_input_items(modified_request),
+    })
+}
+
+fn send_ws_message(
+    outbound_tx: &mpsc::UnboundedSender<Message>,
+    payload: serde_json::Value,
+) -> Result<(), WsClientError> {
+    outbound_tx
+        .send(Message::Text(payload.to_string().into()))
+        .map_err(|_| {
+            WsClientError::new(
+                "client_disconnected",
+                "WebSocket client disconnected before response delivery.",
+            )
+            .with_status(499)
+        })
+}
+
+trait WsClientErrorExt {
+    fn with_param_if_previous_response_not_found(self) -> Self;
+}
+
+impl WsClientErrorExt for WsClientError {
+    fn with_param_if_previous_response_not_found(self) -> Self {
+        if self.code == "previous_response_not_found" {
+            self.with_param("previous_response_id")
+        } else {
+            self
+        }
+    }
 }

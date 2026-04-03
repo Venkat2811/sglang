@@ -49,6 +49,47 @@ def _benchmark_request_body(model: str) -> dict:
     }
 
 
+def _ws_request(**request_fields) -> dict:
+    return {"type": "response.create", **request_fields}
+
+
+def _chain_turn_input(turn_index: int) -> str:
+    return (
+        f"Continuation turn {turn_index}. "
+        "Reply with the single word: hello."
+    )
+
+
+def _tool_output_chain_turn_input(turn_index: int) -> list[dict]:
+    return [
+        {
+            "type": "function_call_output",
+            "call_id": f"call_chain_{turn_index}",
+            "output": json.dumps(
+                {
+                    "step": turn_index,
+                    "status": "ok",
+                    "summary": f"tool result {turn_index}",
+                    "artifacts": [f"chunk_{turn_index}_{index}" for index in range(3)],
+                }
+            ),
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": (
+                        f"Tool step {turn_index} is complete. "
+                        "Reply with the single word: hello."
+                    ),
+                }
+            ],
+        },
+    ]
+
+
 def _summarize_samples(samples: list[dict[str, float | int]]) -> dict[str, float | int]:
     def values(key: str) -> list[float]:
         return [float(sample[key]) for sample in samples]
@@ -88,10 +129,7 @@ def _summarize_samples(samples: list[dict[str, float | int]]) -> dict[str, float
 async def _run_single_ws_sample(ws_url: str, model: str) -> dict[str, float | int]:
     import websockets
 
-    request = {
-        "type": "response.create",
-        "response": _benchmark_request_body(model),
-    }
+    request = _ws_request(**_benchmark_request_body(model))
 
     connect_started_at = time.perf_counter()
     async with websockets.connect(ws_url, open_timeout=30, close_timeout=5) as websocket:
@@ -232,6 +270,246 @@ async def _run_ws_sample_batch(
     )
 
 
+async def _collect_ws_terminal_event(websocket, request: dict) -> tuple[dict, float]:
+    await websocket.send(json.dumps(request))
+    request_started_at = time.perf_counter()
+
+    while True:
+        payload = await asyncio.wait_for(websocket.recv(), timeout=90)
+        event = json.loads(payload)
+        now = time.perf_counter()
+
+        if event.get("type") == "error":
+            raise AssertionError(f"Unexpected websocket chain benchmark error: {event}")
+
+        if event.get("type") == "response.completed":
+            return event, (now - request_started_at) * 1000
+
+
+async def _run_ws_continuation_chain_sample(
+    ws_url: str, model: str, turns: int
+) -> dict[str, float | int | list[float]]:
+    import websockets
+
+    connect_started_at = time.perf_counter()
+    async with websockets.connect(ws_url, open_timeout=30, close_timeout=5) as websocket:
+        connected_at = time.perf_counter()
+
+        per_turn_ms: list[float] = []
+        response, first_turn_ms = await _collect_ws_terminal_event(
+            websocket,
+            _ws_request(
+                model=model,
+                input=_chain_turn_input(1),
+                temperature=0,
+                max_output_tokens=16,
+                store=True,
+            ),
+        )
+        per_turn_ms.append(first_turn_ms)
+        previous_response_id = response["response"]["id"]
+
+        for turn_index in range(2, turns + 1):
+            response, completed_ms = await _collect_ws_terminal_event(
+                websocket,
+                _ws_request(
+                    model=model,
+                    input=_chain_turn_input(turn_index),
+                    temperature=0,
+                    max_output_tokens=16,
+                    store=True,
+                    previous_response_id=previous_response_id,
+                ),
+            )
+            per_turn_ms.append(completed_ms)
+            previous_response_id = response["response"]["id"]
+
+    continuation_turns = per_turn_ms[1:]
+    continuation_mean_ms = (
+        statistics.fmean(continuation_turns) if continuation_turns else 0.0
+    )
+    total_chain_ms = sum(per_turn_ms)
+
+    return {
+        "connect_ms": (connected_at - connect_started_at) * 1000,
+        "turns": turns,
+        "total_chain_ms": total_chain_ms,
+        "first_turn_completed_ms": per_turn_ms[0],
+        "continuation_turn_completed_ms_mean": continuation_mean_ms,
+        "continuation_turn_completed_ms_p50": _percentile(continuation_turns, 0.50),
+        "continuation_turn_completed_ms_p95": _percentile(continuation_turns, 0.95),
+        "continuation_only_total_ms": sum(continuation_turns),
+        "per_turn_completed_ms": per_turn_ms,
+    }
+
+
+async def _run_ws_tool_output_chain_sample(
+    ws_url: str, model: str, tool_turns: int
+) -> dict[str, float | int | list[float]]:
+    import websockets
+
+    connect_started_at = time.perf_counter()
+    async with websockets.connect(ws_url, open_timeout=30, close_timeout=5) as websocket:
+        connected_at = time.perf_counter()
+
+        per_turn_ms: list[float] = []
+        response, seed_turn_ms = await _collect_ws_terminal_event(
+            websocket,
+            _ws_request(
+                model=model,
+                input="Seed the tool-output continuation chain. Reply with hello.",
+                temperature=0,
+                max_output_tokens=16,
+                store=True,
+            ),
+        )
+        per_turn_ms.append(seed_turn_ms)
+        previous_response_id = response["response"]["id"]
+
+        for turn_index in range(1, tool_turns + 1):
+            response, completed_ms = await _collect_ws_terminal_event(
+                websocket,
+                _ws_request(
+                    model=model,
+                    input=_tool_output_chain_turn_input(turn_index),
+                    temperature=0,
+                    max_output_tokens=16,
+                    store=True,
+                    previous_response_id=previous_response_id,
+                ),
+            )
+            per_turn_ms.append(completed_ms)
+            previous_response_id = response["response"]["id"]
+
+    continuation_turns = per_turn_ms[1:]
+    continuation_mean_ms = (
+        statistics.fmean(continuation_turns) if continuation_turns else 0.0
+    )
+    total_chain_ms = sum(per_turn_ms)
+
+    return {
+        "connect_ms": (connected_at - connect_started_at) * 1000,
+        "turns": tool_turns + 1,
+        "tool_turns": tool_turns,
+        "total_chain_ms": total_chain_ms,
+        "first_turn_completed_ms": per_turn_ms[0],
+        "continuation_turn_completed_ms_mean": continuation_mean_ms,
+        "continuation_turn_completed_ms_p50": _percentile(continuation_turns, 0.50),
+        "continuation_turn_completed_ms_p95": _percentile(continuation_turns, 0.95),
+        "continuation_only_total_ms": sum(continuation_turns),
+        "per_turn_completed_ms": per_turn_ms,
+    }
+
+
+def _collect_http_completed_ms(response_stream) -> tuple[object, float]:
+    request_started_at = time.perf_counter()
+
+    for event in response_stream:
+        if event.type == "response.completed":
+            return event.response, (time.perf_counter() - request_started_at) * 1000
+
+    raise AssertionError("HTTP continuation benchmark ended without response.completed")
+
+
+def _run_http_continuation_chain_sample(
+    client, model: str, turns: int
+) -> dict[str, float | int | list[float]]:
+    per_turn_ms: list[float] = []
+
+    response_stream = client.responses.create(
+        model=model,
+        input=_chain_turn_input(1),
+        temperature=0,
+        max_output_tokens=16,
+        store=True,
+        stream=True,
+    )
+    response, completed_ms = _collect_http_completed_ms(response_stream)
+    per_turn_ms.append(completed_ms)
+    previous_response_id = response.id
+
+    for turn_index in range(2, turns + 1):
+        response_stream = client.responses.create(
+            model=model,
+            input=_chain_turn_input(turn_index),
+            previous_response_id=previous_response_id,
+            temperature=0,
+            max_output_tokens=16,
+            store=True,
+            stream=True,
+        )
+        response, completed_ms = _collect_http_completed_ms(response_stream)
+        per_turn_ms.append(completed_ms)
+        previous_response_id = response.id
+
+    continuation_turns = per_turn_ms[1:]
+    continuation_mean_ms = (
+        statistics.fmean(continuation_turns) if continuation_turns else 0.0
+    )
+    total_chain_ms = sum(per_turn_ms)
+
+    return {
+        "turns": turns,
+        "total_chain_ms": total_chain_ms,
+        "first_turn_completed_ms": per_turn_ms[0],
+        "continuation_turn_completed_ms_mean": continuation_mean_ms,
+        "continuation_turn_completed_ms_p50": _percentile(continuation_turns, 0.50),
+        "continuation_turn_completed_ms_p95": _percentile(continuation_turns, 0.95),
+        "continuation_only_total_ms": sum(continuation_turns),
+        "per_turn_completed_ms": per_turn_ms,
+    }
+
+
+def _run_http_tool_output_chain_sample(
+    client, model: str, tool_turns: int
+) -> dict[str, float | int | list[float]]:
+    per_turn_ms: list[float] = []
+
+    response_stream = client.responses.create(
+        model=model,
+        input="Seed the tool-output continuation chain. Reply with hello.",
+        temperature=0,
+        max_output_tokens=16,
+        store=True,
+        stream=True,
+    )
+    response, completed_ms = _collect_http_completed_ms(response_stream)
+    per_turn_ms.append(completed_ms)
+    previous_response_id = response.id
+
+    for turn_index in range(1, tool_turns + 1):
+        response_stream = client.responses.create(
+            model=model,
+            input=_tool_output_chain_turn_input(turn_index),
+            previous_response_id=previous_response_id,
+            temperature=0,
+            max_output_tokens=16,
+            store=True,
+            stream=True,
+        )
+        response, completed_ms = _collect_http_completed_ms(response_stream)
+        per_turn_ms.append(completed_ms)
+        previous_response_id = response.id
+
+    continuation_turns = per_turn_ms[1:]
+    continuation_mean_ms = (
+        statistics.fmean(continuation_turns) if continuation_turns else 0.0
+    )
+    total_chain_ms = sum(per_turn_ms)
+
+    return {
+        "turns": tool_turns + 1,
+        "tool_turns": tool_turns,
+        "total_chain_ms": total_chain_ms,
+        "first_turn_completed_ms": per_turn_ms[0],
+        "continuation_turn_completed_ms_mean": continuation_mean_ms,
+        "continuation_turn_completed_ms_p50": _percentile(continuation_turns, 0.50),
+        "continuation_turn_completed_ms_p95": _percentile(continuation_turns, 0.95),
+        "continuation_only_total_ms": sum(continuation_turns),
+        "per_turn_completed_ms": per_turn_ms,
+    }
+
+
 def _write_summary(experiment_folder: str, payload: dict) -> Path:
     out_dir = Path.cwd() / experiment_folder
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -263,6 +541,29 @@ def _transport_ratios(http_summary: dict, ws_summary: dict) -> dict[str, float]:
             float(ws_summary["output_tokens_per_second_mean"]),
             float(http_summary["output_tokens_per_second_mean"]),
         ),
+    }
+
+
+def _chain_transport_ratios(http_sample: dict, ws_sample: dict) -> dict[str, float]:
+    def ratio(numerator: float, denominator: float) -> float:
+        if denominator <= 0:
+            return 0.0
+        return numerator / denominator
+
+    total_ratio = ratio(
+        float(ws_sample["total_chain_ms"]), float(http_sample["total_chain_ms"])
+    )
+    continuation_ratio = ratio(
+        float(ws_sample["continuation_only_total_ms"]),
+        float(http_sample["continuation_only_total_ms"]),
+    )
+
+    return {
+        "ws_over_http_total_chain": total_ratio,
+        "ws_over_http_continuation_only": continuation_ratio,
+        "ws_vs_http_total_chain_delta_pct": (1.0 - total_ratio) * 100.0,
+        "ws_vs_http_continuation_only_delta_pct": (1.0 - continuation_ratio)
+            * 100.0,
     }
 
 
@@ -367,3 +668,125 @@ class TestResponsesTransportCompare:
         assert ws_summary["request_to_first_event_ms_p50"] > 0
         assert http_summary["request_to_completed_ms_p50"] > 0
         assert ws_summary["request_to_completed_ms_p50"] > 0
+
+
+@pytest.mark.e2e
+@pytest.mark.slow
+@pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
+@pytest.mark.model("qwen-0.5b")
+@pytest.mark.gateway(extra_args=["--history-backend", "memory"])
+@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+class TestResponsesContinuationChainCompare:
+    """Long-chain continuation comparison for HTTP vs persistent WS."""
+
+    def test_http_vs_ws_continuation_chain_compare(self, setup_backend):
+        _, model, client, gateway = setup_backend
+
+        turns = int(os.environ.get("SGLANG_HTTP_WS_CHAIN_TURNS", "20"))
+        samples = int(os.environ.get("SGLANG_HTTP_WS_CHAIN_SAMPLES", "1"))
+        experiment_folder = os.environ.get(
+            "SGLANG_HTTP_WS_CHAIN_EXPERIMENT",
+            f"benchmark_http_ws_chain_compare_{model.replace('/', '_')}_{turns}turns",
+        )
+
+        http_samples = [
+            _run_http_continuation_chain_sample(client, model, turns)
+            for _ in range(samples)
+        ]
+        ws_samples = [
+            asyncio.run(
+                _run_ws_continuation_chain_sample(
+                    _gateway_ws_url(gateway.base_url), model, turns
+                )
+            )
+            for _ in range(samples)
+        ]
+
+        payload = {
+            "router_url": gateway.base_url,
+            "model": model,
+            "turns": turns,
+            "samples": samples,
+            "experiment_folder": experiment_folder,
+            "http": {
+                "transport": "http",
+                "samples": http_samples,
+            },
+            "websocket": {
+                "transport": "websocket",
+                "samples": ws_samples,
+            },
+            "ratios": _chain_transport_ratios(http_samples[0], ws_samples[0]),
+        }
+
+        summary_path = _write_summary(experiment_folder, payload)
+        logger.info("HTTP-vs-WS chain comparison summary written to %s", summary_path)
+
+        assert http_samples[0]["turns"] == turns
+        assert ws_samples[0]["turns"] == turns
+        assert float(http_samples[0]["total_chain_ms"]) > 0
+        assert float(ws_samples[0]["total_chain_ms"]) > 0
+
+
+@pytest.mark.e2e
+@pytest.mark.slow
+@pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
+@pytest.mark.model("qwen-0.5b")
+@pytest.mark.gateway(extra_args=["--history-backend", "memory"])
+@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+class TestResponsesToolOutputChainCompare:
+    """Tool-output-heavy continuation comparison for HTTP vs persistent WS."""
+
+    def test_http_vs_ws_tool_output_chain_compare(self, setup_backend):
+        _, model, client, gateway = setup_backend
+
+        tool_turns = int(os.environ.get("SGLANG_HTTP_WS_TOOL_CHAIN_TURNS", "20"))
+        samples = int(os.environ.get("SGLANG_HTTP_WS_TOOL_CHAIN_SAMPLES", "1"))
+        experiment_folder = os.environ.get(
+            "SGLANG_HTTP_WS_TOOL_CHAIN_EXPERIMENT",
+            (
+                "benchmark_http_ws_tool_chain_compare_"
+                f"{model.replace('/', '_')}_{tool_turns}toolturns"
+            ),
+        )
+
+        http_samples = [
+            _run_http_tool_output_chain_sample(client, model, tool_turns)
+            for _ in range(samples)
+        ]
+        ws_samples = [
+            asyncio.run(
+                _run_ws_tool_output_chain_sample(
+                    _gateway_ws_url(gateway.base_url), model, tool_turns
+                )
+            )
+            for _ in range(samples)
+        ]
+
+        payload = {
+            "router_url": gateway.base_url,
+            "model": model,
+            "tool_turns": tool_turns,
+            "samples": samples,
+            "experiment_folder": experiment_folder,
+            "http": {
+                "transport": "http",
+                "samples": http_samples,
+            },
+            "websocket": {
+                "transport": "websocket",
+                "samples": ws_samples,
+            },
+            "ratios": _chain_transport_ratios(http_samples[0], ws_samples[0]),
+        }
+
+        summary_path = _write_summary(experiment_folder, payload)
+        logger.info(
+            "HTTP-vs-WS tool-output chain comparison summary written to %s",
+            summary_path,
+        )
+
+        assert http_samples[0]["tool_turns"] == tool_turns
+        assert ws_samples[0]["tool_turns"] == tool_turns
+        assert float(http_samples[0]["total_chain_ms"]) > 0
+        assert float(ws_samples[0]["total_chain_ms"]) > 0

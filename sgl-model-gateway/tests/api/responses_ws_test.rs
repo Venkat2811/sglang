@@ -17,8 +17,8 @@ use smg::{
     routers::{
         router_manager::{router_ids, RouterManager},
         ws_responses::{
-            serve_responses_ws_with_config, CachedWsResponse, WsClientError, WsResponsesExecutor,
-            WsRuntimeConfig,
+            serve_responses_ws_with_config, CachedWsResponse, WsClientError,
+            WsResponseCreateOptions, WsResponsesExecutor, WsRuntimeConfig,
         },
         RouterTrait,
     },
@@ -53,6 +53,7 @@ impl WsResponsesExecutor for StubWsExecutor {
         &self,
         _headers: HeaderMap,
         request: ResponsesRequest,
+        _options: WsResponseCreateOptions,
         _cached_response: Option<CachedWsResponse>,
         outbound_tx: mpsc::UnboundedSender<Message>,
     ) -> Result<CachedWsResponse, WsClientError> {
@@ -115,6 +116,126 @@ impl WsResponsesExecutor for StubWsExecutor {
                 role: "user".to_string(),
                 content: vec![ResponseContentPart::InputText {
                     text: "Hello websocket".to_string(),
+                }],
+                status: Some("completed".to_string()),
+            }],
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+struct FunctionCallWsExecutor;
+
+#[async_trait]
+impl WsResponsesExecutor for FunctionCallWsExecutor {
+    async fn execute_response_create(
+        &self,
+        _headers: HeaderMap,
+        request: ResponsesRequest,
+        _options: WsResponseCreateOptions,
+        _cached_response: Option<CachedWsResponse>,
+        outbound_tx: mpsc::UnboundedSender<Message>,
+    ) -> Result<CachedWsResponse, WsClientError> {
+        let response_id = "resp_ws_tool_test";
+        let item_id = "fc_ws_test";
+        let call_id = "call_ws_test";
+        let tool_name = "search_repo";
+        let arguments = r#"{"query":"fizz_buzz"}"#;
+        let model = request.model.clone();
+
+        let created = serde_json::json!({
+            "type": "response.created",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "status": "in_progress",
+                "model": model,
+                "output": []
+            }
+        });
+        let _ = outbound_tx.send(Message::Text(created.to_string().into()));
+
+        let output_item_added = serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": item_id,
+                "type": "function_call",
+                "call_id": call_id,
+                "name": tool_name,
+                "status": "in_progress",
+                "arguments": ""
+            }
+        });
+        let _ = outbound_tx.send(Message::Text(output_item_added.to_string().into()));
+
+        let args_delta = serde_json::json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": item_id,
+            "delta": arguments
+        });
+        let _ = outbound_tx.send(Message::Text(args_delta.to_string().into()));
+
+        let args_done = serde_json::json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "item_id": item_id,
+            "arguments": arguments
+        });
+        let _ = outbound_tx.send(Message::Text(args_done.to_string().into()));
+
+        let output_item_done = serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": item_id,
+                "type": "function_call",
+                "call_id": call_id,
+                "name": tool_name,
+                "status": "completed",
+                "arguments": arguments
+            }
+        });
+        let _ = outbound_tx.send(Message::Text(output_item_done.to_string().into()));
+
+        let response = ResponsesResponse::builder(response_id, request.model.clone())
+            .copy_from_request(&request)
+            .status(ResponseStatus::Completed)
+            .output(vec![ResponseOutputItem::FunctionToolCall {
+                id: item_id.to_string(),
+                call_id: call_id.to_string(),
+                name: tool_name.to_string(),
+                arguments: arguments.to_string(),
+                output: None,
+                status: "completed".to_string(),
+            }])
+            .build();
+
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": response,
+        });
+        let _ = outbound_tx.send(Message::Text(completed.to_string().into()));
+
+        Ok(CachedWsResponse {
+            response: ResponsesResponse::builder(response_id, request.model.clone())
+                .copy_from_request(&request)
+                .status(ResponseStatus::Completed)
+                .output(vec![ResponseOutputItem::FunctionToolCall {
+                    id: item_id.to_string(),
+                    call_id: call_id.to_string(),
+                    name: tool_name.to_string(),
+                    arguments: arguments.to_string(),
+                    output: None,
+                    status: "completed".to_string(),
+                }])
+                .build(),
+            input_items: vec![ResponseInputOutputItem::Message {
+                id: "msg_user_ws_tool_test".to_string(),
+                role: "user".to_string(),
+                content: vec![ResponseContentPart::InputText {
+                    text: "Call the search tool.".to_string(),
                 }],
                 status: Some("completed".to_string()),
             }],
@@ -248,6 +369,39 @@ async fn send_ws_request_and_collect(
     events
 }
 
+fn ws_create_request(response_fields: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(mut request) = response_fields else {
+        panic!("response.create request fields must be a JSON object");
+    };
+    request.insert(
+        "type".to_string(),
+        serde_json::Value::String("response.create".to_string()),
+    );
+    serde_json::Value::Object(request)
+}
+
+fn ws_error_code(event: &serde_json::Value) -> &str {
+    event
+        .pointer("/error/code")
+        .and_then(|value| value.as_str())
+        .or_else(|| event.get("code").and_then(|value| value.as_str()))
+        .unwrap_or("")
+}
+
+fn ws_error_message(event: &serde_json::Value) -> &str {
+    event
+        .pointer("/error/message")
+        .and_then(|value| value.as_str())
+        .or_else(|| event.get("message").and_then(|value| value.as_str()))
+        .unwrap_or("")
+}
+
+fn ws_error_param(event: &serde_json::Value) -> Option<&str> {
+    event
+        .pointer("/error/param")
+        .and_then(|value| value.as_str())
+}
+
 #[derive(Clone, Default)]
 struct SemanticWsExecutor {
     durable_store: Arc<std::sync::Mutex<HashMap<String, CachedWsResponse>>>,
@@ -265,21 +419,58 @@ impl WsResponsesExecutor for SemanticWsExecutor {
         &self,
         _headers: HeaderMap,
         request: ResponsesRequest,
+        options: WsResponseCreateOptions,
         cached_response: Option<CachedWsResponse>,
         outbound_tx: mpsc::UnboundedSender<Message>,
     ) -> Result<CachedWsResponse, WsClientError> {
-        if request.background.unwrap_or(false) {
-            return Err(WsClientError::new(
-                "unsupported_parameter",
-                "Background mode is not supported in WebSocket Responses V1.",
-            ));
-        }
-
         if request.conversation.is_some() {
             return Err(WsClientError::new(
                 "unsupported_parameter",
                 "The `conversation` field is not supported in WebSocket Responses V1.",
             ));
+        }
+
+        if options.generate == Some(false) {
+            let response_id = format!("resp_ws_{}", uuid::Uuid::new_v4().simple());
+            let response = ResponsesResponse::builder(response_id.clone(), request.model.clone())
+                .copy_from_request(&request)
+                .status(ResponseStatus::Completed)
+                .output(vec![])
+                .build();
+
+            let created = serde_json::json!({
+                "type": "response.created",
+                "response": {
+                    "id": response_id.clone(),
+                    "object": "response",
+                    "status": "in_progress",
+                    "model": request.model.clone(),
+                    "output": []
+                }
+            });
+            let _ = outbound_tx.send(Message::Text(created.to_string().into()));
+
+            let completed = serde_json::json!({
+                "type": "response.completed",
+                "response": response,
+            });
+            let _ = outbound_tx.send(Message::Text(completed.to_string().into()));
+
+            return Ok(CachedWsResponse {
+                response: ResponsesResponse::builder(response_id, request.model.clone())
+                    .copy_from_request(&request)
+                    .status(ResponseStatus::Completed)
+                    .output(vec![])
+                    .build(),
+                input_items: vec![ResponseInputOutputItem::Message {
+                    id: "msg_user_ws_semantic".to_string(),
+                    role: "user".to_string(),
+                    content: vec![ResponseContentPart::InputText {
+                        text: "Hello websocket".to_string(),
+                    }],
+                    status: Some("completed".to_string()),
+                }],
+            });
         }
 
         let previous_response = if let Some(previous_id) = request.previous_response_id.as_deref() {
@@ -300,6 +491,7 @@ impl WsResponsesExecutor for SemanticWsExecutor {
                                 previous_id
                             ),
                         )
+                        .with_param("previous_response_id")
                     })?
                     .into()
             }
@@ -410,7 +602,7 @@ async fn test_v1_responses_ws_rejects_unknown_event_type() {
 
     let event = recv_json(&mut socket).await;
     assert_eq!(event["type"], "error");
-    assert_eq!(event["code"], "unsupported_event");
+    assert_eq!(ws_error_code(&event), "unsupported_event");
 }
 
 #[tokio::test]
@@ -429,7 +621,7 @@ async fn test_v1_responses_ws_rejects_invalid_json() {
 
     let event = recv_json(&mut socket).await;
     assert_eq!(event["type"], "error");
-    assert_eq!(event["code"], "invalid_json");
+    assert_eq!(ws_error_code(&event), "invalid_json");
 }
 
 #[tokio::test]
@@ -448,7 +640,7 @@ async fn test_v1_responses_ws_rejects_binary_messages() {
 
     let event = recv_json(&mut socket).await;
     assert_eq!(event["type"], "error");
-    assert_eq!(event["code"], "unsupported_message_type");
+    assert_eq!(ws_error_code(&event), "unsupported_message_type");
 }
 
 #[tokio::test]
@@ -481,14 +673,11 @@ async fn test_v1_responses_ws_replies_to_ping_and_keeps_session_healthy() {
 
     let events = send_ws_request_and_collect(
         &mut socket,
-        serde_json::json!({
-            "type": "response.create",
-            "response": {
-                "model": "mock-model",
-                "input": "Hello websocket after ping",
-                "store": false
-            }
-        }),
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Hello websocket after ping",
+            "store": false
+        })),
     )
     .await;
 
@@ -512,6 +701,10 @@ async fn test_v1_responses_ws_closes_when_session_lifetime_expires() {
         .await
         .unwrap();
 
+    let error = recv_json(&mut socket).await;
+    assert_eq!(error["type"], "error");
+    assert_eq!(ws_error_code(&error), "websocket_connection_limit_reached");
+
     let close_message = tokio::time::timeout(Duration::from_secs(2), socket.next())
         .await
         .expect("timed out waiting for websocket close")
@@ -523,7 +716,7 @@ async fn test_v1_responses_ws_closes_when_session_lifetime_expires() {
             let frame = frame.expect("expected server close frame");
             assert_eq!(
                 frame.reason.to_string(),
-                "WebSocket Responses session lifetime expired."
+                "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue."
             );
         }
         other => panic!("expected websocket close frame, got {:?}", other),
@@ -539,14 +732,11 @@ async fn test_v1_responses_ws_response_create_streams_events() {
 
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({
-                "type": "response.create",
-                "response": {
-                    "model": "mock-model",
-                    "input": "Hello websocket",
-                    "store": false
-                }
-            })
+            ws_create_request(serde_json::json!({
+                "model": "mock-model",
+                "input": "Hello websocket",
+                "store": false
+            }))
             .to_string()
             .into(),
         ))
@@ -562,6 +752,77 @@ async fn test_v1_responses_ws_response_create_streams_events() {
         completed["response"]["output"][0]["content"][0]["text"],
         "stub websocket output"
     );
+}
+
+#[tokio::test]
+async fn test_v1_responses_ws_function_call_events_stream_cleanly() {
+    let url = serve_app(build_stub_app(Arc::new(FunctionCallWsExecutor)).await).await;
+    let (mut socket, _) = connect_async(format!("{}/v1/responses", url))
+        .await
+        .unwrap();
+
+    let events = send_ws_request_and_collect(
+        &mut socket,
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Call the tool",
+            "store": false
+        })),
+    )
+    .await;
+
+    let event_types: Vec<_> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap_or(""))
+        .collect();
+
+    assert_eq!(
+        event_types,
+        vec![
+            "response.created",
+            "response.output_item.added",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
+            "response.completed",
+        ]
+    );
+    assert_eq!(events[1]["item"]["type"], "function_call");
+    assert_eq!(events[2]["delta"], r#"{"query":"fizz_buzz"}"#);
+    assert_eq!(events[3]["arguments"], r#"{"query":"fizz_buzz"}"#);
+    assert_eq!(events[4]["item"]["call_id"], "call_ws_test");
+    assert_eq!(events[4]["item"]["name"], "search_repo");
+    assert_eq!(
+        events.last().unwrap()["response"]["output"][0]["call_id"],
+        "call_ws_test"
+    );
+    assert_eq!(
+        events.last().unwrap()["response"]["output"][0]["arguments"],
+        r#"{"query":"fizz_buzz"}"#
+    );
+}
+
+#[tokio::test]
+async fn test_v1_responses_ws_accepts_top_level_response_create_payload() {
+    let url = serve_app(build_stub_app(Arc::new(StubWsExecutor::immediate())).await).await;
+    let (mut socket, _) = connect_async(format!("{}/v1/responses", url))
+        .await
+        .unwrap();
+
+    let events = send_ws_request_and_collect(
+        &mut socket,
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Top level websocket request",
+            "store": false,
+            "tools": []
+        })),
+    )
+    .await;
+
+    let completed = events.last().unwrap();
+    assert_eq!(events[0]["type"], "response.created");
+    assert_eq!(completed["type"], "response.completed");
 }
 
 #[tokio::test]
@@ -591,14 +852,11 @@ async fn test_v1_responses_ws_rejects_second_inflight_request() {
         .await
         .unwrap();
 
-    let request = serde_json::json!({
-        "type": "response.create",
-        "response": {
-            "model": "mock-model",
-            "input": "Hello websocket",
-            "store": false
-        }
-    });
+    let request = ws_create_request(serde_json::json!({
+        "model": "mock-model",
+        "input": "Hello websocket",
+        "store": false
+    }));
 
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -619,7 +877,7 @@ async fn test_v1_responses_ws_rejects_second_inflight_request() {
 
     let error = recv_json(&mut socket).await;
     assert_eq!(error["type"], "error");
-    assert_eq!(error["code"], "concurrent_response_create");
+    assert_eq!(ws_error_code(&error), "concurrent_response_create");
 
     gate.notify_waiters();
     let completed = recv_json(&mut socket).await;
@@ -646,14 +904,11 @@ async fn test_v1_responses_ws_via_router_manager_streams_events() {
 
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({
-                "type": "response.create",
-                "response": {
-                    "model": "mock-model",
-                    "input": "Hello websocket",
-                    "store": false
-                }
-            })
+            ws_create_request(serde_json::json!({
+                "model": "mock-model",
+                "input": "Hello websocket",
+                "store": false
+            }))
             .to_string()
             .into(),
         ))
@@ -680,14 +935,11 @@ async fn test_v1_responses_ws_same_connection_store_false_continuation_completes
 
     let first_events = send_ws_request_and_collect(
         &mut socket,
-        serde_json::json!({
-            "type": "response.create",
-            "response": {
-                "model": "mock-model",
-                "input": "First websocket turn",
-                "store": false
-            }
-        }),
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "First websocket turn",
+            "store": false
+        })),
     )
     .await;
     let first_completed = first_events.last().unwrap();
@@ -700,15 +952,12 @@ async fn test_v1_responses_ws_same_connection_store_false_continuation_completes
 
     let second_events = send_ws_request_and_collect(
         &mut socket,
-        serde_json::json!({
-            "type": "response.create",
-            "response": {
-                "model": "mock-model",
-                "input": "Follow up websocket turn",
-                "previous_response_id": response_id,
-                "store": false
-            }
-        }),
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Follow up websocket turn",
+            "previous_response_id": response_id,
+            "store": false
+        })),
     )
     .await;
 
@@ -722,15 +971,12 @@ async fn test_v1_responses_ws_same_connection_store_false_continuation_completes
 
     let third_events = send_ws_request_and_collect(
         &mut socket,
-        serde_json::json!({
-            "type": "response.create",
-            "response": {
-                "model": "mock-model",
-                "input": "Third websocket turn",
-                "previous_response_id": second_response_id,
-                "store": false
-            }
-        }),
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Third websocket turn",
+            "previous_response_id": second_response_id,
+            "store": false
+        })),
     )
     .await;
 
@@ -748,14 +994,11 @@ async fn test_v1_responses_ws_store_true_continuation_survives_reconnect() {
         .unwrap();
     let first_events = send_ws_request_and_collect(
         &mut first_socket,
-        serde_json::json!({
-            "type": "response.create",
-            "response": {
-                "model": "mock-model",
-                "input": "Persist this websocket turn",
-                "store": true
-            }
-        }),
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Persist this websocket turn",
+            "store": true
+        })),
     )
     .await;
     let first_completed = first_events.last().unwrap();
@@ -771,15 +1014,12 @@ async fn test_v1_responses_ws_store_true_continuation_survives_reconnect() {
         .unwrap();
     let second_events = send_ws_request_and_collect(
         &mut second_socket,
-        serde_json::json!({
-            "type": "response.create",
-            "response": {
-                "model": "mock-model",
-                "input": "Reconnect follow up websocket turn",
-                "previous_response_id": response_id,
-                "store": false
-            }
-        }),
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Reconnect follow up websocket turn",
+            "previous_response_id": response_id,
+            "store": false
+        })),
     )
     .await;
 
@@ -796,21 +1036,19 @@ async fn test_v1_responses_ws_missing_previous_response_errors() {
 
     let events = send_ws_request_and_collect(
         &mut socket,
-        serde_json::json!({
-            "type": "response.create",
-            "response": {
-                "model": "mock-model",
-                "input": "Missing previous response id",
-                "previous_response_id": "resp_missing_ws",
-                "store": false
-            }
-        }),
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Missing previous response id",
+            "previous_response_id": "resp_missing_ws",
+            "store": false
+        })),
     )
     .await;
 
     let error = events.last().unwrap();
     assert_eq!(error["type"], "error");
-    assert_eq!(error["code"], "previous_response_not_found");
+    assert_eq!(ws_error_code(error), "previous_response_not_found");
+    assert_eq!(ws_error_param(error), Some("previous_response_id"));
 }
 
 #[tokio::test]
@@ -820,29 +1058,113 @@ async fn test_v1_responses_ws_rejects_unsupported_parameters() {
         .await
         .unwrap();
 
-    for request in [
-        serde_json::json!({
-            "type": "response.create",
-            "response": {
-                "model": "mock-model",
-                "input": "Background websocket request",
-                "background": true
-            }
-        }),
-        serde_json::json!({
-            "type": "response.create",
-            "response": {
-                "model": "mock-model",
-                "input": "Conversation websocket request",
-                "conversation": "conv_test_123"
-            }
-        }),
-    ] {
-        let events = send_ws_request_and_collect(&mut socket, request).await;
-        let error = events.last().unwrap();
-        assert_eq!(error["type"], "error");
-        assert_eq!(error["code"], "unsupported_parameter");
-    }
+    let background_events = send_ws_request_and_collect(
+        &mut socket,
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Background websocket request",
+            "background": true
+        })),
+    )
+    .await;
+    assert_eq!(
+        background_events.last().unwrap()["type"],
+        "response.completed"
+    );
+
+    let events = send_ws_request_and_collect(
+        &mut socket,
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Conversation websocket request",
+            "conversation": "conv_test_123"
+        })),
+    )
+    .await;
+    let error = events.last().unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(ws_error_code(error), "unsupported_parameter");
+}
+
+#[tokio::test]
+async fn test_v1_responses_ws_accepts_generate_false_warmup() {
+    let url = serve_app(build_stub_app(Arc::new(SemanticWsExecutor::new())).await).await;
+    let (mut socket, _) = connect_async(format!("{}/v1/responses", url))
+        .await
+        .unwrap();
+
+    let warmup_events = send_ws_request_and_collect(
+        &mut socket,
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Warm up websocket request",
+            "generate": false,
+            "store": false
+        })),
+    )
+    .await;
+
+    let completed = warmup_events.last().unwrap();
+    assert_eq!(completed["type"], "response.completed");
+    assert_eq!(
+        completed["response"]["output"]
+            .as_array()
+            .expect("warmup output should be an array")
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_v1_responses_ws_evicts_cached_response_after_failed_continuation() {
+    let url = serve_app(build_stub_app(Arc::new(SemanticWsExecutor::new())).await).await;
+    let (mut socket, _) = connect_async(format!("{}/v1/responses", url))
+        .await
+        .unwrap();
+
+    let first_events = send_ws_request_and_collect(
+        &mut socket,
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "First websocket turn",
+            "store": false
+        })),
+    )
+    .await;
+    let first_completed = first_events.last().unwrap();
+    let response_id = first_completed["response"]["id"]
+        .as_str()
+        .expect("completed response should include id")
+        .to_string();
+
+    let failed_events = send_ws_request_and_collect(
+        &mut socket,
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Fail this continuation",
+            "previous_response_id": response_id,
+            "conversation": "conv_test_123",
+            "store": false
+        })),
+    )
+    .await;
+    let failed_error = failed_events.last().unwrap();
+    assert_eq!(failed_error["type"], "error");
+    assert_eq!(ws_error_code(failed_error), "unsupported_parameter");
+
+    let retry_events = send_ws_request_and_collect(
+        &mut socket,
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Retry after failed continuation",
+            "previous_response_id": response_id,
+            "store": false
+        })),
+    )
+    .await;
+    let retry_error = retry_events.last().unwrap();
+    assert_eq!(retry_error["type"], "error");
+    assert_eq!(ws_error_code(retry_error), "previous_response_not_found");
 }
 
 #[tokio::test]
@@ -854,21 +1176,18 @@ async fn test_v1_responses_ws_errors_echo_event_id() {
 
     let events = send_ws_request_and_collect(
         &mut socket,
-        serde_json::json!({
-            "type": "response.create",
+        ws_create_request(serde_json::json!({
             "event_id": "evt_ws_123",
-            "response": {
-                "model": "mock-model",
-                "input": "Conversation websocket request",
-                "conversation": "conv_test_123"
-            }
-        }),
+            "model": "mock-model",
+            "input": "Conversation websocket request",
+            "conversation": "conv_test_123"
+        })),
     )
     .await;
 
     let error = events.last().unwrap();
     assert_eq!(error["type"], "error");
-    assert_eq!(error["code"], "unsupported_parameter");
+    assert_eq!(ws_error_code(error), "unsupported_parameter");
     assert_eq!(error["event_id"], "evt_ws_123");
-    assert!(error["message"].is_string());
+    assert!(!ws_error_message(error).is_empty());
 }

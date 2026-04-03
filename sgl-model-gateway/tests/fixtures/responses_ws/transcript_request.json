@@ -1,19 +1,17 @@
 {
   "type": "response.create",
-  "response": {
-    "model": "mock-model",
-    "input": [
-      {
-        "type": "message",
-        "role": "user",
-        "content": [
-          {
-            "type": "input_text",
-            "text": "Say hello from a transcript fixture."
-          }
-        ]
-      }
-    ],
-    "store": false
-  }
+  "model": "mock-model",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Say hello from a transcript fixture."
+        }
+      ]
+    }
+  ],
+  "store": false
 }
