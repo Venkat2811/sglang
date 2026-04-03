@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use axum::{body::Body, http::StatusCode, response::Response};
+use axum::{body::Body, extract::ws::Message, http::StatusCode, response::Response};
 use bytes::Bytes;
 use serde_json::json;
 use smg_mcp as mcp;
@@ -24,6 +24,111 @@ use crate::{
     },
     routers::grpc::harmony::responses::ToolResult,
 };
+
+pub(crate) trait ResponseEventSink {
+    fn send_event(&self, event: &serde_json::Value) -> Result<(), String>;
+    fn send_raw_json(&self, payload: &str) -> Result<(), String>;
+    fn send_done(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SseResponseEventSink {
+    tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+}
+
+impl SseResponseEventSink {
+    pub fn new(tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>) -> Self {
+        Self { tx }
+    }
+}
+
+impl ResponseEventSink for SseResponseEventSink {
+    fn send_event(&self, event: &serde_json::Value) -> Result<(), String> {
+        let event_json = serde_json::to_string(event)
+            .map_err(|e| format!("Failed to serialize event: {}", e))?;
+
+        let event_type = event
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("message");
+        let sse_message = format!("event: {}\ndata: {}\n\n", event_type, event_json);
+
+        if self.tx.send(Ok(Bytes::from(sse_message))).is_err() {
+            return Err("Client disconnected".to_string());
+        }
+
+        Ok(())
+    }
+
+    fn send_raw_json(&self, payload: &str) -> Result<(), String> {
+        if self
+            .tx
+            .send(Ok(Bytes::from(format!("data: {}\n\n", payload))))
+            .is_err()
+        {
+            return Err("Client disconnected".to_string());
+        }
+
+        Ok(())
+    }
+
+    fn send_done(&self) -> Result<(), String> {
+        if self.tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).is_err() {
+            return Err("Client disconnected".to_string());
+        }
+
+        Ok(())
+    }
+}
+
+impl ResponseEventSink for mpsc::UnboundedSender<Result<Bytes, std::io::Error>> {
+    fn send_event(&self, event: &serde_json::Value) -> Result<(), String> {
+        SseResponseEventSink::new(self.clone()).send_event(event)
+    }
+
+    fn send_raw_json(&self, payload: &str) -> Result<(), String> {
+        SseResponseEventSink::new(self.clone()).send_raw_json(payload)
+    }
+
+    fn send_done(&self) -> Result<(), String> {
+        SseResponseEventSink::new(self.clone()).send_done()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct WsResponseEventSink {
+    tx: mpsc::UnboundedSender<Message>,
+}
+
+impl WsResponseEventSink {
+    pub fn new(tx: mpsc::UnboundedSender<Message>) -> Self {
+        Self { tx }
+    }
+}
+
+impl ResponseEventSink for WsResponseEventSink {
+    fn send_event(&self, event: &serde_json::Value) -> Result<(), String> {
+        let event_json = serde_json::to_string(event)
+            .map_err(|e| format!("Failed to serialize event: {}", e))?;
+        if self.tx.send(Message::Text(event_json.into())).is_err() {
+            return Err("Client disconnected".to_string());
+        }
+        Ok(())
+    }
+
+    fn send_raw_json(&self, payload: &str) -> Result<(), String> {
+        if self
+            .tx
+            .send(Message::Text(payload.to_string().into()))
+            .is_err()
+        {
+            return Err("Client disconnected".to_string());
+        }
+        Ok(())
+    }
+}
 
 pub(crate) enum OutputItemType {
     Message,
@@ -637,7 +742,7 @@ impl ResponseStreamEventEmitter {
     /// They don't have streaming content - just wrapper events with empty/null content.
     pub fn emit_reasoning_item(
         &mut self,
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        sink: &impl ResponseEventSink,
         reasoning_content: Option<String>,
     ) -> Result<(), String> {
         // Allocate output index and generate ID
@@ -655,11 +760,11 @@ impl ResponseStreamEventEmitter {
 
         // Emit output_item.added
         let added_event = self.emit_output_item_added(output_index, &item);
-        self.send_event(&added_event, tx)?;
+        self.send_event(&added_event, sink)?;
 
         // Immediately emit output_item.done (no streaming for reasoning)
         let done_event = self.emit_output_item_done(output_index, &item);
-        self.send_event(&done_event, tx)?;
+        self.send_event(&done_event, sink)?;
 
         // Mark as completed
         self.complete_output_item(output_index);
@@ -671,7 +776,7 @@ impl ResponseStreamEventEmitter {
     pub fn process_chunk(
         &mut self,
         chunk: &ChatCompletionStreamResponse,
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        sink: &impl ResponseEventSink,
     ) -> Result<(), String> {
         // Process content if present
         if let Some(choice) = chunk.choices.first() {
@@ -692,7 +797,7 @@ impl ResponseStreamEventEmitter {
 
                         // Emit output_item.added
                         let event = self.emit_output_item_added(output_index, &item);
-                        self.send_event(&event, tx)?;
+                        self.send_event(&event, sink)?;
                         self.has_emitted_output_item_added = true;
 
                         // Store for subsequent events
@@ -708,14 +813,14 @@ impl ResponseStreamEventEmitter {
                     if !self.has_emitted_content_part_added {
                         let event =
                             self.emit_content_part_added(output_index, &item_id, content_index);
-                        self.send_event(&event, tx)?;
+                        self.send_event(&event, sink)?;
                         self.has_emitted_content_part_added = true;
                     }
 
                     // Emit text delta
                     let event =
                         self.emit_text_delta(content, output_index, &item_id, content_index);
-                    self.send_event(&event, tx)?;
+                    self.send_event(&event, sink)?;
                 }
             }
 
@@ -729,10 +834,10 @@ impl ResponseStreamEventEmitter {
                     // Emit closing events
                     if self.has_emitted_content_part_added {
                         let event = self.emit_text_done(output_index, &item_id, content_index);
-                        self.send_event(&event, tx)?;
+                        self.send_event(&event, sink)?;
                         let event =
                             self.emit_content_part_done(output_index, &item_id, content_index);
-                        self.send_event(&event, tx)?;
+                        self.send_event(&event, sink)?;
                     }
 
                     if self.has_emitted_output_item_added {
@@ -747,7 +852,7 @@ impl ResponseStreamEventEmitter {
                             }]
                         });
                         let event = self.emit_output_item_done(output_index, &item);
-                        self.send_event(&event, tx)?;
+                        self.send_event(&event, sink)?;
                     }
 
                     // Mark item as completed
@@ -762,25 +867,9 @@ impl ResponseStreamEventEmitter {
     pub fn send_event(
         &self,
         event: &serde_json::Value,
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        sink: &impl ResponseEventSink,
     ) -> Result<(), String> {
-        let event_json = serde_json::to_string(event)
-            .map_err(|e| format!("Failed to serialize event: {}", e))?;
-
-        // Extract event type from the JSON for SSE event field
-        let event_type = event
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("message");
-
-        // Format as SSE with event: field
-        let sse_message = format!("event: {}\ndata: {}\n\n", event_type, event_json);
-
-        if tx.send(Ok(Bytes::from(sse_message))).is_err() {
-            return Err("Client disconnected".to_string());
-        }
-
-        Ok(())
+        sink.send_event(event)
     }
 
     /// Send event and log any errors (typically client disconnect)
@@ -791,9 +880,9 @@ impl ResponseStreamEventEmitter {
     pub fn send_event_best_effort(
         &self,
         event: &serde_json::Value,
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        sink: &impl ResponseEventSink,
     ) -> bool {
-        match self.send_event(event, tx) {
+        match self.send_event(event, sink) {
             Ok(()) => true,
             Err(e) => {
                 tracing::debug!("Failed to send event (likely client disconnect): {}", e);
@@ -811,7 +900,7 @@ impl ResponseStreamEventEmitter {
         &mut self,
         error_msg: &str,
         error_code: Option<&str>,
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        sink: &impl ResponseEventSink,
     ) {
         let event = json!({
             "type": "error",
@@ -820,8 +909,7 @@ impl ResponseStreamEventEmitter {
             "param": null,
             "sequence_number": self.next_sequence()
         });
-        let sse_data = format!("data: {}\n\n", serde_json::to_string(&event).unwrap());
-        let _ = tx.send(Ok(Bytes::from(sse_data)));
+        let _ = sink.send_raw_json(&serde_json::to_string(&event).unwrap());
     }
 }
 
