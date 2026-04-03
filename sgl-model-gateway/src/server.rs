@@ -7,7 +7,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{ws::WebSocketUpgrade, FromRequestParts, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -53,7 +53,7 @@ use crate::{
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
-        conversations,
+        conversations, error as router_error,
         mesh::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
             get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
@@ -235,6 +235,31 @@ async fn v1_responses(
         .router
         .route_responses(Some(&headers), &body, Some(&body.model))
         .await
+}
+
+async fn v1_responses_ws(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    if !state.router.supports_responses_ws() {
+        return router_error::not_implemented(
+            "responses_ws_not_supported",
+            "WebSocket Responses are not supported for this router.",
+        );
+    }
+
+    let (mut parts, _body) = req.into_parts();
+    let headers = parts.headers.clone();
+
+    let Ok(ws) = WebSocketUpgrade::from_request_parts(&mut parts, &()).await else {
+        return router_error::bad_request(
+            "websocket_upgrade_required",
+            "GET /v1/responses requires a WebSocket upgrade request.",
+        );
+    };
+
+    let router = state.router.clone();
+    ws.on_upgrade(move |socket| async move {
+        router.route_responses_ws(headers, socket).await;
+    })
+    .into_response()
 }
 
 async fn v1_embeddings(
@@ -558,7 +583,7 @@ pub fn build_app(
         .route("/v1/completions", post(v1_completions))
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
-        .route("/v1/responses", post(v1_responses))
+        .route("/v1/responses", get(v1_responses_ws).post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
         .route("/v1/classify", post(v1_classify))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
