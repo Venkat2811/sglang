@@ -259,6 +259,13 @@ pub(crate) async fn load_conversation_history_with_cache(
                 .await
             {
                 Ok(chain) => {
+                    if chain.responses.is_empty() {
+                        return Err(missing_previous_response_response(
+                            prev_id_str,
+                            strict_missing_previous,
+                        ));
+                    }
+
                     let mut items = Vec::new();
                     for stored in chain.responses.iter() {
                         // Convert input items from stored input (which is now a JSON array)
@@ -303,20 +310,13 @@ pub(crate) async fn load_conversation_history_with_cache(
                     modified_request.previous_response_id = None;
                 }
                 Err(e) => {
-                    if strict_missing_previous {
-                        return Err(error::not_found(
-                            "previous_response_not_found",
-                            format!(
-                                "Previous response '{}' was not found in the current session or durable storage.",
-                                prev_id_str
-                            ),
-                        ));
-                    }
-
-                    warn!(
-                        "Failed to load previous response chain for {}: {}",
-                        prev_id_str, e
-                    );
+                    return Err(error::internal_error(
+                        "load_previous_response_chain_failed",
+                        format!(
+                            "Failed to load previous response chain for '{}': {}",
+                            prev_id_str, e
+                        ),
+                    ));
                 }
             }
         }
@@ -442,6 +442,22 @@ pub(crate) async fn load_conversation_history_with_cache(
     );
 
     Ok(modified_request)
+}
+
+fn missing_previous_response_response(
+    previous_response_id: &str,
+    strict_missing_previous: bool,
+) -> Response {
+    let message = if strict_missing_previous {
+        format!(
+            "Previous response '{}' was not found in the current session or durable storage.",
+            previous_response_id
+        )
+    } else {
+        format!("Previous response '{}' not found.", previous_response_id)
+    };
+
+    error::not_found("previous_response_not_found", message)
 }
 
 pub(crate) fn normalize_request_input_items(
