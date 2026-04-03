@@ -181,6 +181,7 @@ sgl-model-gateway/e2e_test/benchmark_ws_microbench_*/
 sgl-model-gateway/e2e_test/benchmark_http_ws_compare_*/
 sgl-model-gateway/e2e_test/benchmark_http_ws_chain_compare_*/
 sgl-model-gateway/e2e_test/benchmark_http_ws_tool_chain_compare_*/
+sgl-model-gateway/e2e_test/benchmark_http_ws_model_tool_chain_compare_*/
 *.jsonl
 tmp*.txt
 
