@@ -39,6 +39,14 @@ MODEL_SPECS: dict[str, dict] = {
         "tp": 1,
         "features": ["chat", "streaming", "tool_choice"],
     },
+    # Public small model cached locally on many dev machines.
+    # Keep this as the preferred local smoke target for single 12 GB GPUs.
+    "qwen-0.5b": {
+        "model": _resolve_model_path("Qwen/Qwen2.5-0.5B-Instruct"),
+        "memory_gb": 2,
+        "tp": 1,
+        "features": ["chat", "streaming"],
+    },
     # Function calling specialist
     "qwen-7b": {
         "model": _resolve_model_path("Qwen/Qwen2.5-7B-Instruct"),

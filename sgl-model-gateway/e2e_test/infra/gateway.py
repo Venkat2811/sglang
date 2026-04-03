@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -18,6 +19,21 @@ if TYPE_CHECKING:
     from .model_pool import ModelInstance
 
 logger = logging.getLogger(__name__)
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_SGLANG_PYTHON = _REPO_ROOT / "python"
+_GATEWAY_BINDINGS_SRC = _REPO_ROOT / "sgl-model-gateway" / "bindings" / "python" / "src"
+
+
+def _build_subprocess_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Expose local checkout modules to router subprocesses."""
+    env = (base_env or os.environ).copy()
+    parts = [str(_SGLANG_PYTHON), str(_GATEWAY_BINDINGS_SRC)]
+    existing = env.get("PYTHONPATH")
+    if existing:
+        parts.append(existing)
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    return env
 
 
 @dataclass
@@ -307,7 +323,7 @@ class Gateway:
 
         self.process = subprocess.Popen(
             cmd,
-            env=self._env,  # Use custom env if set (e.g., for cloud mode API keys)
+            env=_build_subprocess_env(self._env),
             stdout=None if show_output else subprocess.PIPE,
             stderr=None if show_output else subprocess.PIPE,
             start_new_session=True,
