@@ -151,13 +151,21 @@ async fn process_and_transform_stream(
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
     sink: &impl ResponseEventSink,
 ) -> Result<ResponsesResponse, String> {
-    // Create accumulator for final response
-    let mut accumulator = StreamingResponseAccumulator::new(&original_request);
-
-    // Create event emitter for OpenAI-compatible streaming
     let response_id = format!("resp_{}", Uuid::new_v4());
     let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
+
+    // Create accumulator for the persisted/final response. Seed it with the
+    // same response metadata the WS/SSE event emitter exposes so storage,
+    // cache, and retrieval all agree on the response id.
+    let mut accumulator = StreamingResponseAccumulator::new(
+        &original_request,
+        response_id.clone(),
+        model.clone(),
+        created_at as i64,
+    );
+
+    // Create event emitter for OpenAI-compatible streaming
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
     event_emitter.set_original_request(original_request.clone());
 
@@ -269,11 +277,16 @@ struct StreamingResponseAccumulator {
 }
 
 impl StreamingResponseAccumulator {
-    fn new(original_request: &ResponsesRequest) -> Self {
+    fn new(
+        original_request: &ResponsesRequest,
+        response_id: String,
+        model: String,
+        created_at: i64,
+    ) -> Self {
         Self {
-            response_id: String::new(),
-            model: String::new(),
-            created_at: 0,
+            response_id,
+            model,
+            created_at,
             content_buffer: String::new(),
             reasoning_buffer: String::new(),
             tool_calls: Vec::new(),
