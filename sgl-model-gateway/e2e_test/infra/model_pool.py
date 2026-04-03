@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
@@ -33,6 +34,20 @@ from .model_specs import MODEL_SPECS, get_model_spec
 from .process_utils import detect_ib_device
 
 logger = logging.getLogger(__name__)
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_SGLANG_PYTHON = _REPO_ROOT / "python"
+_GATEWAY_BINDINGS_SRC = _REPO_ROOT / "sgl-model-gateway" / "bindings" / "python" / "src"
+
+
+def _extend_pythonpath(env: dict[str, str]) -> dict[str, str]:
+    """Expose local checkout modules to worker subprocesses."""
+    parts = [str(_SGLANG_PYTHON), str(_GATEWAY_BINDINGS_SRC)]
+    existing = env.get("PYTHONPATH")
+    if existing:
+        parts.append(existing)
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    return env
 
 
 @dataclass(frozen=True)
@@ -491,6 +506,7 @@ class ModelPool:
         env = os.environ.copy()
         if gpu_slot:
             env["CUDA_VISIBLE_DEVICES"] = gpu_slot.cuda_visible_devices()
+        env = _extend_pythonpath(env)
 
         # Build command
         cmd = [
