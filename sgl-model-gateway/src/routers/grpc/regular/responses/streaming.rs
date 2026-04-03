@@ -6,7 +6,7 @@
 //! - Streaming accumulators for response building
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -183,47 +183,46 @@ async fn process_and_transform_stream(
     // Convert body to data stream
     let mut stream = body.into_data_stream();
     let mut upstream_error_forwarded = false;
+    let mut function_call_events = BTreeMap::new();
+    let mut pending_sse = String::new();
 
-    // Process stream chunks (each chunk is a complete SSE event)
-    while let Some(chunk_result) = stream.next().await {
+    // Process stream chunks, handling SSE records even when multiple events are
+    // coalesced into one body chunk or split across chunk boundaries.
+    'stream: while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| format!("Stream read error: {}", e))?;
+        let chunk_str = String::from_utf8_lossy(&chunk).replace("\r\n", "\n");
+        pending_sse.push_str(&chunk_str);
 
-        // Convert chunk to string
-        let event_str = String::from_utf8_lossy(&chunk);
-        let event = event_str.trim();
+        while let Some(record_end) = pending_sse.find("\n\n") {
+            let record = pending_sse[..record_end].to_string();
+            pending_sse = pending_sse[record_end + 2..].to_string();
 
-        // Check for end of stream
-        if event == "data: [DONE]" {
-            break;
-        }
-
-        // Parse SSE event (format: "data: {...}\n\n" or "data: {...}")
-        if let Some(json_str) = event.strip_prefix("data: ") {
-            let json_str = json_str.trim();
-
-            // Try to parse as ChatCompletionStreamResponse
-            match serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
-                Ok(chat_chunk) => {
-                    // Update accumulator
-                    accumulator.process_chunk(&chat_chunk);
-
-                    // Process chunk through event emitter (emits proper OpenAI events)
-                    event_emitter.process_chunk(&chat_chunk, sink)?;
-                }
-                Err(_) => {
-                    // Not a valid chat chunk - might be an upstream JSON error. Preserve it.
-                    debug!("Non-chunk SSE event, passing through: {}", event);
-                    if let Some(raw_json) = event.strip_prefix("data: ") {
-                        let raw_json = raw_json.trim();
-                        sink.send_raw_json(raw_json)?;
-
-                        if is_upstream_error_payload(raw_json) {
-                            upstream_error_forwarded = true;
-                            break;
-                        }
-                    }
+            match process_non_mcp_sse_record(
+                &record,
+                &mut accumulator,
+                &mut event_emitter,
+                sink,
+                &mut function_call_events,
+            )? {
+                SseRecordOutcome::Continue => {}
+                SseRecordOutcome::StopStream => break 'stream,
+                SseRecordOutcome::UpstreamError => {
+                    upstream_error_forwarded = true;
+                    break 'stream;
                 }
             }
+        }
+    }
+
+    if !upstream_error_forwarded && !pending_sse.trim().is_empty() {
+        if let SseRecordOutcome::UpstreamError = process_non_mcp_sse_record(
+            &pending_sse,
+            &mut accumulator,
+            &mut event_emitter,
+            sink,
+            &mut function_call_events,
+        )? {
+            upstream_error_forwarded = true;
         }
     }
 
@@ -253,7 +252,9 @@ async fn process_and_transform_stream(
         usage_obj
     });
 
-    let completed_event = event_emitter.emit_completed(usage_json.as_ref());
+    let terminal_status = accumulator.response_status();
+    let completed_event =
+        event_emitter.emit_completed_with_status(terminal_status, usage_json.as_ref());
     event_emitter.send_event(&completed_event, sink)?;
 
     // Finalize and persist accumulated response
@@ -268,6 +269,178 @@ async fn process_and_transform_stream(
     .await;
 
     Ok(final_response)
+}
+
+enum SseRecordOutcome {
+    Continue,
+    StopStream,
+    UpstreamError,
+}
+
+fn process_non_mcp_sse_record(
+    event: &str,
+    accumulator: &mut StreamingResponseAccumulator,
+    event_emitter: &mut ResponseStreamEventEmitter,
+    sink: &impl ResponseEventSink,
+    function_call_events: &mut BTreeMap<usize, FunctionCallEventState>,
+) -> Result<SseRecordOutcome, String> {
+    let event = event.trim();
+    if event.is_empty() {
+        return Ok(SseRecordOutcome::Continue);
+    }
+
+    if event == "data: [DONE]" {
+        return Ok(SseRecordOutcome::StopStream);
+    }
+
+    let Some(json_str) = event.strip_prefix("data: ") else {
+        return Ok(SseRecordOutcome::Continue);
+    };
+    let json_str = json_str.trim();
+
+    match serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
+        Ok(chat_chunk) => {
+            accumulator.process_chunk(&chat_chunk);
+
+            let has_tool_call_delta = chat_chunk
+                .choices
+                .first()
+                .and_then(|choice| choice.delta.tool_calls.as_ref())
+                .is_some_and(|tool_calls| !tool_calls.is_empty());
+            if has_tool_call_delta || !function_call_events.is_empty() {
+                process_non_mcp_function_call_chunk(
+                    &chat_chunk,
+                    event_emitter,
+                    sink,
+                    function_call_events,
+                )?;
+            } else {
+                event_emitter.process_chunk(&chat_chunk, sink)?;
+            }
+
+            Ok(SseRecordOutcome::Continue)
+        }
+        Err(_) => {
+            debug!("Non-chunk SSE event, passing through: {}", event);
+            sink.send_raw_json(json_str)?;
+
+            if is_upstream_error_payload(json_str) {
+                Ok(SseRecordOutcome::UpstreamError)
+            } else {
+                Ok(SseRecordOutcome::Continue)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FunctionCallEventState {
+    output_index: usize,
+    item_id: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+    completed: bool,
+}
+
+fn process_non_mcp_function_call_chunk(
+    chunk: &ChatCompletionStreamResponse,
+    emitter: &mut ResponseStreamEventEmitter,
+    sink: &impl ResponseEventSink,
+    function_call_events: &mut BTreeMap<usize, FunctionCallEventState>,
+) -> Result<(), String> {
+    let Some(choice) = chunk.choices.first() else {
+        return Ok(());
+    };
+
+    if let Some(tool_call_deltas) = &choice.delta.tool_calls {
+        for delta in tool_call_deltas {
+            let state = function_call_events
+                .entry(delta.index as usize)
+                .or_insert_with(|| {
+                    let (output_index, item_id) =
+                        emitter.allocate_output_index(OutputItemType::FunctionCall);
+
+                    FunctionCallEventState {
+                        output_index,
+                        item_id,
+                        call_id: String::new(),
+                        name: String::new(),
+                        arguments: String::new(),
+                        completed: false,
+                    }
+                });
+
+            if state.call_id.is_empty() {
+                if let Some(delta_id) = &delta.id {
+                    state.call_id = delta_id.clone();
+                }
+            } else if let Some(delta_id) = &delta.id {
+                state.call_id.push_str(delta_id);
+            }
+
+            if let Some(function) = &delta.function {
+                if let Some(delta_name) = &function.name {
+                    state.name.push_str(delta_name);
+                }
+
+                if let Some(delta_args) = &function.arguments {
+                    if !delta_args.is_empty() {
+                        if state.arguments.is_empty() {
+                            let item = json!({
+                                "id": state.item_id,
+                                "type": "function_call",
+                                "call_id": state.call_id,
+                                "name": state.name,
+                                "status": "in_progress",
+                                "arguments": ""
+                            });
+                            let event = emitter.emit_output_item_added(state.output_index, &item);
+                            emitter.send_event(&event, sink)?;
+                        }
+
+                        state.arguments.push_str(delta_args);
+                        let event = emitter.emit_function_call_arguments_delta(
+                            state.output_index,
+                            &state.item_id,
+                            delta_args,
+                        );
+                        emitter.send_event(&event, sink)?;
+                    }
+                }
+            }
+        }
+    }
+
+    if choice.finish_reason.as_deref() == Some("tool_calls") {
+        for state in function_call_events.values_mut() {
+            if state.completed {
+                continue;
+            }
+
+            let event = emitter.emit_function_call_arguments_done(
+                state.output_index,
+                &state.item_id,
+                &state.arguments,
+            );
+            emitter.send_event(&event, sink)?;
+
+            let item = json!({
+                "id": state.item_id,
+                "type": "function_call",
+                "call_id": state.call_id,
+                "name": state.name,
+                "status": "completed",
+                "arguments": state.arguments
+            });
+            let event = emitter.emit_output_item_done(state.output_index, &item);
+            emitter.send_event(&event, sink)?;
+            emitter.complete_output_item(state.output_index);
+            state.completed = true;
+        }
+    }
+
+    Ok(())
 }
 
 /// Response accumulator for streaming responses (non-MCP path)
@@ -322,7 +495,9 @@ impl StreamingResponseAccumulator {
         if let Some(choice) = chunk.choices.first() {
             // Accumulate content
             if let Some(content) = &choice.delta.content {
-                self.content_buffer.push_str(content);
+                if self.tool_calls.is_empty() {
+                    self.content_buffer.push_str(content);
+                }
             }
 
             // Accumulate reasoning
@@ -383,14 +558,17 @@ impl StreamingResponseAccumulator {
         }
     }
 
-    fn finalize(self) -> ResponsesResponse {
-        let status = match self.finish_reason.as_deref() {
+    fn response_status(&self) -> ResponseStatus {
+        match self.finish_reason.as_deref() {
             Some("stop") | Some("length") => ResponseStatus::Completed,
             Some("tool_calls") => ResponseStatus::InProgress,
             Some("failed") | Some("error") => ResponseStatus::Failed,
             _ => ResponseStatus::Completed,
-        };
+        }
+    }
 
+    fn finalize(self) -> ResponsesResponse {
+        let status = self.response_status();
         self.finalize_with_status(status)
     }
 
@@ -988,10 +1166,14 @@ async fn execute_tool_loop_streaming_internal(
                         "total_tokens": u.total_tokens
                     })
                 });
-                let event = emitter.emit_completed(usage_json.as_ref());
+                let event = emitter
+                    .emit_completed_with_status(ResponseStatus::InProgress, usage_json.as_ref());
                 emitter.send_event(&event, sink)?;
 
-                let final_response = emitter.finalize(accumulated_response.usage.clone());
+                let final_response = emitter.finalize_with_status(
+                    accumulated_response.usage.clone(),
+                    ResponseStatus::InProgress,
+                );
                 persist_response_if_needed(
                     ctx.conversation_storage.clone(),
                     ctx.conversation_item_storage.clone(),
@@ -1230,6 +1412,136 @@ mod tests {
                 .expect("storage lookup should succeed")
                 .is_none(),
             "failed upstream streams should not be persisted",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_and_transform_stream_emits_function_call_events_for_non_mcp_streams() {
+        let body = Body::from_stream(stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from(
+                "data: {\"id\":\"chatcmpl_test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_test\",\"function\":{\"name\":\"get_weather\"},\"type\":\"function\"}]},\"finish_reason\":null}]}\n\n",
+            )),
+            Ok(Bytes::from(
+                "data: {\"id\":\"chatcmpl_test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"location\\\":\\\"Berlin\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            )),
+            Ok(Bytes::from(
+                "data: {\"id\":\"chatcmpl_test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\n]\"},\"finish_reason\":null}]}\n\n",
+            )),
+            Ok(Bytes::from(
+                "data: {\"id\":\"chatcmpl_test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7,\"total_tokens\":19}}\n\n",
+            )),
+            Ok(Bytes::from("data: [DONE]\n\n")),
+        ]));
+        let response_storage = Arc::new(MemoryResponseStorage::new());
+        let conversation_storage = Arc::new(MemoryConversationStorage::new());
+        let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+        let sink = RecordingSink::default();
+
+        let final_response = process_and_transform_stream(
+            body,
+            test_responses_request(),
+            response_storage,
+            conversation_storage,
+            conversation_item_storage,
+            &sink,
+        )
+        .await
+        .expect("tool-call stream processing should succeed");
+
+        let events = sink.events();
+        let event_types: Vec<_> = events
+            .iter()
+            .filter_map(|event| event.get("type").and_then(|value| value.as_str()))
+            .collect();
+
+        assert_eq!(
+            event_types,
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ],
+        );
+        assert_eq!(events[2]["item"]["type"], "function_call");
+        assert_eq!(events[3]["delta"], "{\"location\":\"Berlin\"}");
+        assert_eq!(
+            events.last().unwrap()["response"]["output"][0]["type"],
+            "function_call"
+        );
+        assert_eq!(
+            events.last().unwrap()["response"]["output"][0]["arguments"],
+            "{\"location\":\"Berlin\"}"
+        );
+        assert_eq!(events.last().unwrap()["response"]["status"], "in_progress");
+
+        assert_eq!(final_response.status, ResponseStatus::InProgress);
+        assert_eq!(final_response.output.len(), 1);
+        let serialized_output = serde_json::to_value(&final_response.output[0]).unwrap();
+        assert_eq!(serialized_output["type"], "function_call");
+        assert_eq!(serialized_output["arguments"], "{\"location\":\"Berlin\"}");
+    }
+
+    #[tokio::test]
+    async fn test_process_and_transform_stream_handles_coalesced_sse_records() {
+        let body = Body::from_stream(stream::iter(vec![Ok::<_, std::io::Error>(
+            Bytes::from(
+                concat!(
+                    "data: {\"id\":\"chatcmpl_test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_test\",\"function\":{\"name\":\"calculate\"},\"type\":\"function\"}]},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"chatcmpl_test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"expression\\\":\\\"42 * 17\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"chatcmpl_test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\n]\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"chatcmpl_test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":6,\"total_tokens\":14}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            ),
+        )]));
+        let response_storage = Arc::new(MemoryResponseStorage::new());
+        let conversation_storage = Arc::new(MemoryConversationStorage::new());
+        let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+        let sink = RecordingSink::default();
+
+        let final_response = process_and_transform_stream(
+            body,
+            test_responses_request(),
+            response_storage,
+            conversation_storage,
+            conversation_item_storage,
+            &sink,
+        )
+        .await
+        .expect("coalesced SSE record processing should succeed");
+
+        let events = sink.events();
+        let event_types: Vec<_> = events
+            .iter()
+            .filter_map(|event| event.get("type").and_then(|value| value.as_str()))
+            .collect();
+
+        assert_eq!(
+            event_types,
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ],
+        );
+        assert_eq!(events[3]["delta"], "{\"expression\":\"42 * 17\"}");
+        assert_eq!(events.last().unwrap()["response"]["status"], "in_progress");
+        assert_eq!(final_response.status, ResponseStatus::InProgress);
+        assert_eq!(final_response.output.len(), 1);
+        let serialized_output = serde_json::to_value(&final_response.output[0]).unwrap();
+        assert_eq!(serialized_output["type"], "function_call");
+        assert_eq!(serialized_output["name"], "calculate");
+        assert_eq!(
+            serialized_output["arguments"],
+            "{\"expression\":\"42 * 17\"}"
         );
     }
 }

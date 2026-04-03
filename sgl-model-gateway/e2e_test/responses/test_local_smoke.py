@@ -12,6 +12,56 @@ import json
 import openai
 import pytest
 
+GET_WEATHER_FUNCTION = {
+    "type": "function",
+    "name": "get_weather",
+    "description": "Get the current weather in a given location.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "location": {
+                "type": "string",
+                "description": "A city name such as Berlin.",
+            }
+        },
+        "required": ["location"],
+    },
+}
+
+CALCULATE_FUNCTION = {
+    "type": "function",
+    "name": "calculate",
+    "description": "Perform a mathematical calculation.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "expression": {
+                "type": "string",
+                "description": "The mathematical expression to evaluate.",
+            }
+        },
+        "required": ["expression"],
+    },
+}
+
+CALCULATE_CHAT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "calculate",
+        "description": "Perform a mathematical calculation.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "The mathematical expression to evaluate.",
+                }
+            },
+            "required": ["expression"],
+        },
+    },
+}
+
 
 def _gateway_ws_url(base_url: str) -> str:
     """Convert the router base URL into a websocket endpoint URL."""
@@ -29,6 +79,8 @@ def _ws_request(
     generate: bool | None = None,
     temperature: float = 0,
     max_output_tokens: int = 16,
+    tools: list[dict] | None = None,
+    tool_choice=None,
 ) -> dict:
     request = {
         "type": "response.create",
@@ -42,6 +94,10 @@ def _ws_request(
         request["previous_response_id"] = previous_response_id
     if generate is not None:
         request["generate"] = generate
+    if tools is not None:
+        request["tools"] = tools
+    if tool_choice is not None:
+        request["tool_choice"] = tool_choice
     return request
 
 
@@ -131,6 +187,18 @@ def _response_output_text(completed_event: dict) -> str:
             if isinstance(text, str) and text.strip():
                 return text
     return ""
+
+
+def _response_function_calls(output) -> list:
+    return [item for item in output if item.type == "function_call"]
+
+
+def _completed_response_function_calls(completed_event: dict) -> list[dict]:
+    return [
+        item
+        for item in completed_event.get("response", {}).get("output", [])
+        if item.get("type") == "function_call"
+    ]
 
 
 def _collect_http_event_types(client, model: str) -> list[str]:
@@ -640,3 +708,206 @@ class TestResponsesLocalSmoke:
                 previous_response_id="resp_missing_http",
                 max_output_tokens=16,
             )
+
+
+@pytest.mark.e2e
+@pytest.mark.model("qwen-3b")
+@pytest.mark.gateway(
+    extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"]
+)
+@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+class TestResponsesLocalToolSmoke:
+    """Single-GPU function-tool Responses smoke on qwen-3b."""
+
+    def test_chat_streaming_function_call_first_turn(self, setup_backend):
+        """Local chat streaming should surface qwen tool-call deltas before Responses adapts them."""
+        _, model, client, _ = setup_backend
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Calculate 42 * 17. Use the tool.",
+                }
+            ],
+            tools=[CALCULATE_CHAT_TOOL],
+            tool_choice="required",
+            stream=True,
+            stream_options={"include_usage": True},
+            temperature=0,
+            max_tokens=128,
+        )
+
+        tool_call_chunks = []
+        finish_reason = None
+
+        for chunk in response:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.delta.tool_calls:
+                tool_call_chunks.extend(choice.delta.tool_calls)
+            if choice.finish_reason is not None:
+                finish_reason = choice.finish_reason
+
+        assert tool_call_chunks, "expected chat streaming to emit tool-call chunks"
+        assert finish_reason == "tool_calls"
+
+    def test_http_responses_function_call_first_turn(self, setup_backend):
+        """The router should emit a real function call on qwen-3b locally."""
+        _, model, client, _ = setup_backend
+
+        resp = client.responses.create(
+            model=model,
+            input="Calculate 15 * 23. Use the tool.",
+            tools=[CALCULATE_FUNCTION],
+            tool_choice="required",
+            stream=False,
+            temperature=0,
+            max_output_tokens=128,
+        )
+
+        assert resp.error is None
+        assert resp.status == "in_progress"
+
+        function_calls = _response_function_calls(resp.output)
+        assert function_calls, "expected at least one function call in the first turn"
+        assert function_calls[0].name == "calculate"
+        assert function_calls[0].call_id
+        assert function_calls[0].arguments
+
+        arguments = json.loads(function_calls[0].arguments)
+        assert "expression" in arguments
+        assert "15" in arguments["expression"]
+        assert "23" in arguments["expression"]
+
+    def test_http_streaming_function_call_first_turn(self, setup_backend):
+        """Streaming Responses should expose function-call events and final output."""
+        _, model, client, _ = setup_backend
+
+        events = list(
+            client.responses.create(
+                model=model,
+                input="Calculate 42 * 17. Use the tool.",
+                tools=[CALCULATE_FUNCTION],
+                tool_choice="required",
+                stream=True,
+                temperature=0,
+                max_output_tokens=128,
+            )
+        )
+
+        event_types = [event.type for event in events]
+        assert "response.created" in event_types
+        assert "response.function_call_arguments.delta" in event_types
+        assert "response.function_call_arguments.done" in event_types
+
+        completed_events = [event for event in events if event.type == "response.completed"]
+        assert len(completed_events) == 1
+
+        completed = completed_events[0]
+        assert completed.response.status == "in_progress"
+
+        function_calls = _response_function_calls(completed.response.output)
+        assert function_calls, "expected a function call in the completed response payload"
+        assert function_calls[0].name == "calculate"
+        assert function_calls[0].call_id
+        assert function_calls[0].arguments
+
+    def test_http_function_call_two_turn_continuation(self, setup_backend):
+        """HTTP Responses should continue from function_call_output-only turns."""
+        _, model, client, _ = setup_backend
+
+        first = client.responses.create(
+            model=model,
+            input="Calculate 15 * 23. Use the tool.",
+            tools=[CALCULATE_FUNCTION],
+            tool_choice="required",
+            stream=False,
+            temperature=0,
+            max_output_tokens=128,
+        )
+
+        function_calls = _response_function_calls(first.output)
+        assert function_calls, "expected a completed function call in the first HTTP turn"
+        assert first.status == "in_progress"
+        assert function_calls[0].name == "calculate"
+        assert function_calls[0].arguments
+
+        second = client.responses.create(
+            model=model,
+            input=[
+                {
+                    "type": "function_call_output",
+                    "call_id": function_calls[0].call_id,
+                    "output": json.dumps({"result": 345}),
+                }
+            ],
+            previous_response_id=first.id,
+            tools=[CALCULATE_FUNCTION],
+            tool_choice="auto",
+            temperature=0,
+            max_output_tokens=128,
+        )
+
+        assert second.status == "completed"
+        assert "345" in second.output_text
+
+    def test_websocket_function_call_two_turn_continuation(self, setup_backend):
+        """WS should support a first-turn function call and a second-turn tool result."""
+        _, model, _, gateway = setup_backend
+
+        async def run() -> tuple[dict, dict]:
+            import websockets
+
+            ws_url = _gateway_ws_url(gateway.base_url)
+            async with websockets.connect(
+                ws_url, open_timeout=30, close_timeout=5
+            ) as websocket:
+                first_events = await _send_ws_request_and_collect(
+                    websocket,
+                    _ws_request(
+                        model,
+                        input="Calculate 15 * 23. Use the tool.",
+                        store=False,
+                        tools=[CALCULATE_FUNCTION],
+                        tool_choice="required",
+                        max_output_tokens=128,
+                    ),
+                )
+                first_completed = first_events[-1]
+                function_call = _completed_response_function_calls(first_completed)[0]
+
+                second_events = await _send_ws_request_and_collect(
+                    websocket,
+                    _ws_request(
+                        model,
+                        input=[
+                            {
+                                "type": "function_call_output",
+                                "call_id": function_call["call_id"],
+                                "output": json.dumps({"result": 345}),
+                            }
+                        ],
+                        previous_response_id=first_completed["response"]["id"],
+                        store=False,
+                        tools=[CALCULATE_FUNCTION],
+                        tool_choice="auto",
+                        max_output_tokens=128,
+                    ),
+                )
+
+            return first_completed, second_events[-1]
+
+        first_completed, second_completed = asyncio.run(run())
+
+        function_calls = _completed_response_function_calls(first_completed)
+        assert function_calls, "expected a completed function call in the first WS turn"
+        assert first_completed["response"]["status"] == "in_progress"
+        assert function_calls[0]["name"] == "calculate"
+        assert function_calls[0]["arguments"]
+
+        assert second_completed["type"] == "response.completed"
+        assert second_completed["response"]["status"] == "completed"
+        assert "345" in _response_output_text(second_completed)
