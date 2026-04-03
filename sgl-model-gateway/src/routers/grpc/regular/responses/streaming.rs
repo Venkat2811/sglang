@@ -11,6 +11,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use axum::extract::ws::Message;
 use axum::{
     body::Body,
     http::{self, header, StatusCode},
@@ -48,7 +49,10 @@ use crate::{
     routers::{
         grpc::common::responses::{
             build_sse_response, persist_response_if_needed,
-            streaming::{OutputItemType, ResponseStreamEventEmitter},
+            streaming::{
+                OutputItemType, ResponseEventSink, ResponseStreamEventEmitter,
+                SseResponseEventSink, WsResponseEventSink,
+            },
             ResponsesContext,
         },
         mcp_utils::{extract_server_label, DEFAULT_MAX_ITERATIONS},
@@ -76,37 +80,23 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
 ) -> Response {
     debug!("Converting chat SSE stream to responses SSE format");
 
-    // Get chat streaming response
-    let chat_response = ctx
-        .pipeline
-        .execute_chat(
-            chat_request.clone(),
-            headers,
-            model_id,
-            ctx.components.clone(),
-        )
-        .await;
-
-    // Extract body from chat response
-    let (_parts, body) = chat_response.into_parts();
-
     // Create channel for transformed SSE events
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+    let sink = SseResponseEventSink::new(tx.clone());
 
     // Spawn background task to transform stream
     let original_request_clone = original_request.clone();
-    let response_storage = ctx.response_storage.clone();
-    let conversation_storage = ctx.conversation_storage.clone();
-    let conversation_item_storage = ctx.conversation_item_storage.clone();
+    let ctx_clone = ctx.clone();
+    let chat_request_clone = chat_request.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = process_and_transform_sse_stream(
-            body,
+        if let Err(e) = execute_non_mcp_stream_with_sink(
+            &ctx_clone,
+            chat_request_clone,
             original_request_clone,
-            response_storage,
-            conversation_storage,
-            conversation_item_storage,
-            tx.clone(),
+            headers,
+            model_id,
+            &sink,
         )
         .await
         {
@@ -117,26 +107,50 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
                     "type": "stream_error"
                 }
             });
-            let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", error_event))));
+            let _ = sink.send_raw_json(&error_event.to_string());
         }
 
-        // Send final [DONE] event
-        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+        let _ = sink.send_done();
     });
 
     // Build SSE response with transformed stream
     build_sse_response(rx)
 }
 
-/// Process chat SSE stream and transform to responses format
-async fn process_and_transform_sse_stream(
+pub(super) async fn execute_non_mcp_stream_with_sink(
+    ctx: &ResponsesContext,
+    chat_request: Arc<ChatCompletionRequest>,
+    original_request: ResponsesRequest,
+    headers: Option<http::HeaderMap>,
+    model_id: Option<String>,
+    sink: &impl ResponseEventSink,
+) -> Result<ResponsesResponse, String> {
+    let chat_response = ctx
+        .pipeline
+        .execute_chat(chat_request, headers, model_id, ctx.components.clone())
+        .await;
+    let (_parts, body) = chat_response.into_parts();
+
+    process_and_transform_stream(
+        body,
+        original_request,
+        ctx.response_storage.clone(),
+        ctx.conversation_storage.clone(),
+        ctx.conversation_item_storage.clone(),
+        sink,
+    )
+    .await
+}
+
+/// Process chat SSE stream and transform to responses format.
+async fn process_and_transform_stream(
     body: Body,
     original_request: ResponsesRequest,
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
-    tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
-) -> Result<(), String> {
+    sink: &impl ResponseEventSink,
+) -> Result<ResponsesResponse, String> {
     // Create accumulator for final response
     let mut accumulator = StreamingResponseAccumulator::new(&original_request);
 
@@ -150,12 +164,12 @@ async fn process_and_transform_sse_stream(
     // Emit initial response.created and response.in_progress events
     let event = event_emitter.emit_created();
     event_emitter
-        .send_event(&event, &tx)
+        .send_event(&event, sink)
         .map_err(|_| "Failed to send response.created event".to_string())?;
 
     let event = event_emitter.emit_in_progress();
     event_emitter
-        .send_event(&event, &tx)
+        .send_event(&event, sink)
         .map_err(|_| "Failed to send response.in_progress event".to_string())?;
 
     // Convert body to data stream
@@ -185,13 +199,13 @@ async fn process_and_transform_sse_stream(
                     accumulator.process_chunk(&chat_chunk);
 
                     // Process chunk through event emitter (emits proper OpenAI events)
-                    event_emitter.process_chunk(&chat_chunk, &tx)?;
+                    event_emitter.process_chunk(&chat_chunk, sink)?;
                 }
                 Err(_) => {
-                    // Not a valid chat chunk - might be error event, pass through
+                    // Not a valid chat chunk - might be an upstream JSON error. Preserve it.
                     debug!("Non-chunk SSE event, passing through: {}", event);
-                    if tx.send(Ok(Bytes::from(format!("{}\n\n", event)))).is_err() {
-                        return Err("Client disconnected".to_string());
+                    if let Some(raw_json) = event.strip_prefix("data: ") {
+                        sink.send_raw_json(raw_json.trim())?;
                     }
                 }
             }
@@ -218,7 +232,7 @@ async fn process_and_transform_sse_stream(
     });
 
     let completed_event = event_emitter.emit_completed(usage_json.as_ref());
-    event_emitter.send_event(&completed_event, &tx)?;
+    event_emitter.send_event(&completed_event, sink)?;
 
     // Finalize and persist accumulated response
     let final_response = accumulator.finalize();
@@ -231,7 +245,7 @@ async fn process_and_transform_sse_stream(
     )
     .await;
 
-    Ok(())
+    Ok(final_response)
 }
 
 /// Response accumulator for streaming responses (non-MCP path)
@@ -425,6 +439,7 @@ pub(super) async fn execute_tool_loop_streaming(
 ) -> Response {
     // Create SSE channel for client
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+    let sink = SseResponseEventSink::new(tx.clone());
 
     // Clone data for background task
     let ctx_clone = ctx.clone();
@@ -438,7 +453,7 @@ pub(super) async fn execute_tool_loop_streaming(
             &original_request_clone,
             headers,
             model_id,
-            tx.clone(),
+            &sink,
         )
         .await;
 
@@ -450,11 +465,10 @@ pub(super) async fn execute_tool_loop_streaming(
                     "type": "tool_loop_error"
                 }
             });
-            let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", error_event))));
+            let _ = sink.send_raw_json(&error_event.to_string());
         }
 
-        // Send [DONE]
-        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+        let _ = sink.send_done();
     });
 
     // Build SSE response
@@ -482,6 +496,26 @@ pub(super) async fn execute_tool_loop_streaming(
     response
 }
 
+pub(super) async fn execute_tool_loop_streaming_with_sink(
+    ctx: &ResponsesContext,
+    current_request: ResponsesRequest,
+    original_request: &ResponsesRequest,
+    headers: Option<http::HeaderMap>,
+    model_id: Option<String>,
+    outbound_tx: mpsc::UnboundedSender<Message>,
+) -> Result<ResponsesResponse, String> {
+    let sink = WsResponseEventSink::new(outbound_tx);
+    execute_tool_loop_streaming_internal(
+        ctx,
+        current_request,
+        original_request,
+        headers,
+        model_id,
+        &sink,
+    )
+    .await
+}
+
 /// Internal streaming tool loop implementation
 async fn execute_tool_loop_streaming_internal(
     ctx: &ResponsesContext,
@@ -489,8 +523,8 @@ async fn execute_tool_loop_streaming_internal(
     original_request: &ResponsesRequest,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
-) -> Result<(), String> {
+    sink: &impl ResponseEventSink,
+) -> Result<ResponsesResponse, String> {
     // Extract server label from original request tools
     let server_label = extract_server_label(original_request.tools.as_deref(), "request-mcp");
 
@@ -509,9 +543,9 @@ async fn execute_tool_loop_streaming_internal(
 
     // Emit initial response.created and response.in_progress events
     let event = emitter.emit_created();
-    emitter.send_event(&event, &tx)?;
+    emitter.send_event(&event, sink)?;
     let event = emitter.emit_in_progress();
-    emitter.send_event(&event, &tx)?;
+    emitter.send_event(&event, sink)?;
 
     // Get MCP tools and convert to chat format (do this once before loop)
     let mcp_tools = ctx.mcp_manager.list_tools();
@@ -567,15 +601,15 @@ async fn execute_tool_loop_streaming_internal(
 
             // Emit output_item.added
             let event = emitter.emit_output_item_added(output_index, &item);
-            emitter.send_event(&event, &tx)?;
+            emitter.send_event(&event, sink)?;
 
             // Emit mcp_list_tools.in_progress
             let event = emitter.emit_mcp_list_tools_in_progress(output_index);
-            emitter.send_event(&event, &tx)?;
+            emitter.send_event(&event, sink)?;
 
             // Emit mcp_list_tools.completed
             let event = emitter.emit_mcp_list_tools_completed(output_index, &mcp_tools);
-            emitter.send_event(&event, &tx)?;
+            emitter.send_event(&event, sink)?;
 
             // Build complete item with tools
             let item_done = json!({
@@ -588,7 +622,7 @@ async fn execute_tool_loop_streaming_internal(
 
             // Emit output_item.done
             let event = emitter.emit_output_item_done(output_index, &item_done);
-            emitter.send_event(&event, &tx)?;
+            emitter.send_event(&event, sink)?;
 
             emitter.complete_output_item(output_index);
             mcp_list_tools_emitted = true;
@@ -615,7 +649,7 @@ async fn execute_tool_loop_streaming_internal(
         // Convert chat stream to Responses API events while accumulating for tool call detection
         // Stream text naturally - it only appears on final iteration (tool iterations have empty content)
         let accumulated_response =
-            convert_and_accumulate_stream(response.into_body(), &mut emitter, &tx).await?;
+            convert_and_accumulate_stream(response.into_body(), &mut emitter, sink).await?;
 
         // Check for tool calls (extract all of them for parallel execution)
         let tool_calls = extract_all_tool_calls_from_chat(&accumulated_response);
@@ -656,7 +690,33 @@ async fn execute_tool_loop_streaming_internal(
                     max_tool_calls,
                     DEFAULT_MAX_ITERATIONS
                 );
-                break;
+
+                let mut final_response = emitter.finalize(accumulated_response.usage.clone());
+                final_response.incomplete_details = Some(json!({ "reason": "max_tool_calls" }));
+
+                let usage_json = accumulated_response.usage.as_ref().map(|u| {
+                    json!({
+                        "input_tokens": u.prompt_tokens,
+                        "output_tokens": u.completion_tokens,
+                        "total_tokens": u.total_tokens
+                    })
+                });
+                let mut event = emitter.emit_completed(usage_json.as_ref());
+                if let Some(response) = event.get_mut("response") {
+                    response["incomplete_details"] = json!({ "reason": "max_tool_calls" });
+                }
+                emitter.send_event(&event, sink)?;
+
+                persist_response_if_needed(
+                    ctx.conversation_storage.clone(),
+                    ctx.conversation_item_storage.clone(),
+                    ctx.response_storage.clone(),
+                    &final_response,
+                    original_request,
+                )
+                .await;
+
+                return Ok(final_response);
             }
 
             // Process each MCP tool call
@@ -687,11 +747,11 @@ async fn execute_tool_loop_streaming_internal(
 
                 // Emit output_item.added
                 let event = emitter.emit_output_item_added(output_index, &item);
-                emitter.send_event(&event, &tx)?;
+                emitter.send_event(&event, sink)?;
 
                 // Emit mcp_call.in_progress
                 let event = emitter.emit_mcp_call_in_progress(output_index, &item_id);
-                emitter.send_event(&event, &tx)?;
+                emitter.send_event(&event, sink)?;
 
                 // Emit mcp_call_arguments.delta (simulate streaming by sending full arguments)
                 let event = emitter.emit_mcp_call_arguments_delta(
@@ -699,7 +759,7 @@ async fn execute_tool_loop_streaming_internal(
                     &item_id,
                     &tool_call.arguments,
                 );
-                emitter.send_event(&event, &tx)?;
+                emitter.send_event(&event, sink)?;
 
                 // Emit mcp_call_arguments.done
                 let event = emitter.emit_mcp_call_arguments_done(
@@ -707,7 +767,7 @@ async fn execute_tool_loop_streaming_internal(
                     &item_id,
                     &tool_call.arguments,
                 );
-                emitter.send_event(&event, &tx)?;
+                emitter.send_event(&event, sink)?;
 
                 // Execute the MCP tool - manager handles parsing and type coercion
                 trace!(
@@ -725,7 +785,7 @@ async fn execute_tool_loop_streaming_internal(
                         Ok(output) => {
                             // Emit mcp_call.completed
                             let event = emitter.emit_mcp_call_completed(output_index, &item_id);
-                            emitter.send_event(&event, &tx)?;
+                            emitter.send_event(&event, sink)?;
 
                             // Build complete item with output
                             let item_done = json!({
@@ -740,7 +800,7 @@ async fn execute_tool_loop_streaming_internal(
 
                             // Emit output_item.done
                             let event = emitter.emit_output_item_done(output_index, &item_done);
-                            emitter.send_event(&event, &tx)?;
+                            emitter.send_event(&event, sink)?;
 
                             emitter.complete_output_item(output_index);
                             (output, true, None)
@@ -750,7 +810,7 @@ async fn execute_tool_loop_streaming_internal(
                             warn!("{}", err);
                             // Emit mcp_call.failed
                             let event = emitter.emit_mcp_call_failed(output_index, &item_id, &err);
-                            emitter.send_event(&event, &tx)?;
+                            emitter.send_event(&event, sink)?;
 
                             // Build failed item
                             let item_done = json!({
@@ -765,7 +825,7 @@ async fn execute_tool_loop_streaming_internal(
 
                             // Emit output_item.done
                             let event = emitter.emit_output_item_done(output_index, &item_done);
-                            emitter.send_event(&event, &tx)?;
+                            emitter.send_event(&event, sink)?;
 
                             emitter.complete_output_item(output_index);
                             let error_json = json!({ "error": &err }).to_string();
@@ -777,7 +837,7 @@ async fn execute_tool_loop_streaming_internal(
                         warn!("Tool execution failed: {}", err_str);
                         // Emit mcp_call.failed
                         let event = emitter.emit_mcp_call_failed(output_index, &item_id, &err_str);
-                        emitter.send_event(&event, &tx)?;
+                        emitter.send_event(&event, sink)?;
 
                         // Build failed item
                         let item_done = json!({
@@ -792,7 +852,7 @@ async fn execute_tool_loop_streaming_internal(
 
                         // Emit output_item.done
                         let event = emitter.emit_output_item_done(output_index, &item_done);
-                        emitter.send_event(&event, &tx)?;
+                        emitter.send_event(&event, sink)?;
 
                         emitter.complete_output_item(output_index);
                         let error_json = json!({ "error": &err_str }).to_string();
@@ -849,7 +909,7 @@ async fn execute_tool_loop_streaming_internal(
 
                     // Emit output_item.added
                     let event = emitter.emit_output_item_added(output_index, &item);
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, sink)?;
 
                     // Emit function_call_arguments.delta
                     let event = emitter.emit_function_call_arguments_delta(
@@ -857,7 +917,7 @@ async fn execute_tool_loop_streaming_internal(
                         &item_id,
                         &tool_call.arguments,
                     );
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, sink)?;
 
                     // Emit function_call_arguments.done
                     let event = emitter.emit_function_call_arguments_done(
@@ -865,7 +925,7 @@ async fn execute_tool_loop_streaming_internal(
                         &item_id,
                         &tool_call.arguments,
                     );
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, sink)?;
 
                     // Build complete item
                     let item_complete = json!({
@@ -879,13 +939,32 @@ async fn execute_tool_loop_streaming_internal(
 
                     // Emit output_item.done
                     let event = emitter.emit_output_item_done(output_index, &item_complete);
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, sink)?;
 
                     emitter.complete_output_item(output_index);
                 }
 
-                // Break loop to return response to caller
-                break;
+                let usage_json = accumulated_response.usage.as_ref().map(|u| {
+                    json!({
+                        "input_tokens": u.prompt_tokens,
+                        "output_tokens": u.completion_tokens,
+                        "total_tokens": u.total_tokens
+                    })
+                });
+                let event = emitter.emit_completed(usage_json.as_ref());
+                emitter.send_event(&event, sink)?;
+
+                let final_response = emitter.finalize(accumulated_response.usage.clone());
+                persist_response_if_needed(
+                    ctx.conversation_storage.clone(),
+                    ctx.conversation_item_storage.clone(),
+                    ctx.response_storage.clone(),
+                    &final_response,
+                    original_request,
+                )
+                .await;
+
+                return Ok(final_response);
             }
 
             // Build next request with conversation history
@@ -906,7 +985,7 @@ async fn execute_tool_loop_streaming_internal(
         // Emit reasoning item if present
         if let Some(reasoning) = reasoning_content {
             if !reasoning.is_empty() {
-                emitter.emit_reasoning_item(&tx, Some(reasoning))?;
+                emitter.emit_reasoning_item(sink, Some(reasoning))?;
             }
         }
 
@@ -922,19 +1001,27 @@ async fn execute_tool_loop_streaming_internal(
             })
         });
         let event = emitter.emit_completed(usage_json.as_ref());
-        emitter.send_event(&event, &tx)?;
+        emitter.send_event(&event, sink)?;
 
-        break;
+        let final_response = emitter.finalize(accumulated_response.usage.clone());
+        persist_response_if_needed(
+            ctx.conversation_storage.clone(),
+            ctx.conversation_item_storage.clone(),
+            ctx.response_storage.clone(),
+            &final_response,
+            original_request,
+        )
+        .await;
+
+        return Ok(final_response);
     }
-
-    Ok(())
 }
 
 /// Convert chat stream to Responses API events while accumulating for tool call detection
 async fn convert_and_accumulate_stream(
     body: Body,
     emitter: &mut ResponseStreamEventEmitter,
-    tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    sink: &impl ResponseEventSink,
 ) -> Result<ChatCompletionResponse, String> {
     let mut accumulator = ChatResponseAccumulator::new();
     let mut stream = body.into_data_stream();
@@ -954,7 +1041,7 @@ async fn convert_and_accumulate_stream(
             let json_str = json_str.trim();
             if let Ok(chat_chunk) = serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
                 // Convert chat chunk to Responses API events and emit
-                emitter.process_chunk(&chat_chunk, tx)?;
+                emitter.process_chunk(&chat_chunk, sink)?;
 
                 // Accumulate for tool call detection
                 accumulator.process_chunk(&chat_chunk);
