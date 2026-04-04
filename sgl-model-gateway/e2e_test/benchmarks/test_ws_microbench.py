@@ -50,6 +50,9 @@ CALCULATE_TOOL_RESULT_INSTRUCTIONS = (
     "Answer briefly with the final numeric result."
 )
 
+DEFAULT_MODEL_TOOL_REQUEST_MAX_OUTPUT_TOKENS = 128
+DEFAULT_MODEL_TOOL_RESULT_MAX_OUTPUT_TOKENS = 128
+
 
 def _gateway_ws_url(base_url: str) -> str:
     if base_url.startswith("https://"):
@@ -125,6 +128,38 @@ def _model_generated_tool_prompt(turn_index: int) -> str:
     left = 15 + turn_index
     right = 23 + (turn_index * 2)
     return f"Calculate {left} * {right}. Use the tool."
+
+
+def _model_tool_request_instructions() -> str:
+    return os.environ.get(
+        "SGLANG_HTTP_WS_MODEL_TOOL_REQUEST_INSTRUCTIONS",
+        CALCULATE_TOOL_REQUEST_INSTRUCTIONS,
+    )
+
+
+def _model_tool_result_instructions() -> str:
+    return os.environ.get(
+        "SGLANG_HTTP_WS_MODEL_TOOL_RESULT_INSTRUCTIONS",
+        CALCULATE_TOOL_RESULT_INSTRUCTIONS,
+    )
+
+
+def _model_tool_request_max_output_tokens() -> int:
+    return int(
+        os.environ.get(
+            "SGLANG_HTTP_WS_MODEL_TOOL_REQUEST_MAX_OUTPUT_TOKENS",
+            str(DEFAULT_MODEL_TOOL_REQUEST_MAX_OUTPUT_TOKENS),
+        )
+    )
+
+
+def _model_tool_result_max_output_tokens() -> int:
+    return int(
+        os.environ.get(
+            "SGLANG_HTTP_WS_MODEL_TOOL_RESULT_MAX_OUTPUT_TOKENS",
+            str(DEFAULT_MODEL_TOOL_RESULT_MAX_OUTPUT_TOKENS),
+        )
+    )
 
 
 def _response_function_calls(output) -> list:
@@ -604,6 +639,10 @@ async def _run_ws_model_generated_tool_chain_sample(
 ) -> dict[str, float | int | list[float] | list[dict[str, float]]]:
     import websockets
 
+    request_instructions = _model_tool_request_instructions()
+    result_instructions = _model_tool_result_instructions()
+    request_max_output_tokens = _model_tool_request_max_output_tokens()
+    result_max_output_tokens = _model_tool_result_max_output_tokens()
     connect_started_at = time.perf_counter()
     async with websockets.connect(ws_url, open_timeout=30, close_timeout=5) as websocket:
         connected_at = time.perf_counter()
@@ -618,9 +657,9 @@ async def _run_ws_model_generated_tool_chain_sample(
                 _ws_request(
                     model=model,
                     input=_model_generated_tool_prompt(turn_index),
-                    instructions=CALCULATE_TOOL_REQUEST_INSTRUCTIONS,
+                    instructions=request_instructions,
                     temperature=0,
-                    max_output_tokens=128,
+                    max_output_tokens=request_max_output_tokens,
                     store=True,
                     tools=[CALCULATE_FUNCTION],
                     tool_choice="required",
@@ -637,9 +676,9 @@ async def _run_ws_model_generated_tool_chain_sample(
                 _ws_request(
                     model=model,
                     input=_tool_output_from_ws_function_call(function_calls[0]),
-                    instructions=CALCULATE_TOOL_RESULT_INSTRUCTIONS,
+                    instructions=result_instructions,
                     temperature=0,
-                    max_output_tokens=128,
+                    max_output_tokens=result_max_output_tokens,
                     store=True,
                     tools=[CALCULATE_FUNCTION],
                     tool_choice="auto",
@@ -666,6 +705,10 @@ async def _run_ws_model_generated_tool_chain_sample(
     return {
         "connect_ms": (connected_at - connect_started_at) * 1000,
         "turns": turns,
+        "request_instructions": request_instructions,
+        "result_instructions": result_instructions,
+        "request_max_output_tokens": request_max_output_tokens,
+        "result_max_output_tokens": result_max_output_tokens,
         "total_chain_ms": sum(per_turn_ms),
         "first_turn_completed_ms": per_turn_ms[0],
         "continuation_turn_completed_ms_mean": continuation_mean_ms,
@@ -798,6 +841,10 @@ def _run_http_tool_output_chain_sample(
 def _run_http_model_generated_tool_chain_sample(
     client, model: str, turns: int
 ) -> dict[str, float | int | list[float] | list[dict[str, float]]]:
+    request_instructions = _model_tool_request_instructions()
+    result_instructions = _model_tool_result_instructions()
+    request_max_output_tokens = _model_tool_request_max_output_tokens()
+    result_max_output_tokens = _model_tool_result_max_output_tokens()
     per_turn_ms: list[float] = []
     per_turn_requests_ms: list[dict[str, float]] = []
     previous_response_id: str | None = None
@@ -807,9 +854,9 @@ def _run_http_model_generated_tool_chain_sample(
             model=model,
             input=_model_generated_tool_prompt(turn_index),
             previous_response_id=previous_response_id,
-            instructions=CALCULATE_TOOL_REQUEST_INSTRUCTIONS,
+            instructions=request_instructions,
             temperature=0,
-            max_output_tokens=128,
+            max_output_tokens=request_max_output_tokens,
             store=True,
             stream=True,
             tools=[CALCULATE_FUNCTION],
@@ -829,9 +876,9 @@ def _run_http_model_generated_tool_chain_sample(
             model=model,
             input=_tool_output_from_http_function_call(function_calls[0]),
             previous_response_id=first_response.id,
-            instructions=CALCULATE_TOOL_RESULT_INSTRUCTIONS,
+            instructions=result_instructions,
             temperature=0,
-            max_output_tokens=128,
+            max_output_tokens=result_max_output_tokens,
             store=True,
             stream=True,
             tools=[CALCULATE_FUNCTION],
@@ -857,6 +904,10 @@ def _run_http_model_generated_tool_chain_sample(
 
     return {
         "turns": turns,
+        "request_instructions": request_instructions,
+        "result_instructions": result_instructions,
+        "request_max_output_tokens": request_max_output_tokens,
+        "result_max_output_tokens": result_max_output_tokens,
         "total_chain_ms": sum(per_turn_ms),
         "first_turn_completed_ms": per_turn_ms[0],
         "continuation_turn_completed_ms_mean": continuation_mean_ms,
@@ -873,10 +924,18 @@ async def _run_ws_model_generated_tool_chain_diagnostic(
 ) -> dict:
     import websockets
 
+    request_instructions = _model_tool_request_instructions()
+    result_instructions = _model_tool_result_instructions()
+    request_max_output_tokens = _model_tool_request_max_output_tokens()
+    result_max_output_tokens = _model_tool_result_max_output_tokens()
     result = {
         "transport": "websocket",
         "mode": "persistent_ws_diagnostic",
         "turns_requested": turns,
+        "request_instructions": request_instructions,
+        "result_instructions": result_instructions,
+        "request_max_output_tokens": request_max_output_tokens,
+        "result_max_output_tokens": result_max_output_tokens,
         "success": True,
         "failed_at_turn": None,
         "failed_stage": None,
@@ -894,9 +953,9 @@ async def _run_ws_model_generated_tool_chain_diagnostic(
             first_request = _ws_request(
                 model=model,
                 input=_model_generated_tool_prompt(turn_index),
-                instructions=CALCULATE_TOOL_REQUEST_INSTRUCTIONS,
+                instructions=request_instructions,
                 temperature=0,
-                max_output_tokens=128,
+                max_output_tokens=request_max_output_tokens,
                 store=True,
                 tools=[CALCULATE_FUNCTION],
                 tool_choice="required",
@@ -950,9 +1009,9 @@ async def _run_ws_model_generated_tool_chain_diagnostic(
             second_request = _ws_request(
                 model=model,
                 input=_tool_output_from_ws_function_call(first_function_calls[0]),
-                instructions=CALCULATE_TOOL_RESULT_INSTRUCTIONS,
+                instructions=result_instructions,
                 temperature=0,
-                max_output_tokens=128,
+                max_output_tokens=result_max_output_tokens,
                 store=True,
                 tools=[CALCULATE_FUNCTION],
                 tool_choice="auto",
@@ -1003,10 +1062,18 @@ async def _run_ws_model_generated_tool_chain_diagnostic(
 def _run_http_model_generated_tool_chain_diagnostic(
     base_url: str, model: str, turns: int, timeout_secs: float
 ) -> dict:
+    request_instructions = _model_tool_request_instructions()
+    result_instructions = _model_tool_result_instructions()
+    request_max_output_tokens = _model_tool_request_max_output_tokens()
+    result_max_output_tokens = _model_tool_result_max_output_tokens()
     result = {
         "transport": "http",
         "mode": "non_streaming_http_diagnostic",
         "turns_requested": turns,
+        "request_instructions": request_instructions,
+        "result_instructions": result_instructions,
+        "request_max_output_tokens": request_max_output_tokens,
+        "result_max_output_tokens": result_max_output_tokens,
         "success": True,
         "failed_at_turn": None,
         "failed_stage": None,
@@ -1022,9 +1089,9 @@ def _run_http_model_generated_tool_chain_diagnostic(
             "model": model,
             "input": _model_generated_tool_prompt(turn_index),
             "previous_response_id": previous_response_id,
-            "instructions": CALCULATE_TOOL_REQUEST_INSTRUCTIONS,
+            "instructions": request_instructions,
             "temperature": 0,
-            "max_output_tokens": 128,
+            "max_output_tokens": request_max_output_tokens,
             "store": True,
             "tools": [CALCULATE_FUNCTION],
             "tool_choice": "required",
@@ -1090,9 +1157,9 @@ def _run_http_model_generated_tool_chain_diagnostic(
             "model": model,
             "input": _tool_output_from_http_function_call_dict(first_function_calls[0]),
             "previous_response_id": first_body["id"],
-            "instructions": CALCULATE_TOOL_RESULT_INSTRUCTIONS,
+            "instructions": result_instructions,
             "temperature": 0,
-            "max_output_tokens": 128,
+            "max_output_tokens": result_max_output_tokens,
             "store": True,
             "tools": [CALCULATE_FUNCTION],
             "tool_choice": "auto",
