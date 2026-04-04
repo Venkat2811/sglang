@@ -14,12 +14,18 @@ import logging
 import operator as op
 import os
 import statistics
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 import pytest
+from benchmarks.bfcl_subset import BfclScenario
+from benchmarks.bfcl_subset import BfclWorkspace
+from benchmarks.bfcl_subset import bfcl_subset_tools
+from benchmarks.bfcl_subset import load_bfcl_subset_scenarios
+from benchmarks.bfcl_subset import materialize_bfcl_scenario
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +58,17 @@ CALCULATE_TOOL_RESULT_INSTRUCTIONS = (
 
 DEFAULT_MODEL_TOOL_REQUEST_MAX_OUTPUT_TOKENS = 128
 DEFAULT_MODEL_TOOL_RESULT_MAX_OUTPUT_TOKENS = 128
+BFCL_TOOL_REQUEST_INSTRUCTIONS = (
+    "You are handling a BFCL-derived multi-turn filesystem task. "
+    "Paths are always relative to the scenario root. "
+    "Use the provided filesystem tools only. "
+    "For each turn, call the requested tool once and do not answer normally "
+    "until the tool result is provided."
+)
+BFCL_TOOL_RESULT_INSTRUCTIONS = (
+    "The filesystem tool result has been provided. "
+    "Reply briefly with the outcome and do not call any more tools."
+)
 
 
 def _gateway_ws_url(base_url: str) -> str:
@@ -159,6 +176,85 @@ def _model_tool_result_max_output_tokens() -> int:
             "SGLANG_HTTP_WS_MODEL_TOOL_RESULT_MAX_OUTPUT_TOKENS",
             str(DEFAULT_MODEL_TOOL_RESULT_MAX_OUTPUT_TOKENS),
         )
+    )
+
+
+def _bfcl_tool_request_instructions() -> str:
+    return os.environ.get(
+        "SGLANG_HTTP_WS_BFCL_TOOL_REQUEST_INSTRUCTIONS",
+        BFCL_TOOL_REQUEST_INSTRUCTIONS,
+    )
+
+
+def _bfcl_tool_result_instructions() -> str:
+    return os.environ.get(
+        "SGLANG_HTTP_WS_BFCL_TOOL_RESULT_INSTRUCTIONS",
+        BFCL_TOOL_RESULT_INSTRUCTIONS,
+    )
+
+
+def _selected_bfcl_subset_scenarios() -> list[BfclScenario]:
+    scenarios = load_bfcl_subset_scenarios()
+    selected_ids = [
+        value.strip()
+        for value in os.environ.get("SGLANG_HTTP_WS_BFCL_SUBSET_SCENARIOS", "").split(",")
+        if value.strip()
+    ]
+    if not selected_ids:
+        return scenarios
+
+    requested = set(selected_ids)
+    selected = [scenario for scenario in scenarios if scenario.id in requested]
+    if not selected:
+        raise AssertionError(
+            f"BFCL subset selection matched no scenarios: requested={selected_ids}"
+        )
+    return selected
+
+
+def _bfcl_tool_choice(expected_tool: str) -> dict:
+    return {"type": "function", "function": {"name": expected_tool}}
+
+
+def _bfcl_request_instructions_for_scenario(scenario: BfclScenario) -> str:
+    return (
+        f"{_bfcl_tool_request_instructions()} "
+        f"Scenario {scenario.id}: {scenario.description}"
+    )
+
+
+def _bfcl_tool_output_from_http_function_call(
+    workspace: BfclWorkspace, function_call
+) -> tuple[list[dict], dict]:
+    result = workspace.execute(function_call.name, json.loads(function_call.arguments))
+    return (
+        [
+            {
+                "type": "function_call_output",
+                "call_id": function_call.call_id,
+                "output": json.dumps(result),
+            }
+        ],
+        result,
+    )
+
+
+def _bfcl_tool_output_from_ws_function_call(
+    workspace: BfclWorkspace, function_call: dict
+) -> tuple[list[dict], dict]:
+    result = workspace.execute(
+        function_call["name"],
+        json.loads(function_call["arguments"]),
+    )
+    return (
+        [
+            {
+                "type": "function_call_output",
+                "call_id": function_call["call_id"],
+                "output": json.dumps(result),
+            }
+        ],
+        result,
     )
 
 
@@ -349,6 +445,36 @@ def _summarize_chain_samples(
         summary["connect_ms_mean"] = statistics.fmean(values("connect_ms"))
         summary["connect_ms_p50"] = _percentile(values("connect_ms"), 0.50)
         summary["connect_ms_p95"] = _percentile(values("connect_ms"), 0.95)
+
+    return summary
+
+
+def _summarize_bfcl_suite_samples(samples: list[dict]) -> dict[str, float | int]:
+    def values(key: str) -> list[float]:
+        return [float(sample[key]) for sample in samples]
+
+    summary: dict[str, float | int] = {
+        "samples": len(samples),
+        "scenario_count": int(samples[0]["scenario_count"]),
+        "turns": int(samples[0]["total_turns"]),
+        "all_expected_tools_matched": int(
+            all(bool(sample["all_expected_tools_matched"]) for sample in samples)
+        ),
+    }
+
+    for key in (
+        "total_suite_ms",
+        "total_tool_request_ms",
+        "total_tool_output_ms",
+    ):
+        summary[f"{key}_mean"] = statistics.fmean(values(key))
+        summary[f"{key}_p50"] = _percentile(values(key), 0.50)
+        summary[f"{key}_p95"] = _percentile(values(key), 0.95)
+
+    if "connect_ms_total" in samples[0]:
+        summary["connect_ms_total_mean"] = statistics.fmean(values("connect_ms_total"))
+        summary["connect_ms_total_p50"] = _percentile(values("connect_ms_total"), 0.50)
+        summary["connect_ms_total_p95"] = _percentile(values("connect_ms_total"), 0.95)
 
     return summary
 
@@ -1269,6 +1395,269 @@ def _chain_transport_ratios(http_summary: dict, ws_summary: dict) -> dict[str, f
     }
 
 
+def _bfcl_transport_ratios(http_summary: dict, ws_summary: dict) -> dict[str, float]:
+    def ratio(numerator: float, denominator: float) -> float:
+        if denominator <= 0:
+            return 0.0
+        return numerator / denominator
+
+    total_ratio = ratio(
+        float(ws_summary["total_suite_ms_p50"]),
+        float(http_summary["total_suite_ms_p50"]),
+    )
+    request_ratio = ratio(
+        float(ws_summary["total_tool_request_ms_p50"]),
+        float(http_summary["total_tool_request_ms_p50"]),
+    )
+    output_ratio = ratio(
+        float(ws_summary["total_tool_output_ms_p50"]),
+        float(http_summary["total_tool_output_ms_p50"]),
+    )
+
+    return {
+        "ws_over_http_total_suite": total_ratio,
+        "ws_over_http_tool_request_total": request_ratio,
+        "ws_over_http_tool_output_total": output_ratio,
+        "ws_vs_http_total_suite_delta_pct": (1.0 - total_ratio) * 100.0,
+        "ws_vs_http_tool_request_total_delta_pct": (1.0 - request_ratio) * 100.0,
+        "ws_vs_http_tool_output_total_delta_pct": (1.0 - output_ratio) * 100.0,
+    }
+
+
+def _run_http_bfcl_subset_suite_sample(
+    client, model: str, scenarios: list[BfclScenario]
+) -> dict:
+    request_max_output_tokens = _model_tool_request_max_output_tokens()
+    result_max_output_tokens = _model_tool_result_max_output_tokens()
+    total_tool_request_ms = 0.0
+    total_tool_output_ms = 0.0
+    total_turns = 0
+    all_expected_tools_matched = True
+    scenario_results = []
+
+    for scenario in scenarios:
+        with tempfile.TemporaryDirectory(prefix=f"{scenario.id}_") as temp_dir:
+            workspace_root = Path(temp_dir)
+            materialize_bfcl_scenario(workspace_root, scenario)
+            workspace = BfclWorkspace(workspace_root)
+            previous_response_id: str | None = None
+            per_turn_ms: list[float] = []
+            per_turn_requests_ms: list[dict[str, float | int | str]] = []
+            observed_tools: list[str] = []
+
+            for turn_index, turn in enumerate(scenario.turns, start=1):
+                first_stream = client.responses.create(
+                    model=model,
+                    input=turn.prompt,
+                    previous_response_id=previous_response_id,
+                    instructions=_bfcl_request_instructions_for_scenario(scenario),
+                    temperature=0,
+                    max_output_tokens=request_max_output_tokens,
+                    store=True,
+                    stream=True,
+                    tools=bfcl_subset_tools(),
+                    tool_choice=_bfcl_tool_choice(turn.expected_tool),
+                )
+                first_response, tool_request_ms = _collect_http_completed_ms(first_stream)
+                function_calls = _response_function_calls(first_response.output)
+                if not function_calls:
+                    raise AssertionError(
+                        f"expected BFCL tool call in http scenario={scenario.id} turn={turn_index}"
+                    )
+
+                observed_tool = function_calls[0].name
+                observed_tools.append(observed_tool)
+                if observed_tool != turn.expected_tool:
+                    all_expected_tools_matched = False
+                    raise AssertionError(
+                        "unexpected BFCL http tool selection "
+                        f"scenario={scenario.id} turn={turn_index} "
+                        f"expected={turn.expected_tool} observed={observed_tool}"
+                    )
+
+                tool_output_items, _ = _bfcl_tool_output_from_http_function_call(
+                    workspace, function_calls[0]
+                )
+                second_stream = client.responses.create(
+                    model=model,
+                    input=tool_output_items,
+                    previous_response_id=first_response.id,
+                    instructions=_bfcl_tool_result_instructions(),
+                    temperature=0,
+                    max_output_tokens=result_max_output_tokens,
+                    store=True,
+                    stream=True,
+                    tools=bfcl_subset_tools(),
+                    tool_choice="auto",
+                )
+                second_response, tool_output_ms = _collect_http_completed_ms(second_stream)
+
+                turn_total_ms = tool_request_ms + tool_output_ms
+                per_turn_ms.append(turn_total_ms)
+                per_turn_requests_ms.append(
+                    {
+                        "turn_index": turn_index,
+                        "expected_tool": turn.expected_tool,
+                        "observed_tool": observed_tool,
+                        "tool_request_ms": tool_request_ms,
+                        "tool_output_ms": tool_output_ms,
+                        "turn_total_ms": turn_total_ms,
+                    }
+                )
+                previous_response_id = second_response.id
+                total_tool_request_ms += tool_request_ms
+                total_tool_output_ms += tool_output_ms
+
+            total_turns += len(scenario.turns)
+            scenario_results.append(
+                {
+                    "scenario_id": scenario.id,
+                    "source_dataset": scenario.source_dataset,
+                    "source_id": scenario.source_id,
+                    "turns": len(scenario.turns),
+                    "total_chain_ms": sum(per_turn_ms),
+                    "per_turn_completed_ms": per_turn_ms,
+                    "per_turn_requests_ms": per_turn_requests_ms,
+                    "expected_tools": [turn.expected_tool for turn in scenario.turns],
+                    "observed_tools": observed_tools,
+                    "final_files": workspace.list_files(),
+                }
+            )
+
+    return {
+        "scenario_count": len(scenarios),
+        "scenario_results": scenario_results,
+        "total_turns": total_turns,
+        "total_suite_ms": total_tool_request_ms + total_tool_output_ms,
+        "total_tool_request_ms": total_tool_request_ms,
+        "total_tool_output_ms": total_tool_output_ms,
+        "all_expected_tools_matched": all_expected_tools_matched,
+    }
+
+
+async def _run_ws_bfcl_subset_suite_sample(
+    ws_url: str, model: str, scenarios: list[BfclScenario]
+) -> dict:
+    import websockets
+
+    request_max_output_tokens = _model_tool_request_max_output_tokens()
+    result_max_output_tokens = _model_tool_result_max_output_tokens()
+    total_tool_request_ms = 0.0
+    total_tool_output_ms = 0.0
+    total_turns = 0
+    all_expected_tools_matched = True
+    connect_ms_total = 0.0
+    scenario_results = []
+
+    for scenario in scenarios:
+        with tempfile.TemporaryDirectory(prefix=f"{scenario.id}_") as temp_dir:
+            workspace_root = Path(temp_dir)
+            materialize_bfcl_scenario(workspace_root, scenario)
+            workspace = BfclWorkspace(workspace_root)
+
+            connect_started_at = time.perf_counter()
+            async with websockets.connect(
+                ws_url, open_timeout=30, close_timeout=5
+            ) as websocket:
+                connect_ms_total += (time.perf_counter() - connect_started_at) * 1000
+                previous_response_id: str | None = None
+                per_turn_ms: list[float] = []
+                per_turn_requests_ms: list[dict[str, float | int | str]] = []
+                observed_tools: list[str] = []
+
+                for turn_index, turn in enumerate(scenario.turns, start=1):
+                    first_completed, tool_request_ms = await _collect_ws_terminal_event(
+                        websocket,
+                        _ws_request(
+                            model=model,
+                            input=turn.prompt,
+                            instructions=_bfcl_request_instructions_for_scenario(scenario),
+                            temperature=0,
+                            max_output_tokens=request_max_output_tokens,
+                            store=True,
+                            tools=bfcl_subset_tools(),
+                            tool_choice=_bfcl_tool_choice(turn.expected_tool),
+                            previous_response_id=previous_response_id,
+                        ),
+                    )
+                    function_calls = _completed_response_function_calls(first_completed)
+                    if not function_calls:
+                        raise AssertionError(
+                            f"expected BFCL tool call in websocket scenario={scenario.id} turn={turn_index}"
+                        )
+
+                    observed_tool = function_calls[0]["name"]
+                    observed_tools.append(observed_tool)
+                    if observed_tool != turn.expected_tool:
+                        all_expected_tools_matched = False
+                        raise AssertionError(
+                            "unexpected BFCL websocket tool selection "
+                            f"scenario={scenario.id} turn={turn_index} "
+                            f"expected={turn.expected_tool} observed={observed_tool}"
+                        )
+
+                    tool_output_items, _ = _bfcl_tool_output_from_ws_function_call(
+                        workspace, function_calls[0]
+                    )
+                    second_completed, tool_output_ms = await _collect_ws_terminal_event(
+                        websocket,
+                        _ws_request(
+                            model=model,
+                            input=tool_output_items,
+                            instructions=_bfcl_tool_result_instructions(),
+                            temperature=0,
+                            max_output_tokens=result_max_output_tokens,
+                            store=True,
+                            tools=bfcl_subset_tools(),
+                            tool_choice="auto",
+                            previous_response_id=first_completed["response"]["id"],
+                        ),
+                    )
+
+                    turn_total_ms = tool_request_ms + tool_output_ms
+                    per_turn_ms.append(turn_total_ms)
+                    per_turn_requests_ms.append(
+                        {
+                            "turn_index": turn_index,
+                            "expected_tool": turn.expected_tool,
+                            "observed_tool": observed_tool,
+                            "tool_request_ms": tool_request_ms,
+                            "tool_output_ms": tool_output_ms,
+                            "turn_total_ms": turn_total_ms,
+                        }
+                    )
+                    previous_response_id = second_completed["response"]["id"]
+                    total_tool_request_ms += tool_request_ms
+                    total_tool_output_ms += tool_output_ms
+
+                total_turns += len(scenario.turns)
+                scenario_results.append(
+                    {
+                        "scenario_id": scenario.id,
+                        "source_dataset": scenario.source_dataset,
+                        "source_id": scenario.source_id,
+                        "turns": len(scenario.turns),
+                        "total_chain_ms": sum(per_turn_ms),
+                        "per_turn_completed_ms": per_turn_ms,
+                        "per_turn_requests_ms": per_turn_requests_ms,
+                        "expected_tools": [turn.expected_tool for turn in scenario.turns],
+                        "observed_tools": observed_tools,
+                        "final_files": workspace.list_files(),
+                    }
+                )
+
+    return {
+        "scenario_count": len(scenarios),
+        "scenario_results": scenario_results,
+        "total_turns": total_turns,
+        "connect_ms_total": connect_ms_total,
+        "total_suite_ms": total_tool_request_ms + total_tool_output_ms,
+        "total_tool_request_ms": total_tool_request_ms,
+        "total_tool_output_ms": total_tool_output_ms,
+        "all_expected_tools_matched": all_expected_tools_matched,
+    }
+
+
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
@@ -1640,3 +2029,75 @@ class TestResponsesModelGeneratedToolChainDiagnostic:
         assert payload["http"]["turns_requested"] == turns
         assert payload["websocket"]["turns_requested"] == turns
         assert payload["http"]["records"] or payload["websocket"]["records"]
+
+
+@pytest.mark.e2e
+@pytest.mark.slow
+@pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
+@pytest.mark.model("qwen-3b")
+@pytest.mark.gateway(extra_args=["--history-backend", "memory"])
+@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+class TestResponsesBfclSubsetCompare:
+    """BFCL-derived multi-turn filesystem workload for HTTP vs persistent WS."""
+
+    def test_http_vs_ws_bfcl_subset_compare(self, setup_backend):
+        _, model, client, gateway = setup_backend
+
+        scenarios = _selected_bfcl_subset_scenarios()
+        samples = int(os.environ.get("SGLANG_HTTP_WS_BFCL_SUBSET_SAMPLES", "1"))
+        experiment_folder = os.environ.get(
+            "SGLANG_HTTP_WS_BFCL_SUBSET_EXPERIMENT",
+            f"benchmark_http_ws_bfcl_subset_compare_{model.replace('/', '_')}",
+        )
+
+        http_samples = [
+            _run_http_bfcl_subset_suite_sample(client, model, scenarios)
+            for _ in range(samples)
+        ]
+        ws_samples = [
+            asyncio.run(
+                _run_ws_bfcl_subset_suite_sample(
+                    _gateway_ws_url(gateway.base_url), model, scenarios
+                )
+            )
+            for _ in range(samples)
+        ]
+
+        http_summary = _summarize_bfcl_suite_samples(http_samples)
+        ws_summary = _summarize_bfcl_suite_samples(ws_samples)
+        payload = {
+            "router_url": gateway.base_url,
+            "model": model,
+            "samples": samples,
+            "experiment_folder": experiment_folder,
+            "scenarios": [
+                {
+                    "id": scenario.id,
+                    "source_dataset": scenario.source_dataset,
+                    "source_id": scenario.source_id,
+                    "turns": len(scenario.turns),
+                    "description": scenario.description,
+                }
+                for scenario in scenarios
+            ],
+            "http": {
+                "transport": "http",
+                "samples": http_samples,
+                "summary": http_summary,
+            },
+            "websocket": {
+                "transport": "websocket",
+                "samples": ws_samples,
+                "summary": ws_summary,
+            },
+            "ratios": _bfcl_transport_ratios(http_summary, ws_summary),
+        }
+
+        summary_path = _write_summary(experiment_folder, payload)
+        logger.info("HTTP-vs-WS BFCL subset summary written to %s", summary_path)
+
+        assert payload["scenarios"]
+        assert http_summary["all_expected_tools_matched"] == 1
+        assert ws_summary["all_expected_tools_matched"] == 1
+        assert float(http_samples[0]["total_suite_ms"]) > 0
+        assert float(ws_samples[0]["total_suite_ms"]) > 0
