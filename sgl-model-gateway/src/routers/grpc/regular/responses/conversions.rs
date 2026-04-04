@@ -85,7 +85,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                         messages.push(role_to_chat_message(role.as_str(), text));
                     }
                     ResponseInputOutputItem::FunctionToolCall {
-                        id,
+                        call_id,
                         name,
                         arguments,
                         output,
@@ -99,7 +99,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                             content: None,
                             name: None,
                             tool_calls: Some(vec![ToolCall {
-                                id: id.clone(),
+                                id: call_id.clone(),
                                 tool_type: "function".to_string(),
                                 function: FunctionCallResponse {
                                     name: name.clone(),
@@ -113,7 +113,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                         if let Some(output_text) = output {
                             messages.push(ChatMessage::Tool {
                                 content: MessageContent::Text(output_text.clone()),
-                                tool_call_id: id.clone(),
+                                tool_call_id: call_id.clone(),
                             });
                         }
                     }
@@ -549,5 +549,43 @@ mod tests {
             serde_json::to_value(&converted).unwrap(),
             serde_json::to_value(&manual).unwrap(),
         );
+    }
+
+    #[test]
+    fn test_historical_function_tool_call_uses_call_id_for_chat_resume() {
+        let req = ResponsesRequest {
+            input: ResponseInput::Items(vec![ResponseInputOutputItem::FunctionToolCall {
+                id: "fc_item_123".to_string(),
+                call_id: "call_abc".to_string(),
+                name: "calculate".to_string(),
+                arguments: r#"{"expression":"2+2"}"#.to_string(),
+                output: Some(r#"{"result":4}"#.to_string()),
+                status: Some("completed".to_string()),
+            }]),
+            model: "mock-model".to_string(),
+            ..Default::default()
+        };
+
+        let converted = responses_to_chat(&req).unwrap();
+        assert_eq!(converted.messages.len(), 2);
+
+        match &converted.messages[0] {
+            ChatMessage::Assistant {
+                tool_calls: Some(tool_calls),
+                ..
+            } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].id, "call_abc");
+                assert_eq!(tool_calls[0].function.name, "calculate");
+            }
+            other => panic!("expected assistant tool call message, got {:?}", other),
+        }
+
+        match &converted.messages[1] {
+            ChatMessage::Tool { tool_call_id, .. } => {
+                assert_eq!(tool_call_id, "call_abc");
+            }
+            other => panic!("expected tool response message, got {:?}", other),
+        }
     }
 }
