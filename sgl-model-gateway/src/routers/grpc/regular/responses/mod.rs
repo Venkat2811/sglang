@@ -19,4 +19,5 @@ mod websocket;
 
 // Public exports
 pub(crate) use handlers::route_responses;
+pub(crate) use common::normalize_request_input_items;
 pub(crate) use websocket::GrpcWsResponsesExecutor;
