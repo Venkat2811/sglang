@@ -246,9 +246,10 @@ pub(crate) async fn load_conversation_history_with_cache(
 
     // Handle previous_response_id by loading response chain
     if let Some(ref prev_id_str) = modified_request.previous_response_id {
-        if let Some(cached_response) =
-            cached_response.filter(|cached| cached.response.id == *prev_id_str)
-        {
+        if let Some(cached_response) = cached_response.filter(|cached| {
+            cached.response.id == *prev_id_str
+                && cached.response.status != responses::ResponseStatus::Failed
+        }) {
             conversation_items = Some(cached_response.to_conversation_items());
             modified_request.previous_response_id = None;
         } else {

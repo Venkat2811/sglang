@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::{extract::ws::Message, http::HeaderMap};
+use axum::{body::to_bytes, extract::ws::Message, http::HeaderMap};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -77,7 +77,7 @@ impl WsResponsesExecutor for GrpcWsResponsesExecutor {
         if let Some(error_response) =
             validate_worker_availability(&self.worker_registry, request.model.as_str())
         {
-            return Err(response_to_ws_error(error_response));
+            return Err(response_to_ws_error(error_response).await);
         }
 
         if HarmonyDetector::is_harmony_model_in_registry(&self.worker_registry, &request.model) {
@@ -88,19 +88,27 @@ impl WsResponsesExecutor for GrpcWsResponsesExecutor {
         }
 
         let ctx = self.responses_context.clone_for_request();
-        let modified_request =
-            load_conversation_history_with_cache(&ctx, &request, cached_response.as_ref(), true)
-                .await
-                .map_err(response_to_ws_error)?;
+        let modified_request = match load_conversation_history_with_cache(
+            &ctx,
+            &request,
+            cached_response.as_ref(),
+            true,
+        )
+        .await
+        {
+            Ok(modified_request) => modified_request,
+            Err(error_response) => return Err(response_to_ws_error(error_response).await),
+        };
 
         if options.generate == Some(false) {
             return warmup_response_create(&ctx, &request, &modified_request, outbound_tx).await;
         }
 
         let (has_mcp_tools, server_keys) =
-            ensure_mcp_connection(&ctx.mcp_manager, request.tools.as_deref())
-                .await
-                .map_err(response_to_ws_error)?;
+            match ensure_mcp_connection(&ctx.mcp_manager, request.tools.as_deref()).await {
+                Ok(result) => result,
+                Err(error_response) => return Err(response_to_ws_error(error_response).await),
+            };
 
         {
             let mut servers = ctx.requested_servers.write().unwrap();
@@ -143,7 +151,7 @@ impl WsResponsesExecutor for GrpcWsResponsesExecutor {
     }
 }
 
-fn response_to_ws_error(response: axum::response::Response) -> WsClientError {
+async fn response_to_ws_error(response: axum::response::Response) -> WsClientError {
     let status = response.status();
     let header_code = response
         .headers()
@@ -151,13 +159,28 @@ fn response_to_ws_error(response: axum::response::Response) -> WsClientError {
         .and_then(|value| value.to_str().ok())
         .unwrap_or("responses_ws_error")
         .to_string();
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.ok();
+    let parsed_error = body_bytes
+        .as_ref()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .and_then(|value| value.get("error").cloned());
 
-    WsClientError::new(
-        header_code,
-        format!("WebSocket Responses request failed with status {}", status),
-    )
-    .with_status(status.as_u16())
-    .with_param_if_previous_response_not_found()
+    let error_code = parsed_error
+        .as_ref()
+        .and_then(|error| error.get("code"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(&header_code)
+        .to_string();
+    let error_message = parsed_error
+        .as_ref()
+        .and_then(|error| error.get("message"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("WebSocket Responses request failed with status {}", status));
+
+    WsClientError::new(error_code, error_message)
+        .with_status(status.as_u16())
+        .with_param_if_previous_response_not_found()
 }
 
 async fn warmup_response_create(
@@ -231,5 +254,48 @@ impl WsClientErrorExt for WsClientError {
         } else {
             self
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::StatusCode, response::IntoResponse};
+
+    #[tokio::test]
+    async fn test_response_to_ws_error_preserves_router_error_body_message() {
+        let err = response_to_ws_error(error::not_found(
+            "previous_response_not_found",
+            "Previous response 'resp_missing' was not found in the current session or durable storage.",
+        ))
+        .await;
+
+        assert_eq!(err.code, "previous_response_not_found");
+        assert_eq!(
+            err.message,
+            "Previous response 'resp_missing' was not found in the current session or durable storage."
+        );
+        assert_eq!(err.status, 404);
+        assert_eq!(err.param.as_deref(), Some("previous_response_id"));
+    }
+
+    #[tokio::test]
+    async fn test_response_to_ws_error_falls_back_for_non_json_error_body() {
+        let response = (
+            StatusCode::BAD_REQUEST,
+            [(error::HEADER_X_SMG_ERROR_CODE, "responses_ws_error")],
+            Body::from("plain text error"),
+        )
+            .into_response();
+
+        let err = response_to_ws_error(response).await;
+
+        assert_eq!(err.code, "responses_ws_error");
+        assert_eq!(
+            err.message,
+            "WebSocket Responses request failed with status 400 Bad Request"
+        );
+        assert_eq!(err.status, 400);
+        assert_eq!(err.param, None);
     }
 }

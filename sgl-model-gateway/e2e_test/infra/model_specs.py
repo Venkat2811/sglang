@@ -74,6 +74,13 @@ MODEL_SPECS: dict[str, dict] = {
             "--context-length=1000"
         ],  # Faster startup, prevents memory issues
     },
+    # Preferred production-readiness validation model on the B200 host.
+    "qwen-72b": {
+        "model": _resolve_model_path("Qwen/Qwen2.5-72B-Instruct"),
+        "memory_gb": 160,
+        "tp": 1,
+        "features": ["chat", "streaming", "function_calling", "pythonic_tools"],
+    },
     # Reasoning model
     "deepseek-7b": {
         "model": _resolve_model_path("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"),

@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "sgl-model-gateway-e2e-tests"
 version = "0.1.0"
@@ -43,3 +47,8 @@ log_cli = false
 #
 # The thread-safe ModelPool and GPUAllocator classes enable safe concurrent
 # access from multiple test threads.
+
+[tool.setuptools]
+# This test harness is a dependency-only project; disabling auto-discovery keeps
+# `uv pip install .` working in the flat repo layout.
+py-modules = []

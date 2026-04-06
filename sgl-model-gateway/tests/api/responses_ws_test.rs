@@ -243,6 +243,88 @@ impl WsResponsesExecutor for FunctionCallWsExecutor {
     }
 }
 
+#[derive(Clone, Default)]
+struct FailedResponseWsExecutor;
+
+#[async_trait]
+impl WsResponsesExecutor for FailedResponseWsExecutor {
+    async fn execute_response_create(
+        &self,
+        _headers: HeaderMap,
+        request: ResponsesRequest,
+        _options: WsResponseCreateOptions,
+        cached_response: Option<CachedWsResponse>,
+        outbound_tx: mpsc::UnboundedSender<Message>,
+    ) -> Result<CachedWsResponse, WsClientError> {
+        if let Some(previous_id) = request.previous_response_id.as_deref() {
+            if cached_response
+                .as_ref()
+                .is_some_and(|cached| cached.response.id == previous_id)
+            {
+                return Ok(CachedWsResponse {
+                    response: ResponsesResponse::builder(
+                        "resp_ws_unexpected_cached_reuse",
+                        request.model.clone(),
+                    )
+                    .copy_from_request(&request)
+                    .status(ResponseStatus::Completed)
+                    .output(vec![ResponseOutputItem::Message {
+                        id: "msg_ws_unexpected_cached_reuse".to_string(),
+                        role: "assistant".to_string(),
+                        content: vec![ResponseContentPart::OutputText {
+                            text: "unexpected cached continuation".to_string(),
+                            annotations: vec![],
+                            logprobs: None,
+                        }],
+                        status: "completed".to_string(),
+                    }])
+                    .build(),
+                    input_items: vec![],
+                });
+            }
+
+            return Err(WsClientError::new(
+                "previous_response_not_found",
+                format!(
+                    "Previous response '{}' was not found in the current session or durable storage.",
+                    previous_id
+                ),
+            )
+            .with_param("previous_response_id"));
+        }
+
+        let response = ResponsesResponse::builder("resp_ws_failed", request.model.clone())
+            .copy_from_request(&request)
+            .status(ResponseStatus::Failed)
+            .output(vec![])
+            .build();
+        let response_model = request.model.clone();
+
+        let created = serde_json::json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp_ws_failed",
+                "object": "response",
+                "status": "in_progress",
+                "model": response_model,
+                "output": []
+            }
+        });
+        let _ = outbound_tx.send(Message::Text(created.to_string().into()));
+
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": response.clone(),
+        });
+        let _ = outbound_tx.send(Message::Text(completed.to_string().into()));
+
+        Ok(CachedWsResponse {
+            response,
+            input_items: vec![],
+        })
+    }
+}
+
 #[derive(Clone)]
 struct StubWsRouter {
     executor: Arc<dyn WsResponsesExecutor>,
@@ -1158,6 +1240,41 @@ async fn test_v1_responses_ws_evicts_cached_response_after_failed_continuation()
             "model": "mock-model",
             "input": "Retry after failed continuation",
             "previous_response_id": response_id,
+            "store": false
+        })),
+    )
+    .await;
+    let retry_error = retry_events.last().unwrap();
+    assert_eq!(retry_error["type"], "error");
+    assert_eq!(ws_error_code(retry_error), "previous_response_not_found");
+}
+
+#[tokio::test]
+async fn test_v1_responses_ws_does_not_reuse_failed_cached_response() {
+    let url = serve_app(build_stub_app(Arc::new(FailedResponseWsExecutor)).await).await;
+    let (mut socket, _) = connect_async(format!("{}/v1/responses", url))
+        .await
+        .unwrap();
+
+    let first_events = send_ws_request_and_collect(
+        &mut socket,
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Produce a failed websocket response",
+            "store": false
+        })),
+    )
+    .await;
+    let first_completed = first_events.last().unwrap();
+    assert_eq!(first_completed["type"], "response.completed");
+    assert_eq!(first_completed["response"]["status"], "failed");
+
+    let retry_events = send_ws_request_and_collect(
+        &mut socket,
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Retry after failed websocket response",
+            "previous_response_id": "resp_ws_failed",
             "store": false
         })),
     )
