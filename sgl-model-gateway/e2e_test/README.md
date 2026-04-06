@@ -95,6 +95,33 @@ uv run --python .venv/bin/python \
   benchmarks/test_ws_microbench.py -k http_vs_ws_transport_compare -q
 ```
 
+## Frozen Transcript Tool-Output Comparison
+
+Run the router-only transcript lane that replays prebuilt
+`function_call_output` turns without executing tools in the benchmark client:
+
+```bash
+cd sgl-model-gateway/e2e_test
+export SGLANG_HTTP_WS_FROZEN_TRANSCRIPT_SAMPLES=1
+uv run --python .venv/bin/python \
+  pytest --workers 1 --tests-per-worker 1 \
+  benchmarks/test_ws_microbench.py -k frozen_tool_transcript_compare -q
+```
+
+Optional scenario filter:
+
+```bash
+export SGLANG_HTTP_WS_FROZEN_TRANSCRIPT_SCENARIOS=repo_refactor_path,test_failure_triage
+```
+
+Notes:
+
+- This lane is dataset-driven and does not execute tools locally.
+- It measures incremental tool-output continuations through the router using
+  `previous_response_id`.
+- The frozen corpus lives in
+  `benchmarks/data/frozen_tool_transcript_subset.json`.
+
 ## Notes
 
 - The larger default e2e models such as `llama-8b`, `qwen-14b`, and `gpt-oss`

@@ -18,8 +18,16 @@ import urllib.request
 from pathlib import Path
 
 import pytest
+from benchmarks.frozen_tool_transcripts import FrozenToolTranscriptScenario
+from benchmarks.frozen_tool_transcripts import FrozenToolTranscriptTurn
+from benchmarks.frozen_tool_transcripts import load_frozen_tool_transcript_scenarios
 
 logger = logging.getLogger(__name__)
+
+FROZEN_TOOL_TRANSCRIPT_RESULT_INSTRUCTIONS = (
+    "The tool result has already been provided as structured context. "
+    "Answer briefly using that result and do not call any tools."
+)
 
 
 def _gateway_ws_url(base_url: str) -> str:
@@ -92,6 +100,70 @@ def _tool_output_chain_turn_input(turn_index: int) -> list[dict]:
     ]
 
 
+def _selected_frozen_tool_transcript_scenarios() -> list[FrozenToolTranscriptScenario]:
+    scenarios = load_frozen_tool_transcript_scenarios()
+    selected_ids = [
+        value.strip()
+        for value in os.environ.get(
+            "SGLANG_HTTP_WS_FROZEN_TRANSCRIPT_SCENARIOS", ""
+        ).split(",")
+        if value.strip()
+    ]
+    if not selected_ids:
+        return scenarios
+
+    requested = set(selected_ids)
+    selected = [scenario for scenario in scenarios if scenario.id in requested]
+    if not selected:
+        raise AssertionError(
+            "Frozen transcript selection matched no scenarios: "
+            f"requested={selected_ids}"
+        )
+    return selected
+
+
+def _frozen_transcript_turn_input(turn: FrozenToolTranscriptTurn) -> list[dict]:
+    output = turn.tool_output
+    return [
+        {
+            "type": "function_call_output",
+            "call_id": turn.call_id,
+            "output": json.dumps(output) if not isinstance(output, str) else output,
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": turn.user_text}],
+        },
+    ]
+
+
+def _response_output_text_from_response(response: dict) -> str:
+    output_text = response.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    for item in response.get("output", []):
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for content_part in item.get("content", []):
+            if not isinstance(content_part, dict):
+                continue
+            text = content_part.get("text")
+            if isinstance(text, str) and text.strip():
+                return text
+    return ""
+
+
+def _usage_token_totals(response: dict) -> tuple[int, int]:
+    usage = response.get("usage", {})
+    input_tokens = int(
+        usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
+    )
+    output_tokens = int(usage.get("output_tokens", 0) or 0)
+    return input_tokens, output_tokens
+
+
 def _http_stream_events(base_url: str, path: str, payload: dict, timeout_secs: float):
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -153,6 +225,145 @@ def _http_stream_events(base_url: str, path: str, payload: dict, timeout_secs: f
             event_lines.append(line)
 
 
+def _collect_http_response_metrics(
+    base_url: str, payload: dict, timeout_secs: float = 90
+) -> tuple[dict, dict[str, float | int]]:
+    request_payload = {**payload, "stream": True}
+    request_payload_bytes = len(json.dumps(request_payload).encode("utf-8"))
+    request_started_at = time.perf_counter()
+
+    first_event_ms: float | None = None
+    first_content_ms: float | None = None
+    completed_ms: float | None = None
+    response_payload_bytes = 0
+    event_count = 0
+    output_text_delta_count = 0
+
+    for event in _http_stream_events(base_url, "/v1/responses", request_payload, timeout_secs):
+        now = time.perf_counter()
+        event_type = event.get("type")
+        event_count += 1
+        response_payload_bytes += len(json.dumps(event).encode("utf-8"))
+
+        if first_event_ms is None:
+            first_event_ms = (now - request_started_at) * 1000
+
+        if (
+            first_content_ms is None
+            and event_type == "response.output_text.delta"
+            and isinstance(event.get("delta"), str)
+            and event["delta"]
+        ):
+            first_content_ms = (now - request_started_at) * 1000
+            output_text_delta_count += 1
+        elif (
+            event_type == "response.output_text.delta"
+            and isinstance(event.get("delta"), str)
+            and event["delta"]
+        ):
+            output_text_delta_count += 1
+
+        if event_type in {"error", "response.failed", "response.incomplete"}:
+            raise AssertionError(
+                f"HTTP transcript benchmark terminated with {event_type}: {event}"
+            )
+
+        if event_type == "response.completed":
+            completed_ms = (now - request_started_at) * 1000
+            response = event["response"]
+            if first_content_ms is None:
+                first_content_ms = completed_ms
+            input_tokens, output_tokens = _usage_token_totals(response)
+            return response, {
+                "request_payload_bytes": request_payload_bytes,
+                "response_payload_bytes": response_payload_bytes,
+                "request_to_first_event_ms": first_event_ms or 0.0,
+                "request_to_first_content_ms": first_content_ms or 0.0,
+                "request_to_completed_ms": completed_ms or 0.0,
+                "first_event_to_first_content_ms": max(
+                    (first_content_ms or 0.0) - (first_event_ms or 0.0), 0.0
+                ),
+                "first_content_to_completed_ms": max(
+                    (completed_ms or 0.0) - (first_content_ms or 0.0), 0.0
+                ),
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "event_count": event_count,
+                "output_text_delta_count": output_text_delta_count,
+            }
+
+    raise AssertionError("HTTP transcript benchmark ended without response.completed")
+
+
+async def _collect_ws_response_metrics(
+    websocket, request: dict, timeout_secs: float = 90
+) -> tuple[dict, dict[str, float | int]]:
+    payload = _ws_request(**request)
+    request_payload_bytes = len(json.dumps(payload).encode("utf-8"))
+    await websocket.send(json.dumps(payload))
+    request_started_at = time.perf_counter()
+
+    first_event_ms: float | None = None
+    first_content_ms: float | None = None
+    completed_ms: float | None = None
+    response_payload_bytes = 0
+    event_count = 0
+    output_text_delta_count = 0
+
+    while True:
+        message = await asyncio.wait_for(websocket.recv(), timeout=timeout_secs)
+        now = time.perf_counter()
+        event = json.loads(message)
+        event_type = event.get("type")
+        event_count += 1
+        response_payload_bytes += len(message.encode("utf-8"))
+
+        if first_event_ms is None:
+            first_event_ms = (now - request_started_at) * 1000
+
+        if (
+            first_content_ms is None
+            and event_type == "response.output_text.delta"
+            and isinstance(event.get("delta"), str)
+            and event["delta"]
+        ):
+            first_content_ms = (now - request_started_at) * 1000
+            output_text_delta_count += 1
+        elif (
+            event_type == "response.output_text.delta"
+            and isinstance(event.get("delta"), str)
+            and event["delta"]
+        ):
+            output_text_delta_count += 1
+
+        if event_type == "error":
+            raise AssertionError(f"Unexpected websocket transcript benchmark error: {event}")
+
+        if event_type == "response.completed":
+            completed_ms = (now - request_started_at) * 1000
+            response = event["response"]
+            if first_content_ms is None:
+                first_content_ms = completed_ms
+            input_tokens, output_tokens = _usage_token_totals(response)
+            return response, {
+                "request_payload_bytes": request_payload_bytes,
+                "response_payload_bytes": response_payload_bytes,
+                "request_to_first_event_ms": first_event_ms or 0.0,
+                "request_to_first_content_ms": first_content_ms or 0.0,
+                "request_to_completed_ms": completed_ms or 0.0,
+                "first_event_to_first_content_ms": max(
+                    (first_content_ms or 0.0) - (first_event_ms or 0.0), 0.0
+                ),
+                "first_content_to_completed_ms": max(
+                    (completed_ms or 0.0) - (first_content_ms or 0.0), 0.0
+                ),
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "event_count": event_count,
+                "output_text_delta_count": output_text_delta_count,
+            }
+
+
 def _summarize_samples(samples: list[dict[str, float | int]]) -> dict[str, float | int]:
     def values(key: str) -> list[float]:
         return [float(sample[key]) for sample in samples]
@@ -212,6 +423,287 @@ def _summarize_chain_samples(
         summary["connect_ms_p95"] = _percentile(values("connect_ms"), 0.95)
 
     return summary
+
+
+def _summarize_frozen_transcript_samples(samples: list[dict]) -> dict[str, float | int]:
+    def sample_values(key: str) -> list[float]:
+        return [float(sample[key]) for sample in samples]
+
+    turn_results = [
+        turn_result for sample in samples for turn_result in sample["turn_results"]
+    ]
+
+    def turn_values(key: str) -> list[float]:
+        return [float(turn_result[key]) for turn_result in turn_results]
+
+    summary: dict[str, float | int] = {
+        "samples": len(samples),
+        "scenario_count": int(samples[0]["scenario_count"]),
+        "turns": int(samples[0]["total_turns"]),
+        "all_turns_nonempty": int(
+            all(
+                int(sample["nonempty_output_turns"]) == int(sample["total_turns"])
+                for sample in samples
+            )
+        ),
+    }
+
+    for key in (
+        "total_suite_ms",
+        "seed_setup_ms_total",
+        "total_request_payload_bytes",
+        "total_response_payload_bytes",
+        "input_tokens_total",
+        "output_tokens_total",
+    ):
+        summary[f"{key}_mean"] = statistics.fmean(sample_values(key))
+        summary[f"{key}_p50"] = _percentile(sample_values(key), 0.50)
+        summary[f"{key}_p95"] = _percentile(sample_values(key), 0.95)
+
+    if "connect_ms_total" in samples[0]:
+        summary["connect_ms_total_mean"] = statistics.fmean(
+            sample_values("connect_ms_total")
+        )
+        summary["connect_ms_total_p50"] = _percentile(
+            sample_values("connect_ms_total"), 0.50
+        )
+        summary["connect_ms_total_p95"] = _percentile(
+            sample_values("connect_ms_total"), 0.95
+        )
+
+    for key in (
+        "request_to_first_event_ms",
+        "request_to_first_content_ms",
+        "request_to_completed_ms",
+        "first_event_to_first_content_ms",
+        "first_content_to_completed_ms",
+        "request_payload_bytes",
+        "response_payload_bytes",
+        "input_tokens",
+        "output_tokens",
+    ):
+        summary[f"{key}_mean"] = statistics.fmean(turn_values(key))
+        summary[f"{key}_p50"] = _percentile(turn_values(key), 0.50)
+        summary[f"{key}_p95"] = _percentile(turn_values(key), 0.95)
+
+    return summary
+
+
+def _run_http_frozen_tool_transcript_sample(
+    base_url: str,
+    model: str,
+    scenarios: list[FrozenToolTranscriptScenario],
+    timeout_secs: float = 90,
+) -> dict:
+    turn_results: list[dict[str, float | int | str | bool]] = []
+    total_suite_ms = 0.0
+    seed_setup_ms_total = 0.0
+    total_request_payload_bytes = 0
+    total_response_payload_bytes = 0
+    input_tokens_total = 0
+    output_tokens_total = 0
+    nonempty_output_turns = 0
+
+    for scenario in scenarios:
+        seed_response, seed_metrics = _collect_http_response_metrics(
+            base_url,
+            {
+                "model": model,
+                "input": scenario.seed_prompt,
+                "temperature": 0,
+                "max_output_tokens": 8,
+                "store": True,
+                "stream": True,
+            },
+            timeout_secs,
+        )
+        seed_setup_ms_total += float(seed_metrics["request_to_completed_ms"])
+        previous_response_id = str(seed_response["id"])
+
+        for turn_index, turn in enumerate(scenario.turns, start=1):
+            response, metrics = _collect_http_response_metrics(
+                base_url,
+                {
+                    "model": model,
+                    "input": _frozen_transcript_turn_input(turn),
+                    "previous_response_id": previous_response_id,
+                    "instructions": FROZEN_TOOL_TRANSCRIPT_RESULT_INSTRUCTIONS,
+                    "temperature": 0,
+                    "max_output_tokens": turn.max_output_tokens,
+                    "store": True,
+                    "stream": True,
+                },
+                timeout_secs,
+            )
+            previous_response_id = str(response["id"])
+            output_text = _response_output_text_from_response(response)
+            if output_text.strip():
+                nonempty_output_turns += 1
+
+            total_suite_ms += float(metrics["request_to_completed_ms"])
+            total_request_payload_bytes += int(metrics["request_payload_bytes"])
+            total_response_payload_bytes += int(metrics["response_payload_bytes"])
+            input_tokens_total += int(metrics["input_tokens"])
+            output_tokens_total += int(metrics["output_tokens"])
+            turn_results.append(
+                {
+                    "scenario_id": scenario.id,
+                    "source_dataset": scenario.source_dataset,
+                    "source_id": scenario.source_id,
+                    "turn_index": turn_index,
+                    "turn_id": turn.turn_id,
+                    "tool_name": turn.tool_name,
+                    "request_payload_bytes": int(metrics["request_payload_bytes"]),
+                    "response_payload_bytes": int(metrics["response_payload_bytes"]),
+                    "input_tokens": int(metrics["input_tokens"]),
+                    "output_tokens": int(metrics["output_tokens"]),
+                    "request_to_first_event_ms": float(
+                        metrics["request_to_first_event_ms"]
+                    ),
+                    "request_to_first_content_ms": float(
+                        metrics["request_to_first_content_ms"]
+                    ),
+                    "request_to_completed_ms": float(
+                        metrics["request_to_completed_ms"]
+                    ),
+                    "first_event_to_first_content_ms": float(
+                        metrics["first_event_to_first_content_ms"]
+                    ),
+                    "first_content_to_completed_ms": float(
+                        metrics["first_content_to_completed_ms"]
+                    ),
+                    "event_count": int(metrics["event_count"]),
+                    "output_text_delta_count": int(metrics["output_text_delta_count"]),
+                    "response_id": previous_response_id,
+                    "has_output_text": bool(output_text.strip()),
+                    "output_text": output_text,
+                }
+            )
+
+    return {
+        "scenario_count": len(scenarios),
+        "total_turns": len(turn_results),
+        "total_suite_ms": total_suite_ms,
+        "seed_setup_ms_total": seed_setup_ms_total,
+        "total_request_payload_bytes": total_request_payload_bytes,
+        "total_response_payload_bytes": total_response_payload_bytes,
+        "input_tokens_total": input_tokens_total,
+        "output_tokens_total": output_tokens_total,
+        "nonempty_output_turns": nonempty_output_turns,
+        "turn_results": turn_results,
+    }
+
+
+async def _run_ws_frozen_tool_transcript_sample(
+    ws_url: str,
+    model: str,
+    scenarios: list[FrozenToolTranscriptScenario],
+    timeout_secs: float = 90,
+) -> dict:
+    import websockets
+
+    turn_results: list[dict[str, float | int | str | bool]] = []
+    total_suite_ms = 0.0
+    seed_setup_ms_total = 0.0
+    total_request_payload_bytes = 0
+    total_response_payload_bytes = 0
+    input_tokens_total = 0
+    output_tokens_total = 0
+    nonempty_output_turns = 0
+    connect_started_at = time.perf_counter()
+
+    async with websockets.connect(ws_url, open_timeout=30, close_timeout=5) as websocket:
+        connect_ms_total = (time.perf_counter() - connect_started_at) * 1000
+
+        for scenario in scenarios:
+            seed_response, seed_metrics = await _collect_ws_response_metrics(
+                websocket,
+                {
+                    "model": model,
+                    "input": scenario.seed_prompt,
+                    "temperature": 0,
+                    "max_output_tokens": 8,
+                    "store": True,
+                },
+                timeout_secs,
+            )
+            seed_setup_ms_total += float(seed_metrics["request_to_completed_ms"])
+            previous_response_id = str(seed_response["id"])
+
+            for turn_index, turn in enumerate(scenario.turns, start=1):
+                response, metrics = await _collect_ws_response_metrics(
+                    websocket,
+                    {
+                        "model": model,
+                        "input": _frozen_transcript_turn_input(turn),
+                        "previous_response_id": previous_response_id,
+                        "instructions": FROZEN_TOOL_TRANSCRIPT_RESULT_INSTRUCTIONS,
+                        "temperature": 0,
+                        "max_output_tokens": turn.max_output_tokens,
+                        "store": True,
+                    },
+                    timeout_secs,
+                )
+                previous_response_id = str(response["id"])
+                output_text = _response_output_text_from_response(response)
+                if output_text.strip():
+                    nonempty_output_turns += 1
+
+                total_suite_ms += float(metrics["request_to_completed_ms"])
+                total_request_payload_bytes += int(metrics["request_payload_bytes"])
+                total_response_payload_bytes += int(metrics["response_payload_bytes"])
+                input_tokens_total += int(metrics["input_tokens"])
+                output_tokens_total += int(metrics["output_tokens"])
+                turn_results.append(
+                    {
+                        "scenario_id": scenario.id,
+                        "source_dataset": scenario.source_dataset,
+                        "source_id": scenario.source_id,
+                        "turn_index": turn_index,
+                        "turn_id": turn.turn_id,
+                        "tool_name": turn.tool_name,
+                        "request_payload_bytes": int(metrics["request_payload_bytes"]),
+                        "response_payload_bytes": int(metrics["response_payload_bytes"]),
+                        "input_tokens": int(metrics["input_tokens"]),
+                        "output_tokens": int(metrics["output_tokens"]),
+                        "request_to_first_event_ms": float(
+                            metrics["request_to_first_event_ms"]
+                        ),
+                        "request_to_first_content_ms": float(
+                            metrics["request_to_first_content_ms"]
+                        ),
+                        "request_to_completed_ms": float(
+                            metrics["request_to_completed_ms"]
+                        ),
+                        "first_event_to_first_content_ms": float(
+                            metrics["first_event_to_first_content_ms"]
+                        ),
+                        "first_content_to_completed_ms": float(
+                            metrics["first_content_to_completed_ms"]
+                        ),
+                        "event_count": int(metrics["event_count"]),
+                        "output_text_delta_count": int(
+                            metrics["output_text_delta_count"]
+                        ),
+                        "response_id": previous_response_id,
+                        "has_output_text": bool(output_text.strip()),
+                        "output_text": output_text,
+                    }
+                )
+
+    return {
+        "scenario_count": len(scenarios),
+        "total_turns": len(turn_results),
+        "connect_ms_total": connect_ms_total,
+        "total_suite_ms": total_suite_ms,
+        "seed_setup_ms_total": seed_setup_ms_total,
+        "total_request_payload_bytes": total_request_payload_bytes,
+        "total_response_payload_bytes": total_response_payload_bytes,
+        "input_tokens_total": input_tokens_total,
+        "output_tokens_total": output_tokens_total,
+        "nonempty_output_turns": nonempty_output_turns,
+        "turn_results": turn_results,
+    }
 
 
 async def _run_single_ws_sample(ws_url: str, model: str) -> dict[str, float | int]:
@@ -776,6 +1268,43 @@ def _chain_transport_ratios(http_summary: dict, ws_summary: dict) -> dict[str, f
     }
 
 
+def _frozen_transcript_transport_ratios(http_summary: dict, ws_summary: dict) -> dict[str, float]:
+    def ratio(numerator: float, denominator: float) -> float:
+        if denominator <= 0:
+            return 0.0
+        return numerator / denominator
+
+    total_ratio = ratio(
+        float(ws_summary["total_suite_ms_p50"]),
+        float(http_summary["total_suite_ms_p50"]),
+    )
+
+    return {
+        "ws_over_http_total_suite": total_ratio,
+        "ws_vs_http_total_suite_delta_pct": (1.0 - total_ratio) * 100.0,
+        "ws_over_http_first_event_p50": ratio(
+            float(ws_summary["request_to_first_event_ms_p50"]),
+            float(http_summary["request_to_first_event_ms_p50"]),
+        ),
+        "ws_over_http_first_content_p50": ratio(
+            float(ws_summary["request_to_first_content_ms_p50"]),
+            float(http_summary["request_to_first_content_ms_p50"]),
+        ),
+        "ws_over_http_completed_p50": ratio(
+            float(ws_summary["request_to_completed_ms_p50"]),
+            float(http_summary["request_to_completed_ms_p50"]),
+        ),
+        "ws_over_http_request_payload_total_p50": ratio(
+            float(ws_summary["total_request_payload_bytes_p50"]),
+            float(http_summary["total_request_payload_bytes_p50"]),
+        ),
+        "ws_over_http_response_payload_total_p50": ratio(
+            float(ws_summary["total_response_payload_bytes_p50"]),
+            float(http_summary["total_response_payload_bytes_p50"]),
+        ),
+    }
+
+
 @pytest.mark.parametrize(
     ("backend_name", "expected_worker_transport", "expected_router_topology"),
     [
@@ -1136,3 +1665,107 @@ class TestResponsesToolOutputChainCompare:
         assert ws_samples[0]["tool_turns"] == tool_turns
         assert float(http_samples[0]["total_chain_ms"]) > 0
         assert float(ws_samples[0]["total_chain_ms"]) > 0
+
+
+@pytest.mark.e2e
+@pytest.mark.slow
+@pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
+@pytest.mark.model("qwen-0.5b")
+@pytest.mark.gateway(extra_args=["--history-backend", "memory"])
+@pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
+class TestResponsesFrozenToolTranscriptCompare:
+    """Dataset-driven tool-output continuations for HTTP SSE vs persistent WS."""
+
+    def test_http_vs_ws_frozen_tool_transcript_compare(self, setup_backend):
+        backend_name, model, _, gateway = setup_backend
+
+        scenarios = _selected_frozen_tool_transcript_scenarios()
+        samples = int(os.environ.get("SGLANG_HTTP_WS_FROZEN_TRANSCRIPT_SAMPLES", "1"))
+        experiment_folder = _scoped_experiment_folder(
+            os.environ.get(
+                "SGLANG_HTTP_WS_FROZEN_TRANSCRIPT_EXPERIMENT",
+                (
+                    "benchmark_http_ws_frozen_tool_transcript_compare_"
+                    f"{model.replace('/', '_')}"
+                ),
+            ),
+            backend_name,
+        )
+        benchmark_context = _benchmark_context(
+            benchmark_family="agentic_transcript_qos",
+            run_class="http_vs_ws_frozen_tool_transcript_compare",
+            backend_name=backend_name,
+            model=model,
+            store_mode="store_true",
+            workload_kind="incremental_frozen_tool_transcript",
+        )
+
+        timeout_secs = float(
+            os.environ.get("SGLANG_HTTP_WS_FROZEN_TRANSCRIPT_TIMEOUT_SECS", "90")
+        )
+        http_samples = [
+            _run_http_frozen_tool_transcript_sample(
+                gateway.base_url,
+                model,
+                scenarios,
+                timeout_secs,
+            )
+            for _ in range(samples)
+        ]
+        ws_samples = [
+            asyncio.run(
+                _run_ws_frozen_tool_transcript_sample(
+                    _gateway_ws_url(gateway.base_url),
+                    model,
+                    scenarios,
+                    timeout_secs,
+                )
+            )
+            for _ in range(samples)
+        ]
+        http_summary = _summarize_frozen_transcript_samples(http_samples)
+        ws_summary = _summarize_frozen_transcript_samples(ws_samples)
+
+        payload = {
+            "benchmark_context": benchmark_context,
+            "worker_backend": backend_name,
+            "router_url": gateway.base_url,
+            "model": model,
+            "samples": samples,
+            "experiment_folder": experiment_folder,
+            "scenarios": [
+                {
+                    "id": scenario.id,
+                    "source_dataset": scenario.source_dataset,
+                    "source_id": scenario.source_id,
+                    "turns": len(scenario.turns),
+                    "description": scenario.description,
+                }
+                for scenario in scenarios
+            ],
+            "http": _transport_result(
+                context=benchmark_context,
+                client_transport="http_sse",
+                samples=http_samples,
+                summary=http_summary,
+            ),
+            "websocket": _transport_result(
+                context=benchmark_context,
+                client_transport="websocket",
+                samples=ws_samples,
+                summary=ws_summary,
+            ),
+            "ratios": _frozen_transcript_transport_ratios(http_summary, ws_summary),
+        }
+
+        summary_path = _write_summary(experiment_folder, payload)
+        logger.info(
+            "HTTP-vs-WS frozen transcript comparison summary written to %s",
+            summary_path,
+        )
+
+        assert payload["scenarios"]
+        assert int(http_summary["turns"]) > 0
+        assert int(ws_summary["turns"]) > 0
+        assert float(http_summary["total_suite_ms_p50"]) > 0
+        assert float(ws_summary["total_suite_ms_p50"]) > 0
