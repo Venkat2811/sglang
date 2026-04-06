@@ -19,7 +19,10 @@ from benchmarks import test_ws_microbench as ws_bench
 from infra.constants import ConnectionMode
 from infra.gateway import Gateway
 from infra.model_pool import ModelPool
+from infra.model_pool import ModelInstance
+from infra.model_pool import WorkerIdentity
 from infra.model_specs import get_model_spec
+from infra.constants import WorkerType
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +159,63 @@ def _run_command(path: Path, cmd: list[str], cwd: Path | None = None) -> str:
     )
     _write_text(path, content)
     return completed.stdout
+
+
+def _safe_slug(value: str) -> str:
+    return value.replace("/", "_").replace(":", "_")
+
+
+def _acquire_regular_workers(
+    *,
+    pool: ModelPool,
+    model_id: str,
+    mode: ConnectionMode,
+    worker_count: int,
+    startup_timeout: int,
+) -> list[ModelInstance]:
+    if worker_count <= 1:
+        return [pool.get(model_id, mode, gpu_wait_timeout=startup_timeout)]
+
+    instances: list[ModelInstance] = []
+    all_existing = pool.get_workers_by_type(model_id, WorkerType.REGULAR)
+    existing_for_mode = [worker for worker in all_existing if worker.mode == mode]
+
+    for worker in all_existing:
+        if worker not in existing_for_mode:
+            worker.release()
+
+    if len(existing_for_mode) >= worker_count:
+        instances = existing_for_mode[:worker_count]
+        for worker in existing_for_mode[worker_count:]:
+            worker.release()
+        return instances
+
+    missing = worker_count - len(existing_for_mode)
+    workers_to_launch = [
+        WorkerIdentity(
+            model_id=model_id,
+            mode=mode,
+            worker_type=WorkerType.REGULAR,
+            index=len(existing_for_mode) + index,
+        )
+        for index in range(missing)
+    ]
+    new_instances = pool.launch_workers(
+        workers_to_launch,
+        startup_timeout=startup_timeout,
+        gpu_wait_timeout=startup_timeout,
+    )
+    if len(new_instances) != missing:
+        for worker in existing_for_mode:
+            worker.release()
+        for worker in new_instances:
+            worker.release()
+        raise RuntimeError(
+            f"Failed to launch {missing} additional workers for {model_id}:{mode.value}"
+        )
+    for worker in new_instances:
+        worker.acquire()
+    return existing_for_mode + new_instances
 
 
 def _capture_system_info(paths: ArtifactPaths) -> dict[str, str]:
@@ -589,6 +649,7 @@ def _report_markdown(payload: dict[str, Any]) -> str:
     sections = ["# WS Matrix Summary", ""]
     for backend_name, backend_payload in payload["backends"].items():
         sections.append(f"## {backend_name}")
+        sections.append(f"- worker count: {backend_payload.get('worker_count', 1)}")
         startup_phases = backend_payload.get("startup_phases")
         if startup_phases:
             sections.append(
@@ -663,6 +724,7 @@ def _root_readme(payload: dict[str, Any]) -> str:
                 f"""\
                 ### {backend_name}
 
+                - worker count: {backend_payload.get('worker_count', 1)}
                 - worker acquire elapsed s: {startup_phases['worker_acquire_elapsed_s']:.2f}
                 - gateway start elapsed s: {startup_phases['gateway_start_elapsed_s']:.2f}
                 - backend setup elapsed s: {startup_phases['backend_setup_elapsed_s']:.2f}
@@ -727,42 +789,78 @@ def _run_backend(
     multiturn_parallel: int,
     request_timeout: int,
     families: set[str],
+    worker_count: int,
 ) -> dict[str, Any]:
     logger.info("Starting backend slice: %s", backend.name)
     backend_started_at = time.perf_counter()
     logger.info(
-        "Acquiring worker backend=%s model_id=%s mode=%s",
+        "Acquiring worker backend=%s model_id=%s mode=%s worker_count=%s",
         backend.name,
         model_id,
         backend.mode.value,
+        worker_count,
     )
     worker_acquire_started_at = time.perf_counter()
-    instance = pool.get(model_id, backend.mode, gpu_wait_timeout=startup_timeout)
+    instances = _acquire_regular_workers(
+        pool=pool,
+        model_id=model_id,
+        mode=backend.mode,
+        worker_count=worker_count,
+        startup_timeout=startup_timeout,
+    )
     worker_acquire_elapsed_s = time.perf_counter() - worker_acquire_started_at
     logger.info(
-        "Worker acquired backend=%s worker_url=%s elapsed=%.2fs",
+        "Workers acquired backend=%s worker_urls=%s elapsed=%.2fs",
         backend.name,
-        instance.worker_url,
+        [instance.worker_url for instance in instances],
         worker_acquire_elapsed_s,
     )
     try:
         gateway = Gateway()
         backend_payload: dict[str, Any] = {
             "model_id": model_id,
-            "model_path": instance.model_path,
+            "model_path": instances[0].model_path,
             "worker_transport": backend.worker_transport,
             "router_topology": backend.router_topology,
+            "worker_count": worker_count,
+            "workers": [
+                {
+                    "key": instance.key,
+                    "worker_url": instance.worker_url,
+                    "base_url": instance.base_url,
+                    "port": instance.port,
+                    "gpu_ids": instance.gpu_slot.gpu_ids if instance.gpu_slot else [],
+                    "launch_command": instance.launch_command,
+                    "stdout_log_path": instance.stdout_log_path,
+                    "stderr_log_path": instance.stderr_log_path,
+                }
+                for instance in instances
+            ],
         }
         try:
             gateway_start_started_at = time.perf_counter()
+            gateway_log_stem = (
+                f"{backend.router_topology}_workers{worker_count}_gateway"
+            )
             gateway.start(
-                worker_urls=[instance.worker_url],
-                model_path=instance.model_path,
+                worker_urls=[instance.worker_url for instance in instances],
+                model_path=instances[0].model_path,
                 timeout=router_timeout,
                 extra_args=["--history-backend", "memory"],
+                stdout_path=paths.logs
+                / "gateway"
+                / f"{_safe_slug(gateway_log_stem)}.stdout.log",
+                stderr_path=paths.logs
+                / "gateway"
+                / f"{_safe_slug(gateway_log_stem)}.stderr.log",
             )
             gateway_start_elapsed_s = time.perf_counter() - gateway_start_started_at
             backend_payload["router_url"] = gateway.base_url
+            backend_payload["gateway"] = {
+                "launch_command": gateway.launch_command,
+                "stdout_log_path": gateway.stdout_log_path,
+                "stderr_log_path": gateway.stderr_log_path,
+            }
             backend_payload["startup_phases"] = {
                 "worker_acquire_elapsed_s": worker_acquire_elapsed_s,
                 "gateway_start_elapsed_s": gateway_start_elapsed_s,
@@ -786,7 +884,7 @@ def _run_backend(
                     "transport_compare",
                     lambda: _transport_compare_payload(
                         backend.name,
-                        instance.model_path,
+                        instances[0].model_path,
                         gateway,
                         transport_samples,
                         request_timeout,
@@ -796,7 +894,7 @@ def _run_backend(
                     "continuation_compare",
                     lambda: _continuation_compare_payload(
                         backend.name,
-                        instance.model_path,
+                        instances[0].model_path,
                         gateway,
                         chain_turns,
                         chain_samples,
@@ -807,7 +905,7 @@ def _run_backend(
                     "tool_output_compare",
                     lambda: _tool_output_compare_payload(
                         backend.name,
-                        instance.model_path,
+                        instances[0].model_path,
                         gateway,
                         tool_turns,
                         chain_samples,
@@ -818,7 +916,7 @@ def _run_backend(
                     "frozen_transcript_compare",
                     lambda: _frozen_transcript_compare_payload(
                         backend.name,
-                        instance.model_path,
+                        instances[0].model_path,
                         gateway,
                         transcript_samples,
                         request_timeout,
@@ -830,7 +928,7 @@ def _run_backend(
                         backend=backend,
                         paths=paths,
                         gateway=gateway,
-                        model_path=instance.model_path,
+                        model_path=instances[0].model_path,
                         chain_mode="full_replay",
                         store_mode="true",
                         turns=multiturn_turns,
@@ -844,7 +942,7 @@ def _run_backend(
                         backend=backend,
                         paths=paths,
                         gateway=gateway,
-                        model_path=instance.model_path,
+                        model_path=instances[0].model_path,
                         chain_mode="previous_response_id",
                         store_mode="true",
                         turns=multiturn_turns,
@@ -877,7 +975,8 @@ def _run_backend(
         finally:
             gateway.shutdown()
     finally:
-        instance.release()
+        for instance in instances:
+            instance.release()
 
     return backend_payload
 
@@ -904,6 +1003,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--router-timeout", type=int, default=180)
     parser.add_argument("--request-timeout", type=int, default=180)
+    parser.add_argument("--worker-count", type=int, default=1)
     parser.add_argument(
         "--backends",
         nargs="+",
@@ -954,13 +1054,14 @@ def main() -> int:
             "startup_timeout": args.startup_timeout,
             "router_timeout": args.router_timeout,
             "request_timeout": args.request_timeout,
+            "worker_count": args.worker_count,
             "backends": [backend.name for backend in backend_configs],
             "families": args.families,
         },
         "backends": {},
     }
 
-    with ModelPool() as pool:
+    with ModelPool(log_dir=paths.logs / "workers") as pool:
         # No eager workers here, but this sets the health-check timeout used by
         # later on-demand launches from pool.get().
         pool.startup(requirements=[], startup_timeout=args.startup_timeout)
@@ -982,6 +1083,7 @@ def main() -> int:
                 multiturn_parallel=args.multiturn_parallel,
                 request_timeout=args.request_timeout,
                 families=set(args.families),
+                worker_count=args.worker_count,
             )
 
     _write_json(paths.reports_benchmarks / "matrix_summary.json", payload)
