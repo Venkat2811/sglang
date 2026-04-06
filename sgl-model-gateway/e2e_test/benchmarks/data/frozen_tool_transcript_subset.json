@@ -1,0 +1,207 @@
+[
+  {
+    "id": "repo_refactor_path",
+    "source_dataset": "frozen_agentic_subset",
+    "source_id": "coding_001",
+    "description": "Trace a websocket cache hardening change across search, file inspection, and symbol lookup.",
+    "seed_prompt": "You are reviewing a router patch. Reply with the single word ready.",
+    "turns": [
+      {
+        "turn_id": "search_cache_path",
+        "call_id": "call_repo_refactor_1",
+        "tool_name": "search_repo",
+        "tool_arguments": {
+          "query": "cached websocket response previous_response_id"
+        },
+        "tool_output": {
+          "matches": [
+            "sgl-model-gateway/src/routers/ws_responses.rs:328",
+            "sgl-model-gateway/src/routers/grpc/regular/responses/common.rs:248",
+            "sgl-model-gateway/tests/api/responses_ws_test.rs:1190"
+          ],
+          "summary": "Cache handling is split between the websocket session and the regular responses continuation path."
+        },
+        "user_text": "Summarize the cache reuse risk in one short paragraph.",
+        "max_output_tokens": 72
+      },
+      {
+        "turn_id": "inspect_ws_handler",
+        "call_id": "call_repo_refactor_2",
+        "tool_name": "read_file",
+        "tool_arguments": {
+          "path": "sgl-model-gateway/src/routers/ws_responses.rs",
+          "start_line": 300,
+          "end_line": 360
+        },
+        "tool_output": {
+          "path": "sgl-model-gateway/src/routers/ws_responses.rs",
+          "excerpt": [
+            "if let Some(previous_response_id) = request.previous_response_id.clone() {",
+            "    let cached = session.latest_response.as_ref().filter(|cached| {",
+            "        cached.response.id == previous_response_id",
+            "    });",
+            "}",
+            "session.latest_response = Some(cached_response.clone());"
+          ]
+        },
+        "user_text": "State the key invariant we should preserve after a failed continuation.",
+        "max_output_tokens": 64
+      },
+      {
+        "turn_id": "symbol_followup",
+        "call_id": "call_repo_refactor_3",
+        "tool_name": "list_symbols",
+        "tool_arguments": {
+          "path": "sgl-model-gateway/src/routers/grpc/regular/responses/common.rs"
+        },
+        "tool_output": {
+          "symbols": [
+            "resolve_previous_response",
+            "hydrate_stored_previous_response",
+            "merge_previous_response_items"
+          ],
+          "summary": "Continuation hydration and merge happen before the worker request is built."
+        },
+        "user_text": "Explain how the websocket cache relates to the regular hydration path.",
+        "max_output_tokens": 80
+      }
+    ]
+  },
+  {
+    "id": "test_failure_triage",
+    "source_dataset": "frozen_agentic_subset",
+    "source_id": "coding_002",
+    "description": "Triaging an integration failure using test output, logs, and a diff summary.",
+    "seed_prompt": "You are triaging a benchmark regression. Reply with the single word ready.",
+    "turns": [
+      {
+        "turn_id": "collect_failures",
+        "call_id": "call_test_triage_1",
+        "tool_name": "read_test_report",
+        "tool_arguments": {
+          "path": "artifacts/test_report.json"
+        },
+        "tool_output": {
+          "failing_tests": [
+            "responses_ws::test_v1_responses_ws_continuation_after_completed_event",
+            "responses_endpoint_tests::test_v1_responses_accepts_function_call_output_only_continuation"
+          ],
+          "summary": "Both failures point at continuation timing and state reuse."
+        },
+        "user_text": "Give the most likely common cause in one sentence.",
+        "max_output_tokens": 56
+      },
+      {
+        "turn_id": "inspect_logs",
+        "call_id": "call_test_triage_2",
+        "tool_name": "read_log",
+        "tool_arguments": {
+          "path": "artifacts/router.log",
+          "grep": "concurrent_response_create"
+        },
+        "tool_output": {
+          "matches": [
+            "response.completed sent before in_flight cleared",
+            "next response.create rejected as concurrent_response_create"
+          ],
+          "line_count": 2
+        },
+        "user_text": "Describe the handoff bug and the user-visible symptom briefly.",
+        "max_output_tokens": 72
+      },
+      {
+        "turn_id": "inspect_diff",
+        "call_id": "call_test_triage_3",
+        "tool_name": "summarize_diff",
+        "tool_arguments": {
+          "paths": [
+            "src/routers/ws_responses.rs",
+            "tests/api/responses_ws_test.rs"
+          ]
+        },
+        "tool_output": {
+          "summary": [
+            "Cleared in_flight before caching the completed response.",
+            "Added regression coverage for immediate next-turn continuation."
+          ]
+        },
+        "user_text": "Summarize why the regression test is necessary.",
+        "max_output_tokens": 68
+      }
+    ]
+  },
+  {
+    "id": "perf_investigation_followup",
+    "source_dataset": "frozen_agentic_subset",
+    "source_id": "coding_003",
+    "description": "Investigating a websocket latency gap using traces, socket tuning, and matrix notes.",
+    "seed_prompt": "You are investigating a websocket latency trace. Reply with the single word ready.",
+    "turns": [
+      {
+        "turn_id": "inspect_phase_trace",
+        "call_id": "call_perf_followup_1",
+        "tool_name": "read_trace",
+        "tool_arguments": {
+          "path": "artifacts/ws_phase_trace.json"
+        },
+        "tool_output": {
+          "phases": {
+            "request_to_first_event_ms_p50": 8.9,
+            "first_event_to_first_content_ms_p50": 41.2,
+            "request_to_completed_ms_p50": 692.4
+          },
+          "note": "The main gap is between response.created and the first content delta."
+        },
+        "user_text": "Identify the dominant latency phase in one short sentence.",
+        "max_output_tokens": 52
+      },
+      {
+        "turn_id": "inspect_socket_tuning",
+        "call_id": "call_perf_followup_2",
+        "tool_name": "read_config_snippet",
+        "tool_arguments": {
+          "path": "src/server.rs",
+          "symbol": "tcp_nodelay"
+        },
+        "tool_output": {
+          "excerpt": [
+            "listener.set_nodelay(true)?;",
+            "websocket stream flushes immediately after created and delta events"
+          ]
+        },
+        "user_text": "Explain what this tuning changes and what it does not change.",
+        "max_output_tokens": 78
+      },
+      {
+        "turn_id": "compare_matrix",
+        "call_id": "call_perf_followup_3",
+        "tool_name": "read_matrix_summary",
+        "tool_arguments": {
+          "path": "artifacts/qwen72b_router_matrix.md"
+        },
+        "tool_output": {
+          "rows": [
+            {
+              "mode": "http full replay",
+              "mean_ms": 10783.95
+            },
+            {
+              "mode": "ws full replay",
+              "mean_ms": 9241.92
+            },
+            {
+              "mode": "http previous_response_id",
+              "mean_ms": 10599.97
+            },
+            {
+              "mode": "ws previous_response_id",
+              "mean_ms": 9292.36
+            }
+          ]
+        },
+        "user_text": "State the strongest takeaway from this matrix in one short paragraph.",
+        "max_output_tokens": 96
+      }
+    ]
+  }
+]

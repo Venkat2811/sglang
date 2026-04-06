@@ -38,6 +38,7 @@ _ALL_FAMILIES = (
     "transport_compare",
     "continuation_compare",
     "tool_output_compare",
+    "frozen_transcript_compare",
     "router_multiturn_full_replay",
     "router_multiturn_previous_response_id",
 )
@@ -412,6 +413,82 @@ def _tool_output_compare_payload(
     }
 
 
+def _frozen_transcript_compare_payload(
+    backend_name: str,
+    model_path: str,
+    gateway: Gateway,
+    samples: int,
+    request_timeout: int,
+) -> dict[str, Any]:
+    scenarios = ws_bench._selected_frozen_tool_transcript_scenarios()
+    benchmark_context = ws_bench._benchmark_context(
+        benchmark_family="agentic_transcript_qos",
+        run_class="b200_frozen_tool_transcript_compare",
+        backend_name=backend_name,
+        model=model_path,
+        store_mode="store_true",
+        workload_kind="incremental_frozen_tool_transcript",
+    )
+    http_samples = _run_logged_samples(
+        suite_name="frozen_transcript_compare",
+        transport="http_sse",
+        samples=samples,
+        runner=lambda: ws_bench._run_http_frozen_tool_transcript_sample(
+            gateway.base_url,
+            model_path,
+            scenarios,
+            request_timeout,
+        ),
+    )
+    ws_samples = _run_logged_samples(
+        suite_name="frozen_transcript_compare",
+        transport="websocket",
+        samples=samples,
+        runner=lambda: asyncio.run(
+            ws_bench._run_ws_frozen_tool_transcript_sample(
+                ws_bench._gateway_ws_url(gateway.base_url),
+                model_path,
+                scenarios,
+                request_timeout,
+            )
+        ),
+    )
+    http_summary = ws_bench._summarize_frozen_transcript_samples(http_samples)
+    ws_summary = ws_bench._summarize_frozen_transcript_samples(ws_samples)
+    return {
+        "benchmark_context": benchmark_context,
+        "worker_backend": backend_name,
+        "router_url": gateway.base_url,
+        "model": model_path,
+        "samples": samples,
+        "scenarios": [
+            {
+                "id": scenario.id,
+                "source_dataset": scenario.source_dataset,
+                "source_id": scenario.source_id,
+                "turns": len(scenario.turns),
+                "description": scenario.description,
+            }
+            for scenario in scenarios
+        ],
+        "http": ws_bench._transport_result(
+            context=benchmark_context,
+            client_transport="http_sse",
+            samples=http_samples,
+            summary=http_summary,
+        ),
+        "websocket": ws_bench._transport_result(
+            context=benchmark_context,
+            client_transport="websocket",
+            samples=ws_samples,
+            summary=ws_summary,
+        ),
+        "ratios": ws_bench._frozen_transcript_transport_ratios(
+            http_summary, ws_summary
+        ),
+    }
+
+
 def _router_multiturn_payload(
     *,
     backend: BackendConfig,
@@ -542,6 +619,19 @@ def _report_markdown(payload: dict[str, Any]) -> str:
                 f"- tool-output compare failed: {tool_output_payload['error']['message']}"
             )
 
+        frozen_transcript_payload = backend_payload.get("frozen_transcript_compare", {})
+        if "ratios" in frozen_transcript_payload:
+            frozen_transcript = frozen_transcript_payload["ratios"]
+            sections.append(
+                "- frozen transcript ws/http total-suite delta pct: "
+                f"{frozen_transcript['ws_vs_http_total_suite_delta_pct']:.2f}"
+            )
+        elif "error" in frozen_transcript_payload:
+            sections.append(
+                "frozen transcript compare failed: "
+                f"{frozen_transcript_payload['error']['message']}"
+            )
+
         sections.append("")
     return "\n".join(sections).rstrip() + "\n"
 
@@ -594,6 +684,7 @@ def _run_backend(
     chain_turns: int,
     chain_samples: int,
     tool_turns: int,
+    transcript_samples: int,
     multiturn_turns: int,
     multiturn_num_qa: int,
     multiturn_parallel: int,
@@ -654,6 +745,16 @@ def _run_backend(
                         gateway,
                         tool_turns,
                         chain_samples,
+                        request_timeout,
+                    ),
+                ),
+                (
+                    "frozen_transcript_compare",
+                    lambda: _frozen_transcript_compare_payload(
+                        backend.name,
+                        instance.model_path,
+                        gateway,
+                        transcript_samples,
                         request_timeout,
                     ),
                 ),
@@ -730,6 +831,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chain-turns", type=int, default=20)
     parser.add_argument("--chain-samples", type=int, default=1)
     parser.add_argument("--tool-turns", type=int, default=20)
+    parser.add_argument("--transcript-samples", type=int, default=1)
     parser.add_argument("--multiturn-turns", type=int, default=8)
     parser.add_argument("--multiturn-num-qa", type=int, default=8)
     parser.add_argument("--multiturn-parallel", type=int, default=1)
@@ -779,6 +881,7 @@ def main() -> int:
             "chain_turns": args.chain_turns,
             "chain_samples": args.chain_samples,
             "tool_turns": args.tool_turns,
+            "transcript_samples": args.transcript_samples,
             "multiturn_turns": args.multiturn_turns,
             "multiturn_num_qa": args.multiturn_num_qa,
             "multiturn_parallel": args.multiturn_parallel,
@@ -807,6 +910,7 @@ def main() -> int:
                 chain_turns=args.chain_turns,
                 chain_samples=args.chain_samples,
                 tool_turns=args.tool_turns,
+                transcript_samples=args.transcript_samples,
                 multiturn_turns=args.multiturn_turns,
                 multiturn_num_qa=args.multiturn_num_qa,
                 multiturn_parallel=args.multiturn_parallel,
