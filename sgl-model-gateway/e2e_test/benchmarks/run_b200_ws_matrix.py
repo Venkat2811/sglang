@@ -104,20 +104,23 @@ def _artifact_paths(root: Path) -> ArtifactPaths:
 
 
 def _configure_logging(log_path: Path) -> None:
-    logger.setLevel(logging.INFO)
     formatter = logging.Formatter(
         "%(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    logger.handlers.clear()
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
 
     file_handler = logging.FileHandler(log_path)
     file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    root_logger.addHandler(file_handler)
 
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
+    root_logger.addHandler(stream_handler)
+
+    logger.setLevel(logging.INFO)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -583,9 +586,20 @@ def _router_multiturn_payload(
 
 
 def _report_markdown(payload: dict[str, Any]) -> str:
-    sections = ["# B200 WS Matrix Summary", ""]
+    sections = ["# WS Matrix Summary", ""]
     for backend_name, backend_payload in payload["backends"].items():
         sections.append(f"## {backend_name}")
+        startup_phases = backend_payload.get("startup_phases")
+        if startup_phases:
+            sections.append(
+                f"- worker acquire elapsed s: {startup_phases['worker_acquire_elapsed_s']:.2f}"
+            )
+            sections.append(
+                f"- gateway start elapsed s: {startup_phases['gateway_start_elapsed_s']:.2f}"
+            )
+            sections.append(
+                f"- backend setup elapsed s: {startup_phases['backend_setup_elapsed_s']:.2f}"
+            )
         transport_payload = backend_payload.get("transport_compare", {})
         if "ratios" in transport_payload:
             transport = transport_payload["ratios"]
@@ -639,37 +653,60 @@ def _report_markdown(payload: dict[str, Any]) -> str:
 def _root_readme(payload: dict[str, Any]) -> str:
     artifact_root = payload["artifact_root"]
     system = payload["system_summary"]
-    return textwrap.dedent(
-        f"""\
-        # B200 WS Matrix Artifacts
+    startup_sections: list[str] = []
+    for backend_name, backend_payload in payload["backends"].items():
+        startup_phases = backend_payload.get("startup_phases")
+        if not startup_phases:
+            continue
+        startup_sections.append(
+            textwrap.dedent(
+                f"""\
+                ### {backend_name}
 
-        This artifact bundle captures the retained WebSocket benchmark matrix on
-        the B200 host for `{payload['model_id']}`.
-
-        ## Machine Snapshot
-
-        - timestamp UTC: {system['timestamp_utc']}
-        - python: `{system['python_executable']}`
-        - sglang git rev: `{system['sglang_git_rev']}`
-        - ai-chat-exports git rev: `{system['ai_chat_exports_git_rev']}`
-
-        ## Artifact Layout
-
-        - `runtime/raw/benchmarks`: raw JSON benchmark payloads
-        - `runtime/raw/system_info`: captured machine and repo state
-        - `runtime/reports/benchmarks`: matrix summaries
-        - `runtime/reports/system_info`: condensed system report
-        - `runtime/logs`: runner and subprocess logs
-        - `tools`: commands and manifests for reruns
-
-        ## Primary Report
-
-        - `runtime/reports/benchmarks/matrix_summary.md`
-        - `runtime/reports/benchmarks/matrix_summary.json`
-
-        Artifact root: `{artifact_root}`
-        """
+                - worker acquire elapsed s: {startup_phases['worker_acquire_elapsed_s']:.2f}
+                - gateway start elapsed s: {startup_phases['gateway_start_elapsed_s']:.2f}
+                - backend setup elapsed s: {startup_phases['backend_setup_elapsed_s']:.2f}
+                """
+            ).rstrip()
+        )
+    sections = [
+        "# WS Matrix Artifacts",
+        "",
+        "This artifact bundle captures the retained WebSocket benchmark matrix",
+        f"for `{payload['model_id']}`.",
+        "",
+        "## Machine Snapshot",
+        "",
+        f"- timestamp UTC: {system['timestamp_utc']}",
+        f"- python: `{system['python_executable']}`",
+        f"- sglang git rev: `{system['sglang_git_rev']}`",
+        f"- ai-chat-exports git rev: `{system['ai_chat_exports_git_rev']}`",
+        "",
+        "## Artifact Layout",
+        "",
+        "- `runtime/raw/benchmarks`: raw JSON benchmark payloads",
+        "- `runtime/raw/system_info`: captured machine and repo state",
+        "- `runtime/reports/benchmarks`: matrix summaries",
+        "- `runtime/reports/system_info`: condensed system report",
+        "- `runtime/logs`: runner and subprocess logs",
+        "- `tools`: commands and manifests for reruns",
+    ]
+    if startup_sections:
+        sections.extend(["", "## Startup Phases", ""])
+        for entry in startup_sections:
+            sections.append(entry)
+            sections.append("")
+    sections.extend(
+        [
+            "## Primary Report",
+            "",
+            "- `runtime/reports/benchmarks/matrix_summary.md`",
+            "- `runtime/reports/benchmarks/matrix_summary.json`",
+            "",
+            f"Artifact root: `{artifact_root}`",
+        ]
     )
+    return "\n".join(sections).rstrip() + "\n"
 
 
 def _run_backend(
@@ -692,23 +729,52 @@ def _run_backend(
     families: set[str],
 ) -> dict[str, Any]:
     logger.info("Starting backend slice: %s", backend.name)
+    backend_started_at = time.perf_counter()
+    logger.info(
+        "Acquiring worker backend=%s model_id=%s mode=%s",
+        backend.name,
+        model_id,
+        backend.mode.value,
+    )
+    worker_acquire_started_at = time.perf_counter()
     instance = pool.get(model_id, backend.mode, gpu_wait_timeout=startup_timeout)
+    worker_acquire_elapsed_s = time.perf_counter() - worker_acquire_started_at
+    logger.info(
+        "Worker acquired backend=%s worker_url=%s elapsed=%.2fs",
+        backend.name,
+        instance.worker_url,
+        worker_acquire_elapsed_s,
+    )
     try:
         gateway = Gateway()
+        backend_payload: dict[str, Any] = {
+            "model_id": model_id,
+            "model_path": instance.model_path,
+            "worker_transport": backend.worker_transport,
+            "router_topology": backend.router_topology,
+        }
         try:
+            gateway_start_started_at = time.perf_counter()
             gateway.start(
                 worker_urls=[instance.worker_url],
                 model_path=instance.model_path,
                 timeout=router_timeout,
                 extra_args=["--history-backend", "memory"],
             )
-            backend_payload: dict[str, Any] = {
-                "model_id": model_id,
-                "model_path": instance.model_path,
-                "worker_transport": backend.worker_transport,
-                "router_topology": backend.router_topology,
-                "router_url": gateway.base_url,
+            gateway_start_elapsed_s = time.perf_counter() - gateway_start_started_at
+            backend_payload["router_url"] = gateway.base_url
+            backend_payload["startup_phases"] = {
+                "worker_acquire_elapsed_s": worker_acquire_elapsed_s,
+                "gateway_start_elapsed_s": gateway_start_elapsed_s,
+                "backend_setup_elapsed_s": time.perf_counter() - backend_started_at,
             }
+            logger.info(
+                "Gateway ready backend=%s router_url=%s elapsed=%.2fs setup_total=%.2fs",
+                backend.name,
+                gateway.base_url,
+                gateway_start_elapsed_s,
+                backend_payload["startup_phases"]["backend_setup_elapsed_s"],
+            )
 
             raw_path = paths.raw_benchmarks / f"{backend.router_topology}.json"
 
