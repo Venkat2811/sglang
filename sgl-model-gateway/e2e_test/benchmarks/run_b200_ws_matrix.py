@@ -15,8 +15,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import openai
-
 from benchmarks import test_ws_microbench as ws_bench
 from infra.constants import ConnectionMode
 from infra.gateway import Gateway
@@ -40,8 +38,6 @@ _ALL_FAMILIES = (
     "transport_compare",
     "continuation_compare",
     "tool_output_compare",
-    "bfcl_forced_compare",
-    "bfcl_free_choice_compare",
     "router_multiturn_full_replay",
     "router_multiturn_previous_response_id",
 )
@@ -202,14 +198,6 @@ def _capture_system_info(paths: ArtifactPaths) -> dict[str, str]:
     )
     _write_text(paths.reports_system_info / "README.md", report)
     return summary
-
-
-def _openai_client(base_url: str, timeout_secs: int) -> openai.OpenAI:
-    return openai.OpenAI(
-        base_url=f"{base_url}/v1",
-        api_key="not-used",
-        timeout=timeout_secs,
-    )
 
 
 def _run_logged_samples(
@@ -424,144 +412,6 @@ def _tool_output_compare_payload(
     }
 
 
-def _bfcl_forced_payload(
-    backend_name: str,
-    model_path: str,
-    gateway: Gateway,
-    client: openai.OpenAI,
-    samples: int,
-) -> dict[str, Any]:
-    scenarios = ws_bench._selected_bfcl_subset_scenarios()
-    benchmark_context = ws_bench._benchmark_context(
-        benchmark_family="tool_loop_transport_qos",
-        run_class="b200_bfcl_forced_tool_compare",
-        backend_name=backend_name,
-        model=model_path,
-        store_mode="store_true",
-        workload_kind="bfcl_multi_turn_forced_tool",
-    )
-    http_samples = _run_logged_samples(
-        suite_name="bfcl_forced_compare",
-        transport="http_sse",
-        samples=samples,
-        runner=lambda: ws_bench._run_http_bfcl_subset_suite_sample(
-            client, model_path, scenarios
-        ),
-    )
-    ws_samples = _run_logged_samples(
-        suite_name="bfcl_forced_compare",
-        transport="websocket",
-        samples=samples,
-        runner=lambda: asyncio.run(
-            ws_bench._run_ws_bfcl_subset_suite_sample(
-                ws_bench._gateway_ws_url(gateway.base_url), model_path, scenarios
-            )
-        ),
-    )
-    http_summary = ws_bench._summarize_bfcl_suite_samples(http_samples)
-    ws_summary = ws_bench._summarize_bfcl_suite_samples(ws_samples)
-    return {
-        "benchmark_context": benchmark_context,
-        "worker_backend": backend_name,
-        "router_url": gateway.base_url,
-        "model": model_path,
-        "samples": samples,
-        "scenarios": [
-            {
-                "id": scenario.id,
-                "source_dataset": scenario.source_dataset,
-                "source_id": scenario.source_id,
-                "turns": len(scenario.turns),
-                "description": scenario.description,
-            }
-            for scenario in scenarios
-        ],
-        "http": ws_bench._transport_result(
-            context=benchmark_context,
-            client_transport="http_sse",
-            samples=http_samples,
-            summary=http_summary,
-        ),
-        "websocket": ws_bench._transport_result(
-            context=benchmark_context,
-            client_transport="websocket",
-            samples=ws_samples,
-            summary=ws_summary,
-        ),
-        "ratios": ws_bench._bfcl_transport_ratios(http_summary, ws_summary),
-    }
-
-
-def _bfcl_free_choice_payload(
-    backend_name: str,
-    model_path: str,
-    gateway: Gateway,
-    client: openai.OpenAI,
-    samples: int,
-) -> dict[str, Any]:
-    scenarios = ws_bench._selected_bfcl_subset_scenarios()
-    benchmark_context = ws_bench._benchmark_context(
-        benchmark_family="tool_loop_transport_qos",
-        run_class="b200_bfcl_free_choice_diagnostic",
-        backend_name=backend_name,
-        model=model_path,
-        store_mode="store_true",
-        workload_kind="bfcl_multi_turn_free_choice",
-    )
-    http_samples = _run_logged_samples(
-        suite_name="bfcl_free_choice_compare",
-        transport="http_sse",
-        samples=samples,
-        runner=lambda: ws_bench._run_http_bfcl_subset_free_choice_suite_sample(
-            client, model_path, scenarios
-        ),
-    )
-    ws_samples = _run_logged_samples(
-        suite_name="bfcl_free_choice_compare",
-        transport="websocket",
-        samples=samples,
-        runner=lambda: asyncio.run(
-            ws_bench._run_ws_bfcl_subset_free_choice_suite_sample(
-                ws_bench._gateway_ws_url(gateway.base_url), model_path, scenarios
-            )
-        ),
-    )
-    http_summary = ws_bench._summarize_bfcl_free_choice_samples(http_samples)
-    ws_summary = ws_bench._summarize_bfcl_free_choice_samples(ws_samples)
-    return {
-        "benchmark_context": benchmark_context,
-        "worker_backend": backend_name,
-        "router_url": gateway.base_url,
-        "model": model_path,
-        "samples": samples,
-        "scenarios": [
-            {
-                "id": scenario.id,
-                "source_dataset": scenario.source_dataset,
-                "source_id": scenario.source_id,
-                "turns": len(scenario.turns),
-                "description": scenario.description,
-            }
-            for scenario in scenarios
-        ],
-        "http": ws_bench._transport_result(
-            context=benchmark_context,
-            client_transport="http_sse",
-            samples=http_samples,
-            summary=http_summary,
-        ),
-        "websocket": ws_bench._transport_result(
-            context=benchmark_context,
-            client_transport="websocket",
-            samples=ws_samples,
-            summary=ws_summary,
-        ),
-        "ratios": ws_bench._bfcl_free_choice_transport_ratios(
-            http_summary, ws_summary
-        ),
-    }
-
-
 def _router_multiturn_payload(
     *,
     backend: BackendConfig,
@@ -692,30 +542,6 @@ def _report_markdown(payload: dict[str, Any]) -> str:
                 f"- tool-output compare failed: {tool_output_payload['error']['message']}"
             )
 
-        forced_payload = backend_payload.get("bfcl_forced_compare", {})
-        if "ratios" in forced_payload:
-            forced = forced_payload["ratios"]
-            sections.append(
-                f"- BFCL forced-tool ws/http suite delta pct: {forced['ws_vs_http_total_suite_delta_pct']:.2f}"
-            )
-        elif "error" in forced_payload:
-            sections.append(
-                f"- BFCL forced-tool compare failed: {forced_payload['error']['message']}"
-            )
-
-        free_choice_payload = backend_payload.get("bfcl_free_choice_compare", {})
-        if "ratios" in free_choice_payload:
-            free_choice = free_choice_payload["ratios"]
-            sections.append(
-                f"- BFCL free-choice matched-turn-rate delta: {free_choice['ws_minus_http_matched_turn_rate']:.4f}"
-            )
-            sections.append(
-                f"- BFCL free-choice completed-scenario-rate delta: {free_choice['ws_minus_http_completed_scenario_rate']:.4f}"
-            )
-        elif "error" in free_choice_payload:
-            sections.append(
-                f"- BFCL free-choice compare failed: {free_choice_payload['error']['message']}"
-            )
         sections.append("")
     return "\n".join(sections).rstrip() + "\n"
 
@@ -768,7 +594,6 @@ def _run_backend(
     chain_turns: int,
     chain_samples: int,
     tool_turns: int,
-    bfcl_samples: int,
     multiturn_turns: int,
     multiturn_num_qa: int,
     multiturn_parallel: int,
@@ -786,8 +611,6 @@ def _run_backend(
                 timeout=router_timeout,
                 extra_args=["--history-backend", "memory"],
             )
-            client = _openai_client(gateway.base_url, request_timeout)
-
             backend_payload: dict[str, Any] = {
                 "model_id": model_id,
                 "model_path": instance.model_path,
@@ -832,18 +655,6 @@ def _run_backend(
                         tool_turns,
                         chain_samples,
                         request_timeout,
-                    ),
-                ),
-                (
-                    "bfcl_forced_compare",
-                    lambda: _bfcl_forced_payload(
-                        backend.name, instance.model_path, gateway, client, bfcl_samples
-                    ),
-                ),
-                (
-                    "bfcl_free_choice_compare",
-                    lambda: _bfcl_free_choice_payload(
-                        backend.name, instance.model_path, gateway, client, bfcl_samples
                     ),
                 ),
                 (
@@ -919,7 +730,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chain-turns", type=int, default=20)
     parser.add_argument("--chain-samples", type=int, default=1)
     parser.add_argument("--tool-turns", type=int, default=20)
-    parser.add_argument("--bfcl-samples", type=int, default=1)
     parser.add_argument("--multiturn-turns", type=int, default=8)
     parser.add_argument("--multiturn-num-qa", type=int, default=8)
     parser.add_argument("--multiturn-parallel", type=int, default=1)
@@ -969,7 +779,6 @@ def main() -> int:
             "chain_turns": args.chain_turns,
             "chain_samples": args.chain_samples,
             "tool_turns": args.tool_turns,
-            "bfcl_samples": args.bfcl_samples,
             "multiturn_turns": args.multiturn_turns,
             "multiturn_num_qa": args.multiturn_num_qa,
             "multiturn_parallel": args.multiturn_parallel,
@@ -998,7 +807,6 @@ def main() -> int:
                 chain_turns=args.chain_turns,
                 chain_samples=args.chain_samples,
                 tool_turns=args.tool_turns,
-                bfcl_samples=args.bfcl_samples,
                 multiturn_turns=args.multiturn_turns,
                 multiturn_num_qa=args.multiturn_num_qa,
                 multiturn_parallel=args.multiturn_parallel,
