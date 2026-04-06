@@ -1,6 +1,8 @@
 //! Streaming infrastructure for /v1/responses endpoint
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{body::Body, extract::ws::Message, http::StatusCode, response::Response};
 use bytes::Bytes;
@@ -32,6 +34,18 @@ pub(crate) trait ResponseEventSink {
     fn send_done(&self) -> Result<(), String> {
         Ok(())
     }
+}
+
+fn response_event_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("SMG_DEBUG_RESPONSE_EVENT_TIMING").is_some())
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn should_log_response_event(event_type: &str) -> bool {
@@ -93,6 +107,18 @@ impl ResponseEventSink for SseResponseEventSink {
 
         if self.tx.send(Ok(Bytes::from(sse_message))).is_err() {
             return Err("Client disconnected".to_string());
+        }
+
+        if response_event_timing_enabled() && should_log_response_event(event_type) {
+            let (_, delta_chars) = response_event_log_fields(event);
+            tracing::info!(
+                wall_time_ms = unix_timestamp_ms(),
+                transport = "sse",
+                stage = "enqueue",
+                event_type,
+                delta_chars,
+                "queued responses stream event"
+            );
         }
 
         Ok(())
@@ -159,6 +185,17 @@ impl ResponseEventSink for WsResponseEventSink {
         }
         if self.tx.send(Message::Text(event_json.into())).is_err() {
             return Err("Client disconnected".to_string());
+        }
+
+        if response_event_timing_enabled() && should_log_response_event(event_type) {
+            tracing::info!(
+                wall_time_ms = unix_timestamp_ms(),
+                transport = "ws",
+                stage = "enqueue",
+                event_type,
+                delta_chars,
+                "queued responses stream event"
+            );
         }
         Ok(())
     }

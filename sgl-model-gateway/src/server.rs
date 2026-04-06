@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use axum_server::accept::NoDelayAcceptor;
 use axum::{
     extract::{ws::WebSocketUpgrade, FromRequestParts, Path, Query, Request, State},
     http::StatusCode,
@@ -1112,12 +1113,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .map_err(|e| format!("Failed to create TLS config: {}", e))?;
 
         axum_server::bind_rustls(addr, tls_config)
+            .acceptor(NoDelayAcceptor::new())
             .handle(handle)
             .serve(app.into_make_service())
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     } else {
         axum_server::bind(addr)
+            .acceptor(NoDelayAcceptor::new())
             .handle(handle)
             .serve(app.into_make_service())
             .await
