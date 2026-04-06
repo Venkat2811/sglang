@@ -95,31 +95,12 @@ uv run --python .venv/bin/python \
   benchmarks/test_ws_microbench.py -k http_vs_ws_transport_compare -q
 ```
 
-## BFCL-Derived Workload Compare
-
-Run the BFCL-derived multi-turn filesystem workload on the local `qwen-3b`
-path:
-
-```bash
-cd sgl-model-gateway/e2e_test
-export SGLANG_HTTP_WS_BFCL_SUBSET_SAMPLES=3
-uv run --python .venv/bin/python \
-  pytest --workers 1 --tests-per-worker 1 \
-  benchmarks/test_ws_microbench.py -k bfcl_subset_compare -q
-```
-
-Notes:
-
-- This uses a tiny BFCL-derived subset with 2 scenarios and 9 total turns.
-- The harness forces the expected function name per turn so the compare isolates
-  transport/history cost instead of small-model tool arbitration quality.
-
 ## Notes
 
 - The larger default e2e models such as `llama-8b`, `qwen-14b`, and `gpt-oss`
   are not intended to be the first green path on a 12 GB developer GPU.
-- `qwen-3b` is the best current local candidate for tool-call semantics on a
-  single RTX 3060-class machine.
+- `qwen-3b` is the best current local candidate for router-only transport and
+  continuation benchmarking on a single RTX 3060-class machine.
 - Keep the small-model smoke path green before expanding to heavier semantic
   or compatibility coverage.
 - Normal pytest exit now tears down the pooled local worker automatically.
