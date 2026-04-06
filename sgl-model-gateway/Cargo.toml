@@ -165,6 +165,11 @@ name = "manual_policy_benchmark"
 harness = false
 path = "benches/manual_policy_benchmark.rs"
 
+[[bench]]
+name = "ws_response_hotpath"
+harness = false
+path = "benches/ws_response_hotpath.rs"
+
 [profile.release]
 opt-level = "z"     # Optimize for size
 lto = "fat"         # Full LTO for smaller binaries
