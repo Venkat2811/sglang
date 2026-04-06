@@ -1193,7 +1193,7 @@ def _run_http_model_generated_tool_chain_diagnostic(
     request_max_output_tokens = _model_tool_request_max_output_tokens()
     result_max_output_tokens = _model_tool_result_max_output_tokens()
     result = {
-        "transport": "http",
+        "transport": "http_json",
         "mode": "non_streaming_http_diagnostic",
         "turns_requested": turns,
         "request_instructions": request_instructions,
@@ -1344,6 +1344,82 @@ def _write_summary(experiment_folder: str, payload: dict) -> Path:
     out_path = out_dir / "summary.json"
     out_path.write_text(json.dumps(payload, indent=2))
     return out_path
+
+
+def _worker_transport_for_backend(backend_name: str) -> str:
+    if backend_name == "http":
+        return "http"
+    if backend_name == "grpc":
+        return "grpc"
+    if backend_name == "pd":
+        return "http"
+    raise ValueError(f"Unsupported benchmark backend: {backend_name}")
+
+
+def _router_topology_for_backend(backend_name: str) -> str:
+    if backend_name == "http":
+        return "regular_http_worker"
+    if backend_name == "grpc":
+        return "regular_grpc_worker"
+    if backend_name == "pd":
+        return "pd_http_workers"
+    raise ValueError(f"Unsupported benchmark backend: {backend_name}")
+
+
+def _topology_overlay_for_backend(backend_name: str) -> str:
+    if backend_name == "pd":
+        return "pd"
+    return "none"
+
+
+def _benchmark_context(
+    *,
+    benchmark_family: str,
+    run_class: str,
+    backend_name: str,
+    model: str,
+    store_mode: str,
+    workload_kind: str,
+) -> dict[str, str]:
+    return {
+        "benchmark_family": benchmark_family,
+        "run_class": run_class,
+        "worker_transport": _worker_transport_for_backend(backend_name),
+        "router_topology": _router_topology_for_backend(backend_name),
+        "model_id": model,
+        "topology_overlay": _topology_overlay_for_backend(backend_name),
+        "store_mode": store_mode,
+        "workload_kind": workload_kind,
+    }
+
+
+def _benchmark_contract(*, client_transport: str, **context: str) -> dict[str, str]:
+    return {
+        **context,
+        "client_transport": client_transport,
+    }
+
+
+def _transport_result(
+    *,
+    context: dict[str, str],
+    client_transport: str,
+    samples: list[dict],
+    summary: dict,
+) -> dict:
+    return {
+        "transport": client_transport,
+        "benchmark_contract": _benchmark_contract(
+            client_transport=client_transport,
+            **context,
+        ),
+        "samples": samples,
+        "summary": summary,
+    }
+
+
+def _scoped_experiment_folder(base_name: str, backend_name: str) -> str:
+    return f"{base_name}_{_router_topology_for_backend(backend_name)}"
 
 
 def _transport_ratios(http_summary: dict, ws_summary: dict) -> dict[str, float]:
@@ -1658,17 +1734,66 @@ async def _run_ws_bfcl_subset_suite_sample(
     }
 
 
+@pytest.mark.parametrize(
+    ("backend_name", "expected_worker_transport", "expected_router_topology"),
+    [
+        ("http", "http", "regular_http_worker"),
+        ("grpc", "grpc", "regular_grpc_worker"),
+        ("pd", "http", "pd_http_workers"),
+    ],
+)
+def test_benchmark_contract_maps_backend_axes(
+    backend_name: str,
+    expected_worker_transport: str,
+    expected_router_topology: str,
+):
+    contract = _benchmark_contract(
+        **_benchmark_context(
+            benchmark_family="transport_qos",
+            run_class="test_contract",
+            backend_name=backend_name,
+            model="Qwen/Qwen2.5-72B-Instruct",
+            store_mode="store_false",
+            workload_kind="single_turn_text",
+        ),
+        client_transport="websocket",
+    )
+
+    assert contract["worker_transport"] == expected_worker_transport
+    assert contract["router_topology"] == expected_router_topology
+    assert contract["client_transport"] == "websocket"
+    assert contract["model_id"] == "Qwen/Qwen2.5-72B-Instruct"
+
+
+def test_benchmark_context_rejects_unknown_backend():
+    with pytest.raises(ValueError, match="Unsupported benchmark backend"):
+        _benchmark_context(
+            benchmark_family="transport_qos",
+            run_class="test_contract",
+            backend_name="ws_worker",
+            model="Qwen/Qwen2.5-72B-Instruct",
+            store_mode="store_false",
+            workload_kind="single_turn_text",
+        )
+
+
+def test_scoped_experiment_folder_uses_router_topology_suffix():
+    assert _scoped_experiment_folder("benchmark_http_ws_compare", "grpc") == (
+        "benchmark_http_ws_compare_regular_grpc_worker"
+    )
+
+
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
 @pytest.mark.model("qwen-0.5b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
-@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+@pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
 class TestWsMicrobench:
     """WebSocket benchmark for the Responses route on a single small model."""
 
     def test_ws_microbench(self, setup_backend):
-        _, model, _, gateway = setup_backend
+        backend_name, model, _, gateway = setup_backend
 
         concurrency_levels = [
             int(value)
@@ -1678,9 +1803,20 @@ class TestWsMicrobench:
         samples_per_concurrency = int(
             os.environ.get("SGLANG_WS_BENCH_SAMPLES_PER_CONCURRENCY", "2")
         )
-        experiment_folder = os.environ.get(
-            "SGLANG_WS_BENCH_EXPERIMENT",
-            f"benchmark_ws_microbench_{model.replace('/', '_')}",
+        experiment_folder = _scoped_experiment_folder(
+            os.environ.get(
+                "SGLANG_WS_BENCH_EXPERIMENT",
+                f"benchmark_ws_microbench_{model.replace('/', '_')}",
+            ),
+            backend_name,
+        )
+        benchmark_context = _benchmark_context(
+            benchmark_family="transport_qos",
+            run_class="ws_microbench_profile",
+            backend_name=backend_name,
+            model=model,
+            store_mode="store_false",
+            workload_kind="single_turn_text",
         )
 
         payload = asyncio.run(
@@ -1691,6 +1827,11 @@ class TestWsMicrobench:
                 samples_per_concurrency,
             )
         )
+        payload["benchmark_contract"] = _benchmark_contract(
+            client_transport="websocket",
+            **benchmark_context,
+        )
+        payload["worker_backend"] = backend_name
         payload["router_url"] = gateway.base_url
         payload["model"] = model
         payload["experiment_folder"] = experiment_folder
@@ -1711,17 +1852,28 @@ class TestWsMicrobench:
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
 @pytest.mark.model("qwen-0.5b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
-@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+@pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
 class TestResponsesTransportCompare:
     """Small-model transport comparison for HTTP SSE vs WebSocket Responses."""
 
     def test_http_vs_ws_transport_compare(self, setup_backend):
-        _, model, client, gateway = setup_backend
+        backend_name, model, client, gateway = setup_backend
 
         samples = int(os.environ.get("SGLANG_HTTP_WS_COMPARE_SAMPLES", "2"))
-        experiment_folder = os.environ.get(
-            "SGLANG_HTTP_WS_COMPARE_EXPERIMENT",
-            f"benchmark_http_ws_compare_{model.replace('/', '_')}",
+        experiment_folder = _scoped_experiment_folder(
+            os.environ.get(
+                "SGLANG_HTTP_WS_COMPARE_EXPERIMENT",
+                f"benchmark_http_ws_compare_{model.replace('/', '_')}",
+            ),
+            backend_name,
+        )
+        benchmark_context = _benchmark_context(
+            benchmark_family="transport_qos",
+            run_class="http_vs_ws_transport_compare",
+            backend_name=backend_name,
+            model=model,
+            store_mode="store_false",
+            workload_kind="single_turn_text",
         )
 
         http_samples = [_run_single_http_sample(client, model) for _ in range(samples)]
@@ -1733,20 +1885,24 @@ class TestResponsesTransportCompare:
         ws_summary = _summarize_samples(ws_samples)
 
         payload = {
+            "benchmark_context": benchmark_context,
+            "worker_backend": backend_name,
             "router_url": gateway.base_url,
             "model": model,
             "experiment_folder": experiment_folder,
             "samples_per_transport": samples,
-            "http": {
-                "transport": "http_sse",
-                "samples": http_samples,
-                "summary": http_summary,
-            },
-            "websocket": {
-                "transport": "websocket",
-                "samples": ws_samples,
-                "summary": ws_summary,
-            },
+            "http": _transport_result(
+                context=benchmark_context,
+                client_transport="http_sse",
+                samples=http_samples,
+                summary=http_summary,
+            ),
+            "websocket": _transport_result(
+                context=benchmark_context,
+                client_transport="websocket",
+                samples=ws_samples,
+                summary=ws_summary,
+            ),
             "ratios": _transport_ratios(http_summary, ws_summary),
         }
 
@@ -1766,18 +1922,32 @@ class TestResponsesTransportCompare:
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
 @pytest.mark.model("qwen-0.5b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
-@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+@pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
 class TestResponsesContinuationChainCompare:
     """Long-chain continuation comparison for HTTP vs persistent WS."""
 
     def test_http_vs_ws_continuation_chain_compare(self, setup_backend):
-        _, model, client, gateway = setup_backend
+        backend_name, model, client, gateway = setup_backend
 
         turns = int(os.environ.get("SGLANG_HTTP_WS_CHAIN_TURNS", "20"))
         samples = int(os.environ.get("SGLANG_HTTP_WS_CHAIN_SAMPLES", "1"))
-        experiment_folder = os.environ.get(
-            "SGLANG_HTTP_WS_CHAIN_EXPERIMENT",
-            f"benchmark_http_ws_chain_compare_{model.replace('/', '_')}_{turns}turns",
+        experiment_folder = _scoped_experiment_folder(
+            os.environ.get(
+                "SGLANG_HTTP_WS_CHAIN_EXPERIMENT",
+                (
+                    "benchmark_http_ws_chain_compare_"
+                    f"{model.replace('/', '_')}_{turns}turns"
+                ),
+            ),
+            backend_name,
+        )
+        benchmark_context = _benchmark_context(
+            benchmark_family="continuation_qos",
+            run_class="http_vs_ws_continuation_compare",
+            backend_name=backend_name,
+            model=model,
+            store_mode="store_true",
+            workload_kind="incremental_text_continuation",
         )
 
         http_samples = [
@@ -1792,27 +1962,30 @@ class TestResponsesContinuationChainCompare:
             )
             for _ in range(samples)
         ]
+        http_summary = _summarize_chain_samples(http_samples)
+        ws_summary = _summarize_chain_samples(ws_samples)
 
         payload = {
+            "benchmark_context": benchmark_context,
+            "worker_backend": backend_name,
             "router_url": gateway.base_url,
             "model": model,
             "turns": turns,
             "samples": samples,
             "experiment_folder": experiment_folder,
-            "http": {
-                "transport": "http",
-                "samples": http_samples,
-                "summary": _summarize_chain_samples(http_samples),
-            },
-            "websocket": {
-                "transport": "websocket",
-                "samples": ws_samples,
-                "summary": _summarize_chain_samples(ws_samples),
-            },
-            "ratios": _chain_transport_ratios(
-                _summarize_chain_samples(http_samples),
-                _summarize_chain_samples(ws_samples),
+            "http": _transport_result(
+                context=benchmark_context,
+                client_transport="http_sse",
+                samples=http_samples,
+                summary=http_summary,
             ),
+            "websocket": _transport_result(
+                context=benchmark_context,
+                client_transport="websocket",
+                samples=ws_samples,
+                summary=ws_summary,
+            ),
+            "ratios": _chain_transport_ratios(http_summary, ws_summary),
         }
 
         summary_path = _write_summary(experiment_folder, payload)
@@ -1829,21 +2002,32 @@ class TestResponsesContinuationChainCompare:
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
 @pytest.mark.model("qwen-0.5b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
-@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+@pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
 class TestResponsesToolOutputChainCompare:
     """Tool-output-heavy continuation comparison for HTTP vs persistent WS."""
 
     def test_http_vs_ws_tool_output_chain_compare(self, setup_backend):
-        _, model, client, gateway = setup_backend
+        backend_name, model, client, gateway = setup_backend
 
         tool_turns = int(os.environ.get("SGLANG_HTTP_WS_TOOL_CHAIN_TURNS", "20"))
         samples = int(os.environ.get("SGLANG_HTTP_WS_TOOL_CHAIN_SAMPLES", "1"))
-        experiment_folder = os.environ.get(
-            "SGLANG_HTTP_WS_TOOL_CHAIN_EXPERIMENT",
-            (
-                "benchmark_http_ws_tool_chain_compare_"
-                f"{model.replace('/', '_')}_{tool_turns}toolturns"
+        experiment_folder = _scoped_experiment_folder(
+            os.environ.get(
+                "SGLANG_HTTP_WS_TOOL_CHAIN_EXPERIMENT",
+                (
+                    "benchmark_http_ws_tool_chain_compare_"
+                    f"{model.replace('/', '_')}_{tool_turns}toolturns"
+                ),
             ),
+            backend_name,
+        )
+        benchmark_context = _benchmark_context(
+            benchmark_family="continuation_qos",
+            run_class="http_vs_ws_tool_output_compare",
+            backend_name=backend_name,
+            model=model,
+            store_mode="store_true",
+            workload_kind="incremental_tool_output_continuation",
         )
 
         http_samples = [
@@ -1858,27 +2042,30 @@ class TestResponsesToolOutputChainCompare:
             )
             for _ in range(samples)
         ]
+        http_summary = _summarize_chain_samples(http_samples)
+        ws_summary = _summarize_chain_samples(ws_samples)
 
         payload = {
+            "benchmark_context": benchmark_context,
+            "worker_backend": backend_name,
             "router_url": gateway.base_url,
             "model": model,
             "tool_turns": tool_turns,
             "samples": samples,
             "experiment_folder": experiment_folder,
-            "http": {
-                "transport": "http",
-                "samples": http_samples,
-                "summary": _summarize_chain_samples(http_samples),
-            },
-            "websocket": {
-                "transport": "websocket",
-                "samples": ws_samples,
-                "summary": _summarize_chain_samples(ws_samples),
-            },
-            "ratios": _chain_transport_ratios(
-                _summarize_chain_samples(http_samples),
-                _summarize_chain_samples(ws_samples),
+            "http": _transport_result(
+                context=benchmark_context,
+                client_transport="http_sse",
+                samples=http_samples,
+                summary=http_summary,
             ),
+            "websocket": _transport_result(
+                context=benchmark_context,
+                client_transport="websocket",
+                samples=ws_samples,
+                summary=ws_summary,
+            ),
+            "ratios": _chain_transport_ratios(http_summary, ws_summary),
         }
 
         summary_path = _write_summary(experiment_folder, payload)
@@ -1898,12 +2085,12 @@ class TestResponsesToolOutputChainCompare:
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
 @pytest.mark.model("qwen-3b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
-@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+@pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
 class TestResponsesModelGeneratedToolChainCompare:
     """Model-generated tool-call comparison for HTTP vs persistent WS."""
 
     def test_http_vs_ws_model_generated_tool_chain_compare(self, setup_backend):
-        _, model, client, gateway = setup_backend
+        backend_name, model, client, gateway = setup_backend
 
         turn_profiles = [
             int(value)
@@ -1913,9 +2100,20 @@ class TestResponsesModelGeneratedToolChainCompare:
             if value.strip()
         ]
         samples = int(os.environ.get("SGLANG_HTTP_WS_MODEL_TOOL_CHAIN_SAMPLES", "1"))
-        experiment_folder = os.environ.get(
-            "SGLANG_HTTP_WS_MODEL_TOOL_CHAIN_EXPERIMENT",
-            f"benchmark_http_ws_model_tool_chain_compare_{model.replace('/', '_')}",
+        experiment_folder = _scoped_experiment_folder(
+            os.environ.get(
+                "SGLANG_HTTP_WS_MODEL_TOOL_CHAIN_EXPERIMENT",
+                f"benchmark_http_ws_model_tool_chain_compare_{model.replace('/', '_')}",
+            ),
+            backend_name,
+        )
+        benchmark_context = _benchmark_context(
+            benchmark_family="tool_loop_transport_qos",
+            run_class="http_vs_ws_model_tool_compare",
+            backend_name=backend_name,
+            model=model,
+            store_mode="store_true",
+            workload_kind="model_generated_tool_loop_required",
         )
 
         profile_results = []
@@ -1932,28 +2130,31 @@ class TestResponsesModelGeneratedToolChainCompare:
                 )
                 for _ in range(samples)
             ]
+            http_summary = _summarize_chain_samples(http_samples)
+            ws_summary = _summarize_chain_samples(ws_samples)
 
             profile_results.append(
                 {
                     "turns": turns,
-                    "http": {
-                        "transport": "http",
-                        "samples": http_samples,
-                        "summary": _summarize_chain_samples(http_samples),
-                    },
-                    "websocket": {
-                        "transport": "websocket",
-                        "samples": ws_samples,
-                        "summary": _summarize_chain_samples(ws_samples),
-                    },
-                    "ratios": _chain_transport_ratios(
-                        _summarize_chain_samples(http_samples),
-                        _summarize_chain_samples(ws_samples),
+                    "http": _transport_result(
+                        context=benchmark_context,
+                        client_transport="http_sse",
+                        samples=http_samples,
+                        summary=http_summary,
                     ),
+                    "websocket": _transport_result(
+                        context=benchmark_context,
+                        client_transport="websocket",
+                        samples=ws_samples,
+                        summary=ws_summary,
+                    ),
+                    "ratios": _chain_transport_ratios(http_summary, ws_summary),
                 }
             )
 
         payload = {
+            "benchmark_context": benchmark_context,
+            "worker_backend": backend_name,
             "router_url": gateway.base_url,
             "model": model,
             "turn_profiles": turn_profiles,
@@ -1980,12 +2181,12 @@ class TestResponsesModelGeneratedToolChainCompare:
 @pytest.mark.thread_unsafe(reason="Diagnostics are only meaningful sequentially.")
 @pytest.mark.model("qwen-3b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
-@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+@pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
 class TestResponsesModelGeneratedToolChainDiagnostic:
     """Turn-level diagnostic harness for long-chain local tool-loop failures."""
 
     def test_http_vs_ws_model_generated_tool_chain_diagnostic(self, setup_backend):
-        _, model, _, gateway = setup_backend
+        backend_name, model, _, gateway = setup_backend
 
         turns = int(
             os.environ.get("SGLANG_HTTP_WS_MODEL_TOOL_CHAIN_DIAGNOSTIC_TURNS", "20")
@@ -1993,12 +2194,23 @@ class TestResponsesModelGeneratedToolChainDiagnostic:
         timeout_secs = float(
             os.environ.get("SGLANG_HTTP_WS_MODEL_TOOL_CHAIN_DIAGNOSTIC_TIMEOUT_SECS", "45")
         )
-        experiment_folder = os.environ.get(
-            "SGLANG_HTTP_WS_MODEL_TOOL_CHAIN_DIAGNOSTIC_EXPERIMENT",
-            (
-                "benchmark_http_ws_model_tool_chain_diagnostic_"
-                f"{model.replace('/', '_')}_{turns}turns"
+        experiment_folder = _scoped_experiment_folder(
+            os.environ.get(
+                "SGLANG_HTTP_WS_MODEL_TOOL_CHAIN_DIAGNOSTIC_EXPERIMENT",
+                (
+                    "benchmark_http_ws_model_tool_chain_diagnostic_"
+                    f"{model.replace('/', '_')}_{turns}turns"
+                ),
             ),
+            backend_name,
+        )
+        benchmark_context = _benchmark_context(
+            benchmark_family="tool_loop_transport_qos",
+            run_class="http_vs_ws_model_tool_diagnostic",
+            backend_name=backend_name,
+            model=model,
+            store_mode="store_true",
+            workload_kind="model_generated_tool_loop_required_diagnostic",
         )
 
         http_result = _run_http_model_generated_tool_chain_diagnostic(
@@ -2011,11 +2223,21 @@ class TestResponsesModelGeneratedToolChainDiagnostic:
         )
 
         payload = {
+            "benchmark_context": benchmark_context,
+            "worker_backend": backend_name,
             "router_url": gateway.base_url,
             "model": model,
             "turns": turns,
             "timeout_secs": timeout_secs,
             "experiment_folder": experiment_folder,
+            "http_contract": _benchmark_contract(
+                client_transport="http_json",
+                **benchmark_context,
+            ),
+            "websocket_contract": _benchmark_contract(
+                client_transport="websocket",
+                **benchmark_context,
+            ),
             "http": http_result,
             "websocket": ws_result,
         }
@@ -2036,18 +2258,29 @@ class TestResponsesModelGeneratedToolChainDiagnostic:
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
 @pytest.mark.model("qwen-3b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
-@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+@pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
 class TestResponsesBfclSubsetCompare:
     """BFCL-derived multi-turn filesystem workload for HTTP vs persistent WS."""
 
     def test_http_vs_ws_bfcl_subset_compare(self, setup_backend):
-        _, model, client, gateway = setup_backend
+        backend_name, model, client, gateway = setup_backend
 
         scenarios = _selected_bfcl_subset_scenarios()
         samples = int(os.environ.get("SGLANG_HTTP_WS_BFCL_SUBSET_SAMPLES", "1"))
-        experiment_folder = os.environ.get(
-            "SGLANG_HTTP_WS_BFCL_SUBSET_EXPERIMENT",
-            f"benchmark_http_ws_bfcl_subset_compare_{model.replace('/', '_')}",
+        experiment_folder = _scoped_experiment_folder(
+            os.environ.get(
+                "SGLANG_HTTP_WS_BFCL_SUBSET_EXPERIMENT",
+                f"benchmark_http_ws_bfcl_subset_compare_{model.replace('/', '_')}",
+            ),
+            backend_name,
+        )
+        benchmark_context = _benchmark_context(
+            benchmark_family="tool_loop_transport_qos",
+            run_class="http_vs_ws_bfcl_subset_compare",
+            backend_name=backend_name,
+            model=model,
+            store_mode="store_true",
+            workload_kind="bfcl_multi_turn_forced_tool",
         )
 
         http_samples = [
@@ -2066,6 +2299,8 @@ class TestResponsesBfclSubsetCompare:
         http_summary = _summarize_bfcl_suite_samples(http_samples)
         ws_summary = _summarize_bfcl_suite_samples(ws_samples)
         payload = {
+            "benchmark_context": benchmark_context,
+            "worker_backend": backend_name,
             "router_url": gateway.base_url,
             "model": model,
             "samples": samples,
@@ -2080,16 +2315,18 @@ class TestResponsesBfclSubsetCompare:
                 }
                 for scenario in scenarios
             ],
-            "http": {
-                "transport": "http",
-                "samples": http_samples,
-                "summary": http_summary,
-            },
-            "websocket": {
-                "transport": "websocket",
-                "samples": ws_samples,
-                "summary": ws_summary,
-            },
+            "http": _transport_result(
+                context=benchmark_context,
+                client_transport="http_sse",
+                samples=http_samples,
+                summary=http_summary,
+            ),
+            "websocket": _transport_result(
+                context=benchmark_context,
+                client_transport="websocket",
+                samples=ws_samples,
+                summary=ws_summary,
+            ),
             "ratios": _bfcl_transport_ratios(http_summary, ws_summary),
         }
 
