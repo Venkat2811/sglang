@@ -81,6 +81,20 @@ MODEL_SPECS: dict[str, dict] = {
         "tp": 1,
         "features": ["chat", "streaming", "function_calling", "pythonic_tools"],
     },
+    # Two-GPU launch profile for the current RTX PRO Blackwell host.
+    "qwen-72b-tp2": {
+        "model": _resolve_model_path("Qwen/Qwen2.5-72B-Instruct"),
+        "memory_gb": 160,
+        "tp": 2,
+        "features": ["chat", "streaming", "function_calling", "pythonic_tools"],
+    },
+    # Cheap local chat benchmark target available on the current RTX PRO host.
+    "deepseek-lite": {
+        "model": _resolve_model_path("deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"),
+        "memory_gb": 40,
+        "tp": 1,
+        "features": ["chat", "streaming"],
+    },
     # Reasoning model
     "deepseek-7b": {
         "model": _resolve_model_path("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"),

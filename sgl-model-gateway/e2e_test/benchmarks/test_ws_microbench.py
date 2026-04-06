@@ -388,6 +388,67 @@ def _http_post_json(
     return status_code, json.loads(body)
 
 
+def _http_stream_events(base_url: str, path: str, payload: dict, timeout_secs: float):
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url}{path}",
+        data=data,
+        headers={
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        response = urllib.request.urlopen(request, timeout=timeout_secs)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise AssertionError(
+            f"HTTP SSE benchmark request failed status={exc.code} body={body}"
+        ) from exc
+
+    with response:
+        event_lines: list[str] = []
+
+        def parse_event(lines: list[str]) -> dict | None:
+            data_lines = [
+                line.removeprefix("data:").lstrip()
+                for line in lines
+                if line.startswith("data:")
+            ]
+            if not data_lines:
+                return None
+            payload_text = "\n".join(data_lines)
+            if payload_text == "[DONE]":
+                return None
+            return json.loads(payload_text)
+
+        while True:
+            raw_line = response.readline()
+            if not raw_line:
+                if event_lines:
+                    event = parse_event(event_lines)
+                    if event is not None:
+                        yield event
+                break
+
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                if not event_lines:
+                    continue
+                event = parse_event(event_lines)
+                event_lines = []
+                if event is not None:
+                    yield event
+                continue
+
+            if line.startswith(":"):
+                continue
+
+            event_lines.append(line)
+
+
 def _summarize_samples(samples: list[dict[str, float | int]]) -> dict[str, float | int]:
     def values(key: str) -> list[float]:
         return [float(sample[key]) for sample in samples]
@@ -479,6 +540,60 @@ def _summarize_bfcl_suite_samples(samples: list[dict]) -> dict[str, float | int]
     return summary
 
 
+def _summarize_bfcl_free_choice_samples(samples: list[dict]) -> dict[str, float | int]:
+    def values(key: str) -> list[float]:
+        return [float(sample[key]) for sample in samples]
+
+    def ratio(sample: dict, numerator_key: str, denominator_key: str) -> float:
+        denominator = float(sample[denominator_key])
+        if denominator <= 0:
+            return 0.0
+        return float(sample[numerator_key]) / denominator
+
+    summary: dict[str, float | int] = {
+        "samples": len(samples),
+        "scenario_count": int(samples[0]["scenario_count"]),
+        "turns_requested": int(samples[0]["total_turns_requested"]),
+    }
+
+    for key in (
+        "matched_turns",
+        "total_turns_executed",
+        "missing_tool_turns",
+        "mismatched_tool_turns",
+        "completed_scenarios",
+        "terminated_scenarios",
+    ):
+        summary[f"{key}_mean"] = statistics.fmean(values(key))
+
+    for key in (
+        "total_suite_ms",
+        "total_tool_request_ms",
+        "total_tool_output_ms",
+    ):
+        summary[f"{key}_mean"] = statistics.fmean(values(key))
+        summary[f"{key}_p50"] = _percentile(values(key), 0.50)
+        summary[f"{key}_p95"] = _percentile(values(key), 0.95)
+
+    summary["matched_turn_rate_mean"] = statistics.fmean(
+        ratio(sample, "matched_turns", "total_turns_requested") for sample in samples
+    )
+    summary["turn_execution_rate_mean"] = statistics.fmean(
+        ratio(sample, "total_turns_executed", "total_turns_requested")
+        for sample in samples
+    )
+    summary["completed_scenario_rate_mean"] = statistics.fmean(
+        ratio(sample, "completed_scenarios", "scenario_count") for sample in samples
+    )
+
+    if "connect_ms_total" in samples[0]:
+        summary["connect_ms_total_mean"] = statistics.fmean(values("connect_ms_total"))
+        summary["connect_ms_total_p50"] = _percentile(values("connect_ms_total"), 0.50)
+        summary["connect_ms_total_p95"] = _percentile(values("connect_ms_total"), 0.95)
+
+    return summary
+
+
 async def _run_single_ws_sample(ws_url: str, model: str) -> dict[str, float | int]:
     import websockets
 
@@ -537,33 +652,48 @@ async def _run_single_ws_sample(ws_url: str, model: str) -> dict[str, float | in
     }
 
 
-def _run_single_http_sample(client, model: str) -> dict[str, float | int]:
+def _run_single_http_sample(
+    base_url: str, model: str, timeout_secs: float = 90
+) -> dict[str, float | int]:
     request_started_at = time.perf_counter()
-    response = client.responses.create(stream=True, **_benchmark_request_body(model))
 
     first_event_ms: float | None = None
     first_content_ms: float | None = None
     completed_ms: float | None = None
     output_tokens = 0
 
-    for event in response:
+    for event in _http_stream_events(
+        base_url,
+        "/v1/responses",
+        {
+            **_benchmark_request_body(model),
+            "stream": True,
+        },
+        timeout_secs,
+    ):
         now = time.perf_counter()
+        event_type = event.get("type")
 
         if first_event_ms is None:
             first_event_ms = (now - request_started_at) * 1000
 
         if (
             first_content_ms is None
-            and event.type == "response.output_text.delta"
-            and isinstance(getattr(event, "delta", None), str)
-            and event.delta
+            and event_type == "response.output_text.delta"
+            and isinstance(event.get("delta"), str)
+            and event["delta"]
         ):
             first_content_ms = (now - request_started_at) * 1000
 
-        if event.type == "response.completed":
+        if event_type in {"error", "response.failed", "response.incomplete"}:
+            raise AssertionError(
+                f"HTTP transport benchmark terminated with {event_type}: {event}"
+            )
+
+        if event_type == "response.completed":
             completed_ms = (now - request_started_at) * 1000
-            usage = getattr(getattr(event, "response", None), "usage", None)
-            output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+            usage = event.get("response", {}).get("usage", {})
+            output_tokens = int(usage.get("output_tokens", 0) or 0)
             if first_content_ms is None:
                 first_content_ms = completed_ms
             break
@@ -846,18 +976,21 @@ async def _run_ws_model_generated_tool_chain_sample(
     }
 
 
-def _collect_http_completed_ms(response_stream) -> tuple[object, float]:
+def _collect_http_completed_ms(
+    base_url: str, payload: dict, timeout_secs: float = 90
+) -> tuple[dict, float]:
     request_started_at = time.perf_counter()
     event_types: list[str] = []
 
-    for event in response_stream:
-        event_types.append(event.type)
-        if event.type in {"error", "response.failed", "response.incomplete"}:
+    for event in _http_stream_events(base_url, "/v1/responses", payload, timeout_secs):
+        event_type = str(event.get("type"))
+        event_types.append(event_type)
+        if event_type in {"error", "response.failed", "response.incomplete"}:
             raise AssertionError(
-                f"HTTP continuation benchmark terminated with {event.type}: {event_types}"
+                f"HTTP continuation benchmark terminated with {event_type}: {event_types}"
             )
-        if event.type == "response.completed":
-            return event.response, (time.perf_counter() - request_started_at) * 1000
+        if event_type == "response.completed":
+            return event["response"], (time.perf_counter() - request_started_at) * 1000
 
     raise AssertionError(
         "HTTP continuation benchmark ended without response.completed; "
@@ -866,35 +999,41 @@ def _collect_http_completed_ms(response_stream) -> tuple[object, float]:
 
 
 def _run_http_continuation_chain_sample(
-    client, model: str, turns: int
+    base_url: str, model: str, turns: int, timeout_secs: float = 90
 ) -> dict[str, float | int | list[float]]:
     per_turn_ms: list[float] = []
 
-    response_stream = client.responses.create(
-        model=model,
-        input=_chain_turn_input(1),
-        temperature=0,
-        max_output_tokens=16,
-        store=True,
-        stream=True,
+    response, completed_ms = _collect_http_completed_ms(
+        base_url,
+        {
+            "model": model,
+            "input": _chain_turn_input(1),
+            "temperature": 0,
+            "max_output_tokens": 16,
+            "store": True,
+            "stream": True,
+        },
+        timeout_secs,
     )
-    response, completed_ms = _collect_http_completed_ms(response_stream)
     per_turn_ms.append(completed_ms)
-    previous_response_id = response.id
+    previous_response_id = response["id"]
 
     for turn_index in range(2, turns + 1):
-        response_stream = client.responses.create(
-            model=model,
-            input=_chain_turn_input(turn_index),
-            previous_response_id=previous_response_id,
-            temperature=0,
-            max_output_tokens=16,
-            store=True,
-            stream=True,
+        response, completed_ms = _collect_http_completed_ms(
+            base_url,
+            {
+                "model": model,
+                "input": _chain_turn_input(turn_index),
+                "previous_response_id": previous_response_id,
+                "temperature": 0,
+                "max_output_tokens": 16,
+                "store": True,
+                "stream": True,
+            },
+            timeout_secs,
         )
-        response, completed_ms = _collect_http_completed_ms(response_stream)
         per_turn_ms.append(completed_ms)
-        previous_response_id = response.id
+        previous_response_id = response["id"]
 
     continuation_turns = per_turn_ms[1:]
     continuation_mean_ms = (
@@ -915,35 +1054,41 @@ def _run_http_continuation_chain_sample(
 
 
 def _run_http_tool_output_chain_sample(
-    client, model: str, tool_turns: int
+    base_url: str, model: str, tool_turns: int, timeout_secs: float = 90
 ) -> dict[str, float | int | list[float]]:
     per_turn_ms: list[float] = []
 
-    response_stream = client.responses.create(
-        model=model,
-        input="Seed the tool-output continuation chain. Reply with hello.",
-        temperature=0,
-        max_output_tokens=16,
-        store=True,
-        stream=True,
+    response, completed_ms = _collect_http_completed_ms(
+        base_url,
+        {
+            "model": model,
+            "input": "Seed the tool-output continuation chain. Reply with hello.",
+            "temperature": 0,
+            "max_output_tokens": 16,
+            "store": True,
+            "stream": True,
+        },
+        timeout_secs,
     )
-    response, completed_ms = _collect_http_completed_ms(response_stream)
     per_turn_ms.append(completed_ms)
-    previous_response_id = response.id
+    previous_response_id = response["id"]
 
     for turn_index in range(1, tool_turns + 1):
-        response_stream = client.responses.create(
-            model=model,
-            input=_tool_output_chain_turn_input(turn_index),
-            previous_response_id=previous_response_id,
-            temperature=0,
-            max_output_tokens=16,
-            store=True,
-            stream=True,
+        response, completed_ms = _collect_http_completed_ms(
+            base_url,
+            {
+                "model": model,
+                "input": _tool_output_chain_turn_input(turn_index),
+                "previous_response_id": previous_response_id,
+                "temperature": 0,
+                "max_output_tokens": 16,
+                "store": True,
+                "stream": True,
+            },
+            timeout_secs,
         )
-        response, completed_ms = _collect_http_completed_ms(response_stream)
         per_turn_ms.append(completed_ms)
-        previous_response_id = response.id
+        previous_response_id = response["id"]
 
     continuation_turns = per_turn_ms[1:]
     continuation_mean_ms = (
@@ -1500,6 +1645,29 @@ def _bfcl_transport_ratios(http_summary: dict, ws_summary: dict) -> dict[str, fl
     }
 
 
+def _bfcl_free_choice_transport_ratios(
+    http_summary: dict, ws_summary: dict
+) -> dict[str, float]:
+    ratios = _bfcl_transport_ratios(http_summary, ws_summary)
+    ratios.update(
+        {
+            "ws_minus_http_matched_turn_rate": float(
+                ws_summary["matched_turn_rate_mean"]
+            )
+            - float(http_summary["matched_turn_rate_mean"]),
+            "ws_minus_http_turn_execution_rate": float(
+                ws_summary["turn_execution_rate_mean"]
+            )
+            - float(http_summary["turn_execution_rate_mean"]),
+            "ws_minus_http_completed_scenario_rate": float(
+                ws_summary["completed_scenario_rate_mean"]
+            )
+            - float(http_summary["completed_scenario_rate_mean"]),
+        }
+    )
+    return ratios
+
+
 def _run_http_bfcl_subset_suite_sample(
     client, model: str, scenarios: list[BfclScenario]
 ) -> dict:
@@ -1734,6 +1902,393 @@ async def _run_ws_bfcl_subset_suite_sample(
     }
 
 
+def _run_http_bfcl_subset_free_choice_suite_sample(
+    client, model: str, scenarios: list[BfclScenario]
+) -> dict:
+    request_max_output_tokens = _model_tool_request_max_output_tokens()
+    result_max_output_tokens = _model_tool_result_max_output_tokens()
+    total_tool_request_ms = 0.0
+    total_tool_output_ms = 0.0
+    total_turns_requested = 0
+    total_turns_executed = 0
+    matched_turns = 0
+    missing_tool_turns = 0
+    mismatched_tool_turns = 0
+    completed_scenarios = 0
+    terminated_scenarios = 0
+    scenario_results = []
+
+    for scenario in scenarios:
+        with tempfile.TemporaryDirectory(prefix=f"{scenario.id}_") as temp_dir:
+            workspace_root = Path(temp_dir)
+            materialize_bfcl_scenario(workspace_root, scenario)
+            workspace = BfclWorkspace(workspace_root)
+            previous_response_id: str | None = None
+            scenario_records: list[dict[str, float | int | str | bool | None]] = []
+            scenario_completed = True
+            scenario_failure_reason: str | None = None
+
+            for turn_index, turn in enumerate(scenario.turns, start=1):
+                total_turns_requested += 1
+
+                try:
+                    first_stream = client.responses.create(
+                        model=model,
+                        input=turn.prompt,
+                        previous_response_id=previous_response_id,
+                        instructions=_bfcl_request_instructions_for_scenario(scenario),
+                        temperature=0,
+                        max_output_tokens=request_max_output_tokens,
+                        store=True,
+                        stream=True,
+                        tools=bfcl_subset_tools(),
+                        tool_choice="auto",
+                    )
+                    first_response, tool_request_ms = _collect_http_completed_ms(first_stream)
+                except Exception as exc:
+                    scenario_completed = False
+                    scenario_failure_reason = "tool_request_exception"
+                    scenario_records.append(
+                        {
+                            "turn_index": turn_index,
+                            "expected_tool": turn.expected_tool,
+                            "observed_tool": None,
+                            "matched_expected_tool": False,
+                            "tool_request_ms": 0.0,
+                            "tool_output_ms": None,
+                            "turn_total_ms": 0.0,
+                            "status": "tool_request_exception",
+                            "error": str(exc),
+                        }
+                    )
+                    break
+
+                total_tool_request_ms += tool_request_ms
+                function_calls = _response_function_calls(first_response.output)
+                observed_tool = function_calls[0].name if function_calls else None
+                matched_expected_tool = observed_tool == turn.expected_tool
+                record: dict[str, float | int | str | bool | None] = {
+                    "turn_index": turn_index,
+                    "expected_tool": turn.expected_tool,
+                    "observed_tool": observed_tool,
+                    "matched_expected_tool": matched_expected_tool,
+                    "tool_request_ms": tool_request_ms,
+                    "tool_output_ms": None,
+                    "turn_total_ms": tool_request_ms,
+                    "status": "tool_request_completed",
+                    "response_id": first_response.id,
+                    "output_types": ",".join(item.type for item in first_response.output),
+                }
+
+                if not function_calls:
+                    missing_tool_turns += 1
+                    scenario_completed = False
+                    scenario_failure_reason = "missing_function_call"
+                    record["status"] = "missing_function_call"
+                    scenario_records.append(record)
+                    break
+
+                if not matched_expected_tool:
+                    mismatched_tool_turns += 1
+                    scenario_completed = False
+                    scenario_failure_reason = "unexpected_tool"
+                    record["status"] = "unexpected_tool"
+                    scenario_records.append(record)
+                    break
+
+                matched_turns += 1
+
+                try:
+                    tool_output_items, _ = _bfcl_tool_output_from_http_function_call(
+                        workspace, function_calls[0]
+                    )
+                    second_stream = client.responses.create(
+                        model=model,
+                        input=tool_output_items,
+                        previous_response_id=first_response.id,
+                        instructions=_bfcl_tool_result_instructions(),
+                        temperature=0,
+                        max_output_tokens=result_max_output_tokens,
+                        store=True,
+                        stream=True,
+                        tools=bfcl_subset_tools(),
+                        tool_choice="auto",
+                    )
+                    second_response, tool_output_ms = _collect_http_completed_ms(second_stream)
+                except Exception as exc:
+                    scenario_completed = False
+                    scenario_failure_reason = "tool_output_exception"
+                    record["status"] = "tool_output_exception"
+                    record["error"] = str(exc)
+                    scenario_records.append(record)
+                    break
+
+                total_tool_output_ms += tool_output_ms
+                total_turns_executed += 1
+                record["tool_output_ms"] = tool_output_ms
+                record["turn_total_ms"] = tool_request_ms + tool_output_ms
+                record["status"] = "matched_completed"
+                previous_response_id = second_response.id
+                scenario_records.append(record)
+
+            if scenario_completed and len(scenario_records) == len(scenario.turns):
+                completed_scenarios += 1
+            else:
+                terminated_scenarios += 1
+
+            scenario_results.append(
+                {
+                    "scenario_id": scenario.id,
+                    "source_dataset": scenario.source_dataset,
+                    "source_id": scenario.source_id,
+                    "turns_requested": len(scenario.turns),
+                    "turns_executed": sum(
+                        1
+                        for record in scenario_records
+                        if record.get("status") == "matched_completed"
+                    ),
+                    "matched_turns": sum(
+                        1
+                        for record in scenario_records
+                        if bool(record.get("matched_expected_tool"))
+                    ),
+                    "completed": scenario_completed
+                    and len(scenario_records) == len(scenario.turns),
+                    "failure_reason": scenario_failure_reason,
+                    "turn_records": scenario_records,
+                    "final_files": workspace.list_files(),
+                }
+            )
+
+    return {
+        "scenario_count": len(scenarios),
+        "scenario_results": scenario_results,
+        "total_turns_requested": total_turns_requested,
+        "total_turns_executed": total_turns_executed,
+        "matched_turns": matched_turns,
+        "missing_tool_turns": missing_tool_turns,
+        "mismatched_tool_turns": mismatched_tool_turns,
+        "completed_scenarios": completed_scenarios,
+        "terminated_scenarios": terminated_scenarios,
+        "total_suite_ms": total_tool_request_ms + total_tool_output_ms,
+        "total_tool_request_ms": total_tool_request_ms,
+        "total_tool_output_ms": total_tool_output_ms,
+    }
+
+
+async def _run_ws_bfcl_subset_free_choice_suite_sample(
+    ws_url: str, model: str, scenarios: list[BfclScenario]
+) -> dict:
+    import websockets
+
+    request_max_output_tokens = _model_tool_request_max_output_tokens()
+    result_max_output_tokens = _model_tool_result_max_output_tokens()
+    total_tool_request_ms = 0.0
+    total_tool_output_ms = 0.0
+    total_turns_requested = 0
+    total_turns_executed = 0
+    matched_turns = 0
+    missing_tool_turns = 0
+    mismatched_tool_turns = 0
+    completed_scenarios = 0
+    terminated_scenarios = 0
+    connect_ms_total = 0.0
+    scenario_results = []
+
+    for scenario in scenarios:
+        with tempfile.TemporaryDirectory(prefix=f"{scenario.id}_") as temp_dir:
+            workspace_root = Path(temp_dir)
+            materialize_bfcl_scenario(workspace_root, scenario)
+            workspace = BfclWorkspace(workspace_root)
+            scenario_records: list[dict[str, float | int | str | bool | None]] = []
+            scenario_completed = True
+            scenario_failure_reason: str | None = None
+
+            connect_started_at = time.perf_counter()
+            async with websockets.connect(
+                ws_url, open_timeout=30, close_timeout=5
+            ) as websocket:
+                connect_ms_total += (time.perf_counter() - connect_started_at) * 1000
+                previous_response_id: str | None = None
+
+                for turn_index, turn in enumerate(scenario.turns, start=1):
+                    total_turns_requested += 1
+
+                    try:
+                        first_completed, tool_request_ms = await _collect_ws_terminal_event(
+                            websocket,
+                            _ws_request(
+                                model=model,
+                                input=turn.prompt,
+                                instructions=_bfcl_request_instructions_for_scenario(
+                                    scenario
+                                ),
+                                temperature=0,
+                                max_output_tokens=request_max_output_tokens,
+                                store=True,
+                                tools=bfcl_subset_tools(),
+                                tool_choice="auto",
+                                previous_response_id=previous_response_id,
+                            ),
+                        )
+                    except Exception as exc:
+                        scenario_completed = False
+                        scenario_failure_reason = "tool_request_exception"
+                        scenario_records.append(
+                            {
+                                "turn_index": turn_index,
+                                "expected_tool": turn.expected_tool,
+                                "observed_tool": None,
+                                "matched_expected_tool": False,
+                                "tool_request_ms": 0.0,
+                                "tool_output_ms": None,
+                                "turn_total_ms": 0.0,
+                                "status": "tool_request_exception",
+                                "error": str(exc),
+                            }
+                        )
+                        break
+
+                    total_tool_request_ms += tool_request_ms
+                    function_calls = _completed_response_function_calls(first_completed)
+                    observed_tool = function_calls[0]["name"] if function_calls else None
+                    matched_expected_tool = observed_tool == turn.expected_tool
+                    record: dict[str, float | int | str | bool | None] = {
+                        "turn_index": turn_index,
+                        "expected_tool": turn.expected_tool,
+                        "observed_tool": observed_tool,
+                        "matched_expected_tool": matched_expected_tool,
+                        "tool_request_ms": tool_request_ms,
+                        "tool_output_ms": None,
+                        "turn_total_ms": tool_request_ms,
+                        "status": "tool_request_completed",
+                        "response_id": first_completed.get("response", {}).get("id"),
+                    }
+
+                    if not function_calls:
+                        missing_tool_turns += 1
+                        scenario_completed = False
+                        scenario_failure_reason = "missing_function_call"
+                        record["status"] = "missing_function_call"
+                        scenario_records.append(record)
+                        break
+
+                    if not matched_expected_tool:
+                        mismatched_tool_turns += 1
+                        scenario_completed = False
+                        scenario_failure_reason = "unexpected_tool"
+                        record["status"] = "unexpected_tool"
+                        scenario_records.append(record)
+                        break
+
+                    matched_turns += 1
+
+                    try:
+                        tool_output_items, _ = _bfcl_tool_output_from_ws_function_call(
+                            workspace, function_calls[0]
+                        )
+                        second_completed, tool_output_ms = await _collect_ws_terminal_event(
+                            websocket,
+                            _ws_request(
+                                model=model,
+                                input=tool_output_items,
+                                instructions=_bfcl_tool_result_instructions(),
+                                temperature=0,
+                                max_output_tokens=result_max_output_tokens,
+                                store=True,
+                                tools=bfcl_subset_tools(),
+                                tool_choice="auto",
+                                previous_response_id=first_completed["response"]["id"],
+                            ),
+                        )
+                    except Exception as exc:
+                        scenario_completed = False
+                        scenario_failure_reason = "tool_output_exception"
+                        record["status"] = "tool_output_exception"
+                        record["error"] = str(exc)
+                        scenario_records.append(record)
+                        break
+
+                    total_tool_output_ms += tool_output_ms
+                    total_turns_executed += 1
+                    record["tool_output_ms"] = tool_output_ms
+                    record["turn_total_ms"] = tool_request_ms + tool_output_ms
+                    record["status"] = "matched_completed"
+                    previous_response_id = second_completed["response"]["id"]
+                    scenario_records.append(record)
+
+            if scenario_completed and len(scenario_records) == len(scenario.turns):
+                completed_scenarios += 1
+            else:
+                terminated_scenarios += 1
+
+            scenario_results.append(
+                {
+                    "scenario_id": scenario.id,
+                    "source_dataset": scenario.source_dataset,
+                    "source_id": scenario.source_id,
+                    "turns_requested": len(scenario.turns),
+                    "turns_executed": sum(
+                        1
+                        for record in scenario_records
+                        if record.get("status") == "matched_completed"
+                    ),
+                    "matched_turns": sum(
+                        1
+                        for record in scenario_records
+                        if bool(record.get("matched_expected_tool"))
+                    ),
+                    "completed": scenario_completed
+                    and len(scenario_records) == len(scenario.turns),
+                    "failure_reason": scenario_failure_reason,
+                    "turn_records": scenario_records,
+                    "final_files": workspace.list_files(),
+                }
+            )
+
+    return {
+        "scenario_count": len(scenarios),
+        "scenario_results": scenario_results,
+        "total_turns_requested": total_turns_requested,
+        "total_turns_executed": total_turns_executed,
+        "matched_turns": matched_turns,
+        "missing_tool_turns": missing_tool_turns,
+        "mismatched_tool_turns": mismatched_tool_turns,
+        "completed_scenarios": completed_scenarios,
+        "terminated_scenarios": terminated_scenarios,
+        "connect_ms_total": connect_ms_total,
+        "total_suite_ms": total_tool_request_ms + total_tool_output_ms,
+        "total_tool_request_ms": total_tool_request_ms,
+        "total_tool_output_ms": total_tool_output_ms,
+    }
+
+
+def test_bfcl_free_choice_transport_ratios_track_quality_deltas():
+    ratios = _bfcl_free_choice_transport_ratios(
+        {
+            "total_suite_ms_p50": 100.0,
+            "total_tool_request_ms_p50": 60.0,
+            "total_tool_output_ms_p50": 40.0,
+            "matched_turn_rate_mean": 0.50,
+            "turn_execution_rate_mean": 0.60,
+            "completed_scenario_rate_mean": 0.40,
+        },
+        {
+            "total_suite_ms_p50": 90.0,
+            "total_tool_request_ms_p50": 50.0,
+            "total_tool_output_ms_p50": 40.0,
+            "matched_turn_rate_mean": 0.75,
+            "turn_execution_rate_mean": 0.80,
+            "completed_scenario_rate_mean": 0.55,
+        },
+    )
+
+    assert ratios["ws_over_http_total_suite"] == pytest.approx(0.9)
+    assert ratios["ws_minus_http_matched_turn_rate"] == pytest.approx(0.25)
+    assert ratios["ws_minus_http_turn_execution_rate"] == pytest.approx(0.20)
+    assert ratios["ws_minus_http_completed_scenario_rate"] == pytest.approx(0.15)
+
+
 @pytest.mark.parametrize(
     ("backend_name", "expected_worker_transport", "expected_router_topology"),
     [
@@ -1876,7 +2431,13 @@ class TestResponsesTransportCompare:
             workload_kind="single_turn_text",
         )
 
-        http_samples = [_run_single_http_sample(client, model) for _ in range(samples)]
+        timeout_secs = float(
+            os.environ.get("SGLANG_HTTP_WS_COMPARE_TIMEOUT_SECS", "90")
+        )
+        http_samples = [
+            _run_single_http_sample(gateway.base_url, model, timeout_secs)
+            for _ in range(samples)
+        ]
         ws_samples = asyncio.run(
             _run_ws_sample_batch(_gateway_ws_url(gateway.base_url), model, samples)
         )
@@ -1950,8 +2511,13 @@ class TestResponsesContinuationChainCompare:
             workload_kind="incremental_text_continuation",
         )
 
+        timeout_secs = float(
+            os.environ.get("SGLANG_HTTP_WS_CHAIN_TIMEOUT_SECS", "90")
+        )
         http_samples = [
-            _run_http_continuation_chain_sample(client, model, turns)
+            _run_http_continuation_chain_sample(
+                gateway.base_url, model, turns, timeout_secs
+            )
             for _ in range(samples)
         ]
         ws_samples = [
@@ -2030,8 +2596,13 @@ class TestResponsesToolOutputChainCompare:
             workload_kind="incremental_tool_output_continuation",
         )
 
+        timeout_secs = float(
+            os.environ.get("SGLANG_HTTP_WS_TOOL_CHAIN_TIMEOUT_SECS", "90")
+        )
         http_samples = [
-            _run_http_tool_output_chain_sample(client, model, tool_turns)
+            _run_http_tool_output_chain_sample(
+                gateway.base_url, model, tool_turns, timeout_secs
+            )
             for _ in range(samples)
         ]
         ws_samples = [

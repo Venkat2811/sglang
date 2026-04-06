@@ -6,6 +6,8 @@ import json
 import statistics
 import sys
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +30,7 @@ class ChainRuntimeConfig:
     client_transport: str
     chain_mode: str
     store: bool
+    request_timeout_secs: float
 
 
 def _normalize_base_url(base_url: str) -> str:
@@ -107,15 +110,17 @@ def _prepare_turn_input(
 
 
 def _response_output_text_from_http_response(response: Any) -> str:
-    output_text = getattr(response, "output_text", None)
+    output_text = response.get("output_text")
     if isinstance(output_text, str) and output_text.strip():
         return output_text
 
-    for item in getattr(response, "output", []):
-        if getattr(item, "type", None) != "message":
+    for item in response.get("output", []):
+        if not isinstance(item, dict) or item.get("type") != "message":
             continue
-        for content_part in getattr(item, "content", []):
-            text = getattr(content_part, "text", None)
+        for content_part in item.get("content", []):
+            if not isinstance(content_part, dict):
+                continue
+            text = content_part.get("text")
             if isinstance(text, str) and text.strip():
                 return text
     return ""
@@ -134,37 +139,107 @@ def _response_output_text_from_ws_response(response: dict[str, Any]) -> str:
     return ""
 
 
-def _collect_http_response(
-    client: Any,
+def _http_stream_events(
+    base_url: str,
     request: dict[str, Any],
-) -> tuple[Any, dict[str, float]]:
-    response_stream = client.responses.create(stream=True, **request)
+    timeout_secs: float,
+):
+    payload = {**request, "stream": True}
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{_normalize_base_url(base_url)}/v1/responses",
+        data=data,
+        headers={
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        response = urllib.request.urlopen(req, timeout=timeout_secs)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"HTTP response chain request failed status={exc.code} body={body}"
+        ) from exc
+
+    with response:
+        event_lines: list[str] = []
+
+        def parse_event(lines: list[str]) -> dict[str, Any] | None:
+            data_lines = [
+                line.removeprefix("data:").lstrip()
+                for line in lines
+                if line.startswith("data:")
+            ]
+            if not data_lines:
+                return None
+            payload_text = "\n".join(data_lines)
+            if payload_text == "[DONE]":
+                return None
+            return json.loads(payload_text)
+
+        while True:
+            raw_line = response.readline()
+            if not raw_line:
+                if event_lines:
+                    event = parse_event(event_lines)
+                    if event is not None:
+                        yield event
+                break
+
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                if not event_lines:
+                    continue
+                event = parse_event(event_lines)
+                event_lines = []
+                if event is not None:
+                    yield event
+                continue
+
+            if line.startswith(":"):
+                continue
+
+            event_lines.append(line)
+
+
+def _collect_http_response(
+    config: ChainRuntimeConfig,
+    request: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, float]]:
     request_started_at = time.perf_counter()
 
     first_event_ms: float | None = None
     first_content_ms: float | None = None
 
-    for event in response_stream:
+    for event in _http_stream_events(
+        config.base_url,
+        request,
+        config.request_timeout_secs,
+    ):
         now = time.perf_counter()
+        event_type = event.get("type")
         if first_event_ms is None:
             first_event_ms = (now - request_started_at) * 1000
 
         if (
             first_content_ms is None
-            and event.type == "response.output_text.delta"
-            and isinstance(getattr(event, "delta", None), str)
-            and event.delta
+            and event_type == "response.output_text.delta"
+            and isinstance(event.get("delta"), str)
+            and event["delta"]
         ):
             first_content_ms = (now - request_started_at) * 1000
 
-        if event.type in {"error", "response.failed", "response.incomplete"}:
-            raise RuntimeError(f"HTTP response chain failed with event={event.type}")
+        if event_type in {"error", "response.failed", "response.incomplete"}:
+            raise RuntimeError(f"HTTP response chain failed with event={event_type}")
 
-        if event.type == "response.completed":
+        if event_type == "response.completed":
             completed_ms = (now - request_started_at) * 1000
             if first_content_ms is None:
                 first_content_ms = completed_ms
-            return event.response, {
+            return event["response"], {
                 "request_to_first_event_ms": first_event_ms or 0.0,
                 "request_to_first_content_ms": first_content_ms or 0.0,
                 "request_to_completed_ms": completed_ms,
@@ -176,6 +251,7 @@ def _collect_http_response(
 async def _collect_ws_response(
     websocket: Any,
     request: dict[str, Any],
+    timeout_secs: float,
 ) -> tuple[dict[str, Any], dict[str, float]]:
     await websocket.send(json.dumps({"type": "response.create", **request}))
     request_started_at = time.perf_counter()
@@ -184,7 +260,7 @@ async def _collect_ws_response(
     first_content_ms: float | None = None
 
     while True:
-        payload = await asyncio.wait_for(websocket.recv(), timeout=180)
+        payload = await asyncio.wait_for(websocket.recv(), timeout=timeout_secs)
         event = json.loads(payload)
         now = time.perf_counter()
 
@@ -226,16 +302,10 @@ def _run_http_chain(
     config: ChainRuntimeConfig,
     qas: list[dict[str, int | str]],
 ) -> dict[str, Any]:
-    import openai
-
-    client = openai.OpenAI(
-        base_url=f"{_normalize_base_url(config.base_url)}/v1",
-        api_key=config.api_key,
-    )
-
     conversation: list[dict[str, Any]] = []
     previous_response_id: str | None = None
     per_turn: list[dict[str, Any]] = []
+    total_request_payload_bytes = 0
     chain_started_at = time.perf_counter()
 
     for turn_index, qa in enumerate(qas, start=1):
@@ -254,11 +324,13 @@ def _run_http_chain(
         if config.chain_mode == "previous_response_id" and previous_response_id is not None:
             request["previous_response_id"] = previous_response_id
 
-        response, metrics = _collect_http_response(client, request)
+        request_payload_bytes = len(json.dumps({**request, "stream": True}).encode("utf-8"))
+        response, metrics = _collect_http_response(config, request)
         assistant_text = _response_output_text_from_http_response(response)
         if config.chain_mode == "full_replay":
             _append_full_replay_turn(conversation, str(qa["prompt"]), assistant_text)
-        previous_response_id = getattr(response, "id", None)
+        previous_response_id = response.get("id")
+        total_request_payload_bytes += request_payload_bytes
 
         per_turn.append(
             {
@@ -266,6 +338,7 @@ def _run_http_chain(
                 "prompt_len": len(str(qa["prompt"])),
                 "max_output_tokens": int(qa["new_tokens"]),
                 "response_id": previous_response_id,
+                "request_payload_bytes": request_payload_bytes,
                 "output_text": assistant_text,
                 **metrics,
             }
@@ -274,6 +347,7 @@ def _run_http_chain(
     return {
         "turn_count": len(qas),
         "total_chain_ms": (time.perf_counter() - chain_started_at) * 1000,
+        "total_request_payload_bytes": total_request_payload_bytes,
         "per_turn": per_turn,
     }
 
@@ -287,6 +361,7 @@ async def _run_ws_chain_async(
     conversation: list[dict[str, Any]] = []
     previous_response_id: str | None = None
     per_turn: list[dict[str, Any]] = []
+    total_request_payload_bytes = 0
     chain_started_at = time.perf_counter()
 
     async with websockets.connect(
@@ -313,11 +388,19 @@ async def _run_ws_chain_async(
             ):
                 request["previous_response_id"] = previous_response_id
 
-            response, metrics = await _collect_ws_response(websocket, request)
+            request_payload_bytes = len(
+                json.dumps({"type": "response.create", **request}).encode("utf-8")
+            )
+            response, metrics = await _collect_ws_response(
+                websocket,
+                request,
+                config.request_timeout_secs,
+            )
             assistant_text = _response_output_text_from_ws_response(response)
             if config.chain_mode == "full_replay":
                 _append_full_replay_turn(conversation, str(qa["prompt"]), assistant_text)
             previous_response_id = response.get("id")
+            total_request_payload_bytes += request_payload_bytes
 
             per_turn.append(
                 {
@@ -325,6 +408,7 @@ async def _run_ws_chain_async(
                     "prompt_len": len(str(qa["prompt"])),
                     "max_output_tokens": int(qa["new_tokens"]),
                     "response_id": previous_response_id,
+                    "request_payload_bytes": request_payload_bytes,
                     "output_text": assistant_text,
                     **metrics,
                 }
@@ -333,6 +417,7 @@ async def _run_ws_chain_async(
     return {
         "turn_count": len(qas),
         "total_chain_ms": (time.perf_counter() - chain_started_at) * 1000,
+        "total_request_payload_bytes": total_request_payload_bytes,
         "per_turn": per_turn,
     }
 
@@ -367,6 +452,9 @@ def _summarize_transport(
         for result in chain_results
         for turn in result["per_turn"]
     ]
+    request_payload_totals = [
+        float(result["total_request_payload_bytes"]) for result in chain_results
+    ]
 
     return {
         "benchmark_contract": _benchmark_contract(args, client_transport),
@@ -383,6 +471,17 @@ def _summarize_transport(
             "turn_ms_p95": _percentile(turn_totals, 0.95),
             "first_event_ms_p50": _percentile(first_events, 0.50),
             "first_content_ms_p50": _percentile(first_content, 0.50),
+            "request_payload_bytes_total_mean": (
+                statistics.fmean(request_payload_totals)
+                if request_payload_totals
+                else 0.0
+            ),
+            "request_payload_bytes_total_p50": _percentile(
+                request_payload_totals, 0.50
+            ),
+            "request_payload_bytes_total_p95": _percentile(
+                request_payload_totals, 0.95
+            ),
         },
     }
 
@@ -400,6 +499,7 @@ def _run_transport(
         client_transport=client_transport,
         chain_mode=args.chain_mode,
         store=args.store_mode == "true",
+        request_timeout_secs=args.request_timeout_secs,
     )
 
     chain_runner = _run_http_chain if client_transport == "http_sse" else _run_ws_chain
@@ -429,10 +529,20 @@ def _transport_targets(client_transport: str) -> list[str]:
 
 
 def _build_workloads(args: argparse.Namespace) -> list[dict[str, Any]]:
-    from vllm.transformers_utils.tokenizer import get_tokenizer
-
     data_gen.random.seed(args.seed)
-    tokenizer = get_tokenizer(args.tokenizer, trust_remote_code=args.trust_remote_code)
+    try:
+        from vllm.transformers_utils.tokenizer import get_tokenizer
+
+        tokenizer = get_tokenizer(
+            args.tokenizer, trust_remote_code=args.trust_remote_code
+        )
+    except ModuleNotFoundError:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer,
+            trust_remote_code=args.trust_remote_code,
+        )
     return data_gen.gen_arguments(args, tokenizer)
 
 
@@ -522,6 +632,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-len-a", type=int, default=4)
     parser.add_argument("--max-len-a", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--request-timeout-secs", type=float, default=180)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--long", action="store_true")
     parser.add_argument(
