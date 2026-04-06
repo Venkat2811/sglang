@@ -10,7 +10,9 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
 
-use crate::protocols::responses::{ResponseInputOutputItem, ResponsesRequest, ResponsesResponse};
+use crate::protocols::responses::{
+    ResponseInputOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse,
+};
 
 const DEFAULT_WS_SESSION_LIFETIME: Duration = Duration::from_secs(60 * 60);
 
@@ -209,11 +211,8 @@ pub async fn serve_responses_ws_with_config(
             let message = session_lifetime_message(max_session_lifetime);
             send_client_error_json(
                 &outbound_tx,
-                &WsClientError::new(
-                    "websocket_connection_limit_reached",
-                    &message,
-                )
-                .with_type("invalid_request_error"),
+                &WsClientError::new("websocket_connection_limit_reached", &message)
+                    .with_type("invalid_request_error"),
                 None,
             );
             let _ = outbound_tx.send(Message::Close(Some(CloseFrame {
@@ -328,7 +327,9 @@ async fn handle_text_event(
 
                 match result {
                     Ok(cached_response) => {
-                        session_guard.cached_response = Some(cached_response);
+                        session_guard.cached_response = (cached_response.response.status
+                            != ResponseStatus::Failed)
+                            .then_some(cached_response);
                     }
                     Err(err) => {
                         let should_evict_cached_response = referenced_previous_response_id

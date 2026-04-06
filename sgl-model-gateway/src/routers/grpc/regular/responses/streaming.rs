@@ -526,6 +526,7 @@ impl StreamingResponseAccumulator {
                     // Update the tool call at this index
                     if let ResponseOutputItem::FunctionToolCall {
                         id,
+                        call_id,
                         name,
                         arguments,
                         ..
@@ -533,6 +534,7 @@ impl StreamingResponseAccumulator {
                     {
                         if let Some(delta_id) = &delta.id {
                             id.push_str(delta_id);
+                            call_id.push_str(delta_id);
                         }
                         if let Some(function) = &delta.function {
                             if let Some(delta_name) = &function.name {
@@ -1467,10 +1469,15 @@ mod tests {
             ],
         );
         assert_eq!(events[2]["item"]["type"], "function_call");
+        assert_eq!(events[2]["item"]["call_id"], "call_test");
         assert_eq!(events[3]["delta"], "{\"location\":\"Berlin\"}");
         assert_eq!(
             events.last().unwrap()["response"]["output"][0]["type"],
             "function_call"
+        );
+        assert_eq!(
+            events.last().unwrap()["response"]["output"][0]["call_id"],
+            "call_test"
         );
         assert_eq!(
             events.last().unwrap()["response"]["output"][0]["arguments"],
@@ -1482,6 +1489,7 @@ mod tests {
         assert_eq!(final_response.output.len(), 1);
         let serialized_output = serde_json::to_value(&final_response.output[0]).unwrap();
         assert_eq!(serialized_output["type"], "function_call");
+        assert_eq!(serialized_output["call_id"], "call_test");
         assert_eq!(serialized_output["arguments"], "{\"location\":\"Berlin\"}");
     }
 
@@ -1538,6 +1546,7 @@ mod tests {
         assert_eq!(final_response.output.len(), 1);
         let serialized_output = serde_json::to_value(&final_response.output[0]).unwrap();
         assert_eq!(serialized_output["type"], "function_call");
+        assert_eq!(serialized_output["call_id"], "call_test");
         assert_eq!(serialized_output["name"], "calculate");
         assert_eq!(
             serialized_output["arguments"],
