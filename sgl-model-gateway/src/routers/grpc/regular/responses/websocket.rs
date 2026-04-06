@@ -1,9 +1,10 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::{body::to_bytes, extract::ws::Message, http::HeaderMap};
 use serde_json::json;
 use tokio::sync::mpsc;
+use tracing::debug;
 
 use super::{
     common::{load_conversation_history_with_cache, normalize_request_input_items},
@@ -58,6 +59,7 @@ impl WsResponsesExecutor for GrpcWsResponsesExecutor {
         cached_response: Option<CachedWsResponse>,
         outbound_tx: mpsc::UnboundedSender<Message>,
     ) -> Result<CachedWsResponse, WsClientError> {
+        let request_started_at = Instant::now();
         request.normalize();
         // WebSocket Responses is inherently event-streamed, so force streaming
         // on the downstream chat pipeline regardless of the client payload.
@@ -88,6 +90,7 @@ impl WsResponsesExecutor for GrpcWsResponsesExecutor {
         }
 
         let ctx = self.responses_context.clone_for_request();
+        let had_cached_response = cached_response.is_some();
         let modified_request = match load_conversation_history_with_cache(
             &ctx,
             &request,
@@ -99,6 +102,13 @@ impl WsResponsesExecutor for GrpcWsResponsesExecutor {
             Ok(modified_request) => modified_request,
             Err(error_response) => return Err(response_to_ws_error(error_response).await),
         };
+        debug!(
+            model = %request.model,
+            cached_response_hit = had_cached_response,
+            input_items = normalize_request_input_items(&modified_request).len(),
+            elapsed_ms = request_started_at.elapsed().as_secs_f64() * 1000.0,
+            "loaded websocket response conversation history"
+        );
 
         if options.generate == Some(false) {
             return warmup_response_create(&ctx, &request, &modified_request, outbound_tx).await;
@@ -143,6 +153,13 @@ impl WsResponsesExecutor for GrpcWsResponsesExecutor {
             .await
             .map_err(|err| WsClientError::new("stream_execution_failed", err))?
         };
+        debug!(
+            model = %request.model,
+            response_id = %final_response.id,
+            status = ?final_response.status,
+            elapsed_ms = request_started_at.elapsed().as_secs_f64() * 1000.0,
+            "finished websocket response execution"
+        );
 
         Ok(CachedWsResponse {
             response: final_response,

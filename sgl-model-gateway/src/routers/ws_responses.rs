@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -15,6 +18,8 @@ use crate::protocols::responses::{
 };
 
 const DEFAULT_WS_SESSION_LIFETIME: Duration = Duration::from_secs(60 * 60);
+const ACTIVE_REQUEST_HANDOFF_TIMEOUT: Duration = Duration::from_millis(50);
+const ACTIVE_REQUEST_HANDOFF_POLL: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Debug)]
 #[doc(hidden)]
@@ -290,9 +295,7 @@ async fn handle_text_event(
                 return;
             };
 
-            let mut session_guard = session.lock().await;
-            if session_guard.active_request {
-                drop(session_guard);
+            if !acquire_request_slot(&session).await {
                 send_error_json(
                     &outbound_tx,
                     "concurrent_response_create",
@@ -301,14 +304,24 @@ async fn handle_text_event(
                 );
                 return;
             }
-
-            session_guard.active_request = true;
+            let session_guard = session.lock().await;
             let cached_response = session_guard.cached_response.clone();
             drop(session_guard);
 
             let event_id = raw_event.event_id.clone();
             let options = raw_event.options.clone();
             let referenced_previous_response_id = request.previous_response_id.clone();
+            let request_model = request.model.clone();
+            let request_store = request.store;
+            let request_started_at = Instant::now();
+            debug!(
+                event_id = event_id.as_deref().unwrap_or(""),
+                model = %request_model,
+                store = request_store,
+                has_previous_response = referenced_previous_response_id.is_some(),
+                generate = options.generate.unwrap_or(true),
+                "accepted websocket response.create request"
+            );
             let session_clone = session.clone();
             let outbound_clone = outbound_tx.clone();
             tokio::spawn(async move {
@@ -327,6 +340,13 @@ async fn handle_text_event(
 
                 match result {
                     Ok(cached_response) => {
+                        debug!(
+                            event_id = event_id.as_deref().unwrap_or(""),
+                            response_id = %cached_response.response.id,
+                            status = ?cached_response.response.status,
+                            elapsed_ms = request_started_at.elapsed().as_secs_f64() * 1000.0,
+                            "completed websocket response.create request"
+                        );
                         session_guard.cached_response = (cached_response.response.status
                             != ResponseStatus::Failed)
                             .then_some(cached_response);
@@ -345,6 +365,12 @@ async fn handle_text_event(
                             session_guard.cached_response = None;
                         }
                         drop(session_guard);
+                        debug!(
+                            event_id = event_id.as_deref().unwrap_or(""),
+                            error_code = %err.code,
+                            elapsed_ms = request_started_at.elapsed().as_secs_f64() * 1000.0,
+                            "websocket response.create request failed"
+                        );
                         send_client_error_json(&outbound_clone, &err, event_id.as_deref());
                     }
                 }
@@ -358,6 +384,24 @@ async fn handle_text_event(
                 raw_event.event_id.as_deref(),
             );
         }
+    }
+}
+
+async fn acquire_request_slot(session: &Arc<Mutex<WsSessionState>>) -> bool {
+    let deadline = Instant::now() + ACTIVE_REQUEST_HANDOFF_TIMEOUT;
+    loop {
+        let mut session_guard = session.lock().await;
+        if !session_guard.active_request {
+            session_guard.active_request = true;
+            return true;
+        }
+        drop(session_guard);
+
+        if Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(ACTIVE_REQUEST_HANDOFF_POLL).await;
     }
 }
 
