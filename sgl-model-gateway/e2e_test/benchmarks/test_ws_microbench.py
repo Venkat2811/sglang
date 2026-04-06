@@ -17,6 +17,7 @@ import statistics
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -75,6 +76,11 @@ def _gateway_ws_url(base_url: str) -> str:
     if base_url.startswith("https://"):
         return f"wss://{base_url.removeprefix('https://')}/v1/responses"
     return f"ws://{base_url.removeprefix('http://')}/v1/responses"
+
+
+def _gateway_http_url_from_client(client) -> str:
+    parsed = urllib.parse.urlparse(str(client.base_url))
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -226,12 +232,21 @@ def _bfcl_request_instructions_for_scenario(scenario: BfclScenario) -> str:
 def _bfcl_tool_output_from_http_function_call(
     workspace: BfclWorkspace, function_call
 ) -> tuple[list[dict], dict]:
-    result = workspace.execute(function_call.name, json.loads(function_call.arguments))
+    if isinstance(function_call, dict):
+        tool_name = str(function_call["name"])
+        arguments = json.loads(function_call["arguments"])
+        call_id = str(function_call["call_id"])
+    else:
+        tool_name = str(function_call.name)
+        arguments = json.loads(function_call.arguments)
+        call_id = str(function_call.call_id)
+
+    result = workspace.execute(tool_name, arguments)
     return (
         [
             {
                 "type": "function_call_output",
-                "call_id": function_call.call_id,
+                "call_id": call_id,
                 "output": json.dumps(result),
             }
         ],
@@ -1112,6 +1127,7 @@ def _run_http_tool_output_chain_sample(
 def _run_http_model_generated_tool_chain_sample(
     client, model: str, turns: int
 ) -> dict[str, float | int | list[float] | list[dict[str, float]]]:
+    base_url = _gateway_http_url_from_client(client)
     request_instructions = _model_tool_request_instructions()
     result_instructions = _model_tool_result_instructions()
     request_max_output_tokens = _model_tool_request_max_output_tokens()
@@ -1121,41 +1137,45 @@ def _run_http_model_generated_tool_chain_sample(
     previous_response_id: str | None = None
 
     for turn_index in range(1, turns + 1):
-        first_stream = client.responses.create(
-            model=model,
-            input=_model_generated_tool_prompt(turn_index),
-            previous_response_id=previous_response_id,
-            instructions=request_instructions,
-            temperature=0,
-            max_output_tokens=request_max_output_tokens,
-            store=True,
-            stream=True,
-            tools=[CALCULATE_FUNCTION],
-            tool_choice="required",
+        first_payload = {
+            "model": model,
+            "input": _model_generated_tool_prompt(turn_index),
+            "previous_response_id": previous_response_id,
+            "instructions": request_instructions,
+            "temperature": 0,
+            "max_output_tokens": request_max_output_tokens,
+            "store": True,
+            "stream": True,
+            "tools": [CALCULATE_FUNCTION],
+            "tool_choice": "required",
+        }
+        first_response, tool_request_ms = _collect_http_completed_ms(
+            base_url, first_payload
         )
-        first_response, tool_request_ms = _collect_http_completed_ms(first_stream)
 
-        function_calls = _response_function_calls(first_response.output)
+        function_calls = _http_response_function_calls(first_response)
         if not function_calls:
-            output_types = [item.type for item in first_response.output]
+            output_types = _http_response_output_types(first_response)
             raise AssertionError(
                 "expected function call in http tool benchmark "
                 f"at turn {turn_index}; output_types={output_types}"
             )
 
-        second_stream = client.responses.create(
-            model=model,
-            input=_tool_output_from_http_function_call(function_calls[0]),
-            previous_response_id=first_response.id,
-            instructions=result_instructions,
-            temperature=0,
-            max_output_tokens=result_max_output_tokens,
-            store=True,
-            stream=True,
-            tools=[CALCULATE_FUNCTION],
-            tool_choice="auto",
+        second_payload = {
+            "model": model,
+            "input": _tool_output_from_http_function_call_dict(function_calls[0]),
+            "previous_response_id": first_response["id"],
+            "instructions": result_instructions,
+            "temperature": 0,
+            "max_output_tokens": result_max_output_tokens,
+            "store": True,
+            "stream": True,
+            "tools": [CALCULATE_FUNCTION],
+            "tool_choice": "auto",
+        }
+        second_response, tool_output_ms = _collect_http_completed_ms(
+            base_url, second_payload
         )
-        second_response, tool_output_ms = _collect_http_completed_ms(second_stream)
 
         turn_total_ms = tool_request_ms + tool_output_ms
         per_turn_ms.append(turn_total_ms)
@@ -1166,7 +1186,7 @@ def _run_http_model_generated_tool_chain_sample(
                 "turn_total_ms": turn_total_ms,
             }
         )
-        previous_response_id = second_response.id
+        previous_response_id = second_response["id"]
 
     continuation_turns = per_turn_ms[1:]
     continuation_mean_ms = (
@@ -1671,6 +1691,7 @@ def _bfcl_free_choice_transport_ratios(
 def _run_http_bfcl_subset_suite_sample(
     client, model: str, scenarios: list[BfclScenario]
 ) -> dict:
+    base_url = _gateway_http_url_from_client(client)
     request_max_output_tokens = _model_tool_request_max_output_tokens()
     result_max_output_tokens = _model_tool_result_max_output_tokens()
     total_tool_request_ms = 0.0
@@ -1690,26 +1711,28 @@ def _run_http_bfcl_subset_suite_sample(
             observed_tools: list[str] = []
 
             for turn_index, turn in enumerate(scenario.turns, start=1):
-                first_stream = client.responses.create(
-                    model=model,
-                    input=turn.prompt,
-                    previous_response_id=previous_response_id,
-                    instructions=_bfcl_request_instructions_for_scenario(scenario),
-                    temperature=0,
-                    max_output_tokens=request_max_output_tokens,
-                    store=True,
-                    stream=True,
-                    tools=bfcl_subset_tools(),
-                    tool_choice=_bfcl_tool_choice(turn.expected_tool),
+                first_payload = {
+                    "model": model,
+                    "input": turn.prompt,
+                    "previous_response_id": previous_response_id,
+                    "instructions": _bfcl_request_instructions_for_scenario(scenario),
+                    "temperature": 0,
+                    "max_output_tokens": request_max_output_tokens,
+                    "store": True,
+                    "stream": True,
+                    "tools": bfcl_subset_tools(),
+                    "tool_choice": _bfcl_tool_choice(turn.expected_tool),
+                }
+                first_response, tool_request_ms = _collect_http_completed_ms(
+                    base_url, first_payload
                 )
-                first_response, tool_request_ms = _collect_http_completed_ms(first_stream)
-                function_calls = _response_function_calls(first_response.output)
+                function_calls = _http_response_function_calls(first_response)
                 if not function_calls:
                     raise AssertionError(
                         f"expected BFCL tool call in http scenario={scenario.id} turn={turn_index}"
                     )
 
-                observed_tool = function_calls[0].name
+                observed_tool = str(function_calls[0]["name"])
                 observed_tools.append(observed_tool)
                 if observed_tool != turn.expected_tool:
                     all_expected_tools_matched = False
@@ -1722,19 +1745,21 @@ def _run_http_bfcl_subset_suite_sample(
                 tool_output_items, _ = _bfcl_tool_output_from_http_function_call(
                     workspace, function_calls[0]
                 )
-                second_stream = client.responses.create(
-                    model=model,
-                    input=tool_output_items,
-                    previous_response_id=first_response.id,
-                    instructions=_bfcl_tool_result_instructions(),
-                    temperature=0,
-                    max_output_tokens=result_max_output_tokens,
-                    store=True,
-                    stream=True,
-                    tools=bfcl_subset_tools(),
-                    tool_choice="auto",
+                second_payload = {
+                    "model": model,
+                    "input": tool_output_items,
+                    "previous_response_id": first_response["id"],
+                    "instructions": _bfcl_tool_result_instructions(),
+                    "temperature": 0,
+                    "max_output_tokens": result_max_output_tokens,
+                    "store": True,
+                    "stream": True,
+                    "tools": bfcl_subset_tools(),
+                    "tool_choice": "auto",
+                }
+                second_response, tool_output_ms = _collect_http_completed_ms(
+                    base_url, second_payload
                 )
-                second_response, tool_output_ms = _collect_http_completed_ms(second_stream)
 
                 turn_total_ms = tool_request_ms + tool_output_ms
                 per_turn_ms.append(turn_total_ms)
@@ -1748,7 +1773,7 @@ def _run_http_bfcl_subset_suite_sample(
                         "turn_total_ms": turn_total_ms,
                     }
                 )
-                previous_response_id = second_response.id
+                previous_response_id = second_response["id"]
                 total_tool_request_ms += tool_request_ms
                 total_tool_output_ms += tool_output_ms
 
@@ -1905,6 +1930,7 @@ async def _run_ws_bfcl_subset_suite_sample(
 def _run_http_bfcl_subset_free_choice_suite_sample(
     client, model: str, scenarios: list[BfclScenario]
 ) -> dict:
+    base_url = _gateway_http_url_from_client(client)
     request_max_output_tokens = _model_tool_request_max_output_tokens()
     result_max_output_tokens = _model_tool_result_max_output_tokens()
     total_tool_request_ms = 0.0
@@ -1932,19 +1958,21 @@ def _run_http_bfcl_subset_free_choice_suite_sample(
                 total_turns_requested += 1
 
                 try:
-                    first_stream = client.responses.create(
-                        model=model,
-                        input=turn.prompt,
-                        previous_response_id=previous_response_id,
-                        instructions=_bfcl_request_instructions_for_scenario(scenario),
-                        temperature=0,
-                        max_output_tokens=request_max_output_tokens,
-                        store=True,
-                        stream=True,
-                        tools=bfcl_subset_tools(),
-                        tool_choice="auto",
+                    first_payload = {
+                        "model": model,
+                        "input": turn.prompt,
+                        "previous_response_id": previous_response_id,
+                        "instructions": _bfcl_request_instructions_for_scenario(scenario),
+                        "temperature": 0,
+                        "max_output_tokens": request_max_output_tokens,
+                        "store": True,
+                        "stream": True,
+                        "tools": bfcl_subset_tools(),
+                        "tool_choice": "auto",
+                    }
+                    first_response, tool_request_ms = _collect_http_completed_ms(
+                        base_url, first_payload
                     )
-                    first_response, tool_request_ms = _collect_http_completed_ms(first_stream)
                 except Exception as exc:
                     scenario_completed = False
                     scenario_failure_reason = "tool_request_exception"
@@ -1964,8 +1992,10 @@ def _run_http_bfcl_subset_free_choice_suite_sample(
                     break
 
                 total_tool_request_ms += tool_request_ms
-                function_calls = _response_function_calls(first_response.output)
-                observed_tool = function_calls[0].name if function_calls else None
+                function_calls = _http_response_function_calls(first_response)
+                observed_tool = (
+                    str(function_calls[0]["name"]) if function_calls else None
+                )
                 matched_expected_tool = observed_tool == turn.expected_tool
                 record: dict[str, float | int | str | bool | None] = {
                     "turn_index": turn_index,
@@ -1976,8 +2006,8 @@ def _run_http_bfcl_subset_free_choice_suite_sample(
                     "tool_output_ms": None,
                     "turn_total_ms": tool_request_ms,
                     "status": "tool_request_completed",
-                    "response_id": first_response.id,
-                    "output_types": ",".join(item.type for item in first_response.output),
+                    "response_id": first_response["id"],
+                    "output_types": ",".join(_http_response_output_types(first_response)),
                 }
 
                 if not function_calls:
@@ -2002,19 +2032,21 @@ def _run_http_bfcl_subset_free_choice_suite_sample(
                     tool_output_items, _ = _bfcl_tool_output_from_http_function_call(
                         workspace, function_calls[0]
                     )
-                    second_stream = client.responses.create(
-                        model=model,
-                        input=tool_output_items,
-                        previous_response_id=first_response.id,
-                        instructions=_bfcl_tool_result_instructions(),
-                        temperature=0,
-                        max_output_tokens=result_max_output_tokens,
-                        store=True,
-                        stream=True,
-                        tools=bfcl_subset_tools(),
-                        tool_choice="auto",
+                    second_payload = {
+                        "model": model,
+                        "input": tool_output_items,
+                        "previous_response_id": first_response["id"],
+                        "instructions": _bfcl_tool_result_instructions(),
+                        "temperature": 0,
+                        "max_output_tokens": result_max_output_tokens,
+                        "store": True,
+                        "stream": True,
+                        "tools": bfcl_subset_tools(),
+                        "tool_choice": "auto",
+                    }
+                    second_response, tool_output_ms = _collect_http_completed_ms(
+                        base_url, second_payload
                     )
-                    second_response, tool_output_ms = _collect_http_completed_ms(second_stream)
                 except Exception as exc:
                     scenario_completed = False
                     scenario_failure_reason = "tool_output_exception"
@@ -2028,7 +2060,7 @@ def _run_http_bfcl_subset_free_choice_suite_sample(
                 record["tool_output_ms"] = tool_output_ms
                 record["turn_total_ms"] = tool_request_ms + tool_output_ms
                 record["status"] = "matched_completed"
-                previous_response_id = second_response.id
+                previous_response_id = second_response["id"]
                 scenario_records.append(record)
 
             if scenario_completed and len(scenario_records) == len(scenario.turns):
