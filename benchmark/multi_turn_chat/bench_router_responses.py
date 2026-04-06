@@ -9,7 +9,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,64 @@ class ChainRuntimeConfig:
     chain_mode: str
     store: bool
     request_timeout_secs: float
+    capture_event_trace: bool
+    event_trace_limit: int
+
+
+@dataclass
+class ResponseTimingTracker:
+    request_started_at: float
+    capture_event_trace: bool
+    event_trace_limit: int
+    first_event_ms: float | None = None
+    first_content_ms: float | None = None
+    completed_ms: float | None = None
+    event_count: int = 0
+    output_text_delta_count: int = 0
+    event_trace: list[dict[str, Any]] = field(default_factory=list)
+
+    def observe(self, event: dict[str, Any], observed_at: float) -> None:
+        elapsed_ms = (observed_at - self.request_started_at) * 1000
+        event_type = _event_type(event)
+        if self.first_event_ms is None:
+            self.first_event_ms = elapsed_ms
+
+        delta_chars = 0
+        if event_type == "response.output_text.delta":
+            delta = event.get("delta")
+            if isinstance(delta, str) and delta:
+                self.output_text_delta_count += 1
+                delta_chars = len(delta)
+                if self.first_content_ms is None:
+                    self.first_content_ms = elapsed_ms
+
+        if event_type == "response.completed":
+            self.completed_ms = elapsed_ms
+
+        self.event_count += 1
+        if self.capture_event_trace and len(self.event_trace) < self.event_trace_limit:
+            self.event_trace.append(
+                {
+                    "event_type": event_type,
+                    "t_ms": elapsed_ms,
+                    "delta_chars": delta_chars,
+                }
+            )
+
+    def metrics(self) -> dict[str, Any]:
+        completed_ms = self.completed_ms or 0.0
+        first_event_ms = self.first_event_ms or 0.0
+        first_content_ms = self.first_content_ms or completed_ms
+        return {
+            "request_to_first_event_ms": first_event_ms,
+            "request_to_first_content_ms": first_content_ms,
+            "request_to_completed_ms": completed_ms,
+            "first_event_to_first_content_ms": max(first_content_ms - first_event_ms, 0.0),
+            "first_content_to_completed_ms": max(completed_ms - first_content_ms, 0.0),
+            "event_count": self.event_count,
+            "output_text_delta_count": self.output_text_delta_count,
+            "event_trace": self.event_trace if self.capture_event_trace else [],
+        }
 
 
 def _normalize_base_url(base_url: str) -> str:
@@ -139,6 +197,40 @@ def _response_output_text_from_ws_response(response: dict[str, Any]) -> str:
     return ""
 
 
+def _event_type(event: dict[str, Any]) -> str:
+    event_type = event.get("type")
+    if isinstance(event_type, str) and event_type:
+        return event_type
+    sse_event_name = event.get("_sse_event_name")
+    if isinstance(sse_event_name, str) and sse_event_name:
+        return sse_event_name
+    return "unknown"
+
+
+def _parse_sse_event(lines: list[str]) -> dict[str, Any] | None:
+    data_lines = [
+        line.removeprefix("data:").lstrip() for line in lines if line.startswith("data:")
+    ]
+    if not data_lines:
+        return None
+    payload_text = "\n".join(data_lines)
+    if payload_text == "[DONE]":
+        return None
+
+    event = json.loads(payload_text)
+    event_name = next(
+        (
+            line.removeprefix("event:").lstrip()
+            for line in lines
+            if line.startswith("event:")
+        ),
+        None,
+    )
+    if event_name and isinstance(event, dict) and "_sse_event_name" not in event:
+        event["_sse_event_name"] = event_name
+    return event
+
+
 def _http_stream_events(
     base_url: str,
     request: dict[str, Any],
@@ -167,24 +259,11 @@ def _http_stream_events(
     with response:
         event_lines: list[str] = []
 
-        def parse_event(lines: list[str]) -> dict[str, Any] | None:
-            data_lines = [
-                line.removeprefix("data:").lstrip()
-                for line in lines
-                if line.startswith("data:")
-            ]
-            if not data_lines:
-                return None
-            payload_text = "\n".join(data_lines)
-            if payload_text == "[DONE]":
-                return None
-            return json.loads(payload_text)
-
         while True:
             raw_line = response.readline()
             if not raw_line:
                 if event_lines:
-                    event = parse_event(event_lines)
+                    event = _parse_sse_event(event_lines)
                     if event is not None:
                         yield event
                 break
@@ -193,7 +272,7 @@ def _http_stream_events(
             if not line:
                 if not event_lines:
                     continue
-                event = parse_event(event_lines)
+                event = _parse_sse_event(event_lines)
                 event_lines = []
                 if event is not None:
                     yield event
@@ -208,11 +287,13 @@ def _http_stream_events(
 def _collect_http_response(
     config: ChainRuntimeConfig,
     request: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, float]]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     request_started_at = time.perf_counter()
-
-    first_event_ms: float | None = None
-    first_content_ms: float | None = None
+    tracker = ResponseTimingTracker(
+        request_started_at=request_started_at,
+        capture_event_trace=config.capture_event_trace,
+        event_trace_limit=config.event_trace_limit,
+    )
 
     for event in _http_stream_events(
         config.base_url,
@@ -220,73 +301,43 @@ def _collect_http_response(
         config.request_timeout_secs,
     ):
         now = time.perf_counter()
-        event_type = event.get("type")
-        if first_event_ms is None:
-            first_event_ms = (now - request_started_at) * 1000
-
-        if (
-            first_content_ms is None
-            and event_type == "response.output_text.delta"
-            and isinstance(event.get("delta"), str)
-            and event["delta"]
-        ):
-            first_content_ms = (now - request_started_at) * 1000
+        tracker.observe(event, now)
+        event_type = _event_type(event)
 
         if event_type in {"error", "response.failed", "response.incomplete"}:
             raise RuntimeError(f"HTTP response chain failed with event={event_type}")
 
         if event_type == "response.completed":
-            completed_ms = (now - request_started_at) * 1000
-            if first_content_ms is None:
-                first_content_ms = completed_ms
-            return event["response"], {
-                "request_to_first_event_ms": first_event_ms or 0.0,
-                "request_to_first_content_ms": first_content_ms or 0.0,
-                "request_to_completed_ms": completed_ms,
-            }
+            return event["response"], tracker.metrics()
 
     raise RuntimeError("HTTP response stream ended without response.completed")
 
 
 async def _collect_ws_response(
     websocket: Any,
+    config: ChainRuntimeConfig,
     request: dict[str, Any],
     timeout_secs: float,
-) -> tuple[dict[str, Any], dict[str, float]]:
-    await websocket.send(json.dumps({"type": "response.create", **request}))
+) -> tuple[dict[str, Any], dict[str, Any]]:
     request_started_at = time.perf_counter()
-
-    first_event_ms: float | None = None
-    first_content_ms: float | None = None
+    await websocket.send(json.dumps({"type": "response.create", **request}))
+    tracker = ResponseTimingTracker(
+        request_started_at=request_started_at,
+        capture_event_trace=config.capture_event_trace,
+        event_trace_limit=config.event_trace_limit,
+    )
 
     while True:
         payload = await asyncio.wait_for(websocket.recv(), timeout=timeout_secs)
         event = json.loads(payload)
         now = time.perf_counter()
-
-        if first_event_ms is None:
-            first_event_ms = (now - request_started_at) * 1000
-
-        if (
-            first_content_ms is None
-            and event.get("type") == "response.output_text.delta"
-            and isinstance(event.get("delta"), str)
-            and event["delta"]
-        ):
-            first_content_ms = (now - request_started_at) * 1000
+        tracker.observe(event, now)
 
         if event.get("type") == "error":
             raise RuntimeError(f"WebSocket response chain failed with event={event}")
 
         if event.get("type") == "response.completed":
-            completed_ms = (now - request_started_at) * 1000
-            if first_content_ms is None:
-                first_content_ms = completed_ms
-            return event["response"], {
-                "request_to_first_event_ms": first_event_ms or 0.0,
-                "request_to_first_content_ms": first_content_ms or 0.0,
-                "request_to_completed_ms": completed_ms,
-            }
+            return event["response"], tracker.metrics()
 
 
 def _append_full_replay_turn(
@@ -347,6 +398,7 @@ def _run_http_chain(
     return {
         "turn_count": len(qas),
         "total_chain_ms": (time.perf_counter() - chain_started_at) * 1000,
+        "connect_ms": 0.0,
         "total_request_payload_bytes": total_request_payload_bytes,
         "per_turn": per_turn,
     }
@@ -363,12 +415,14 @@ async def _run_ws_chain_async(
     per_turn: list[dict[str, Any]] = []
     total_request_payload_bytes = 0
     chain_started_at = time.perf_counter()
+    connect_started_at = time.perf_counter()
 
     async with websockets.connect(
         _gateway_ws_url(config.base_url),
         open_timeout=30,
         close_timeout=5,
     ) as websocket:
+        connect_ms = (time.perf_counter() - connect_started_at) * 1000
         for turn_index, qa in enumerate(qas, start=1):
             turn_input = _prepare_turn_input(
                 config.chain_mode,
@@ -393,6 +447,7 @@ async def _run_ws_chain_async(
             )
             response, metrics = await _collect_ws_response(
                 websocket,
+                config,
                 request,
                 config.request_timeout_secs,
             )
@@ -417,6 +472,7 @@ async def _run_ws_chain_async(
     return {
         "turn_count": len(qas),
         "total_chain_ms": (time.perf_counter() - chain_started_at) * 1000,
+        "connect_ms": connect_ms,
         "total_request_payload_bytes": total_request_payload_bytes,
         "per_turn": per_turn,
     }
@@ -452,6 +508,25 @@ def _summarize_transport(
         for result in chain_results
         for turn in result["per_turn"]
     ]
+    first_event_to_first_content = [
+        float(turn["first_event_to_first_content_ms"])
+        for result in chain_results
+        for turn in result["per_turn"]
+    ]
+    first_content_to_completed = [
+        float(turn["first_content_to_completed_ms"])
+        for result in chain_results
+        for turn in result["per_turn"]
+    ]
+    event_counts = [
+        float(turn["event_count"]) for result in chain_results for turn in result["per_turn"]
+    ]
+    output_text_delta_counts = [
+        float(turn["output_text_delta_count"])
+        for result in chain_results
+        for turn in result["per_turn"]
+    ]
+    connect_ms = [float(result.get("connect_ms", 0.0)) for result in chain_results]
     request_payload_totals = [
         float(result["total_request_payload_bytes"]) for result in chain_results
     ]
@@ -471,6 +546,19 @@ def _summarize_transport(
             "turn_ms_p95": _percentile(turn_totals, 0.95),
             "first_event_ms_p50": _percentile(first_events, 0.50),
             "first_content_ms_p50": _percentile(first_content, 0.50),
+            "first_event_to_first_content_ms_p50": _percentile(
+                first_event_to_first_content, 0.50
+            ),
+            "first_content_to_completed_ms_p50": _percentile(
+                first_content_to_completed, 0.50
+            ),
+            "event_count_mean": statistics.fmean(event_counts) if event_counts else 0.0,
+            "output_text_delta_count_mean": (
+                statistics.fmean(output_text_delta_counts)
+                if output_text_delta_counts
+                else 0.0
+            ),
+            "connect_ms_mean": statistics.fmean(connect_ms) if connect_ms else 0.0,
             "request_payload_bytes_total_mean": (
                 statistics.fmean(request_payload_totals)
                 if request_payload_totals
@@ -500,6 +588,8 @@ def _run_transport(
         chain_mode=args.chain_mode,
         store=args.store_mode == "true",
         request_timeout_secs=args.request_timeout_secs,
+        capture_event_trace=args.capture_event_trace,
+        event_trace_limit=args.event_trace_limit,
     )
 
     chain_runner = _run_http_chain if client_transport == "http_sse" else _run_ws_chain
@@ -566,6 +656,8 @@ def _append_result_line(path: str | None, payload: dict[str, Any]) -> None:
 def _validate_args(args: argparse.Namespace) -> None:
     if args.parallel < 1:
         raise ValueError("--parallel must be >= 1")
+    if getattr(args, "event_trace_limit", 1) < 1:
+        raise ValueError("--event-trace-limit must be >= 1")
     if args.client_transport in {"http_sse", "both"}:
         if args.chain_mode == "previous_response_id" and args.store_mode == "false":
             raise ValueError(
@@ -633,6 +725,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-len-a", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--request-timeout-secs", type=float, default=180)
+    parser.add_argument(
+        "--capture-event-trace",
+        action="store_true",
+        help="Capture a bounded per-turn event trace in the summary output.",
+    )
+    parser.add_argument(
+        "--event-trace-limit",
+        type=int,
+        default=12,
+        help="Maximum number of event trace entries to record per turn.",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--long", action="store_true")
     parser.add_argument(

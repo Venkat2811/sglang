@@ -8,6 +8,7 @@ use serde_json::json;
 use smg_mcp as mcp;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
@@ -33,6 +34,32 @@ pub(crate) trait ResponseEventSink {
     }
 }
 
+fn should_log_response_event(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "response.created"
+            | "response.in_progress"
+            | "response.output_text.delta"
+            | "response.output_text.done"
+            | "response.completed"
+            | "response.failed"
+            | "error"
+    )
+}
+
+fn response_event_log_fields(event: &serde_json::Value) -> (&str, usize) {
+    let event_type = event
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let delta_chars = event
+        .get("delta")
+        .and_then(|value| value.as_str())
+        .map(|delta| delta.chars().count())
+        .unwrap_or(0);
+    (event_type, delta_chars)
+}
+
 #[derive(Clone)]
 pub(crate) struct SseResponseEventSink {
     tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
@@ -53,6 +80,15 @@ impl ResponseEventSink for SseResponseEventSink {
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("message");
+        if should_log_response_event(event_type) {
+            let (_, delta_chars) = response_event_log_fields(event);
+            debug!(
+                transport = "sse",
+                event_type,
+                delta_chars,
+                "forwarding responses stream event"
+            );
+        }
         let sse_message = format!("event: {}\ndata: {}\n\n", event_type, event_json);
 
         if self.tx.send(Ok(Bytes::from(sse_message))).is_err() {
@@ -112,6 +148,15 @@ impl ResponseEventSink for WsResponseEventSink {
     fn send_event(&self, event: &serde_json::Value) -> Result<(), String> {
         let event_json = serde_json::to_string(event)
             .map_err(|e| format!("Failed to serialize event: {}", e))?;
+        let (event_type, delta_chars) = response_event_log_fields(event);
+        if should_log_response_event(event_type) {
+            debug!(
+                transport = "ws",
+                event_type,
+                delta_chars,
+                "forwarding responses stream event"
+            );
+        }
         if self.tx.send(Message::Text(event_json.into())).is_err() {
             return Err("Client disconnected".to_string());
         }

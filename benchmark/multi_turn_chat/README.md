@@ -66,6 +66,9 @@ Notes:
 - `previous_response_id` isolates the Responses continuation path instead.
 - HTTP SSE with `previous_response_id` requires `--store-mode true`; otherwise
   the chain cannot continue across requests.
+- Add `--capture-event-trace` to record bounded per-turn event timing traces in
+  the JSON summary. This is useful when comparing HTTP `first_event` vs
+  `first_content` gaps against the persistent WebSocket path.
 
 ### Benchmark vLLM
 

@@ -47,6 +47,17 @@ impl StubWsExecutor {
     }
 }
 
+#[derive(Clone)]
+struct DelayedReturnWsExecutor {
+    return_delay: Duration,
+}
+
+impl DelayedReturnWsExecutor {
+    fn new(return_delay: Duration) -> Self {
+        Self { return_delay }
+    }
+}
+
 #[async_trait]
 impl WsResponsesExecutor for StubWsExecutor {
     async fn execute_response_create(
@@ -119,6 +130,59 @@ impl WsResponsesExecutor for StubWsExecutor {
                 }],
                 status: Some("completed".to_string()),
             }],
+        })
+    }
+}
+
+#[async_trait]
+impl WsResponsesExecutor for DelayedReturnWsExecutor {
+    async fn execute_response_create(
+        &self,
+        _headers: HeaderMap,
+        request: ResponsesRequest,
+        _options: WsResponseCreateOptions,
+        _cached_response: Option<CachedWsResponse>,
+        outbound_tx: mpsc::UnboundedSender<Message>,
+    ) -> Result<CachedWsResponse, WsClientError> {
+        let output_text = "delayed websocket output";
+        let response = ResponsesResponse::builder("resp_ws_delayed", request.model.clone())
+            .copy_from_request(&request)
+            .status(ResponseStatus::Completed)
+            .output(vec![ResponseOutputItem::Message {
+                id: "msg_ws_delayed".to_string(),
+                role: "assistant".to_string(),
+                content: vec![ResponseContentPart::OutputText {
+                    text: output_text.to_string(),
+                    annotations: vec![],
+                    logprobs: None,
+                }],
+                status: "completed".to_string(),
+            }])
+            .build();
+
+        let created = serde_json::json!({
+            "type": "response.created",
+            "response": {
+                "id": response.id,
+                "object": "response",
+                "status": "in_progress",
+                "model": request.model,
+                "output": []
+            }
+        });
+        let _ = outbound_tx.send(Message::Text(created.to_string().into()));
+
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": response.clone(),
+        });
+        let _ = outbound_tx.send(Message::Text(completed.to_string().into()));
+
+        tokio::time::sleep(self.return_delay).await;
+
+        Ok(CachedWsResponse {
+            response,
+            input_items: vec![],
         })
     }
 }
@@ -1064,6 +1128,45 @@ async fn test_v1_responses_ws_same_connection_store_false_continuation_completes
 
     let third_completed = third_events.last().unwrap();
     assert_eq!(third_completed["type"], "response.completed");
+}
+
+#[tokio::test]
+async fn test_v1_responses_ws_allows_immediate_follow_up_after_completed_event() {
+    let url = serve_app(
+        build_stub_app(Arc::new(DelayedReturnWsExecutor::new(Duration::from_millis(
+            20,
+        ))))
+        .await,
+    )
+    .await;
+    let (mut socket, _) = connect_async(format!("{}/v1/responses", url))
+        .await
+        .unwrap();
+
+    let first_events = send_ws_request_and_collect(
+        &mut socket,
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "First delayed websocket turn",
+            "store": false
+        })),
+    )
+    .await;
+    let first_completed = first_events.last().unwrap();
+    assert_eq!(first_completed["type"], "response.completed");
+
+    let second_events = send_ws_request_and_collect(
+        &mut socket,
+        ws_create_request(serde_json::json!({
+            "model": "mock-model",
+            "input": "Immediate follow-up websocket turn",
+            "store": false
+        })),
+    )
+    .await;
+
+    let second_completed = second_events.last().unwrap();
+    assert_eq!(second_completed["type"], "response.completed");
 }
 
 #[tokio::test]
