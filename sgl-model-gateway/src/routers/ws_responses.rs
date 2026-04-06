@@ -1,6 +1,6 @@
 use std::{
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -11,7 +11,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::protocols::responses::{
     ResponseInputOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse,
@@ -20,6 +20,31 @@ use crate::protocols::responses::{
 const DEFAULT_WS_SESSION_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const ACTIVE_REQUEST_HANDOFF_TIMEOUT: Duration = Duration::from_millis(50);
 const ACTIVE_REQUEST_HANDOFF_POLL: Duration = Duration::from_millis(1);
+
+fn ws_writer_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("SMG_DEBUG_WS_WRITE_TIMING").is_some())
+}
+
+fn ws_message_event_type(message: &Message) -> String {
+    match message {
+        Message::Text(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|value| value.get("type").and_then(|value| value.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| "text".to_string()),
+        Message::Binary(_) => "binary".to_string(),
+        Message::Ping(_) => "ping".to_string(),
+        Message::Pong(_) => "pong".to_string(),
+        Message::Close(_) => "close".to_string(),
+    }
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Clone, Debug)]
 #[doc(hidden)]
@@ -197,9 +222,28 @@ pub async fn serve_responses_ws_with_config(
     let session = Arc::new(Mutex::new(WsSessionState::default()));
 
     let writer = tokio::spawn(async move {
+        let session_started_at = Instant::now();
         while let Some(message) = outbound_rx.recv().await {
+            let event_type = ws_writer_timing_enabled().then(|| ws_message_event_type(&message));
+            let payload_len = match &message {
+                Message::Text(text) => text.len(),
+                Message::Binary(payload) => payload.len(),
+                Message::Ping(payload) | Message::Pong(payload) => payload.len(),
+                Message::Close(_) => 0,
+            };
+
             if sink.send(message).await.is_err() {
                 break;
+            }
+
+            if let Some(event_type) = event_type {
+                info!(
+                    wall_time_ms = unix_timestamp_ms(),
+                    session_elapsed_ms = session_started_at.elapsed().as_secs_f64() * 1000.0,
+                    event_type,
+                    payload_len,
+                    "responses websocket writer flushed frame"
+                );
             }
         }
     });
