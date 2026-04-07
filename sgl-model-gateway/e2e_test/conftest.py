@@ -131,7 +131,10 @@ if str(_E2E_TEST) not in sys.path:
     sys.path.insert(0, str(_E2E_TEST))
 
 # Add bindings/python to path if the wheel is not installed (for local development)
-_wheel_installed = find_spec("sglang_router.sglang_router_rs") is not None
+try:
+    _wheel_installed = find_spec("sglang_router.sglang_router_rs") is not None
+except ModuleNotFoundError:
+    _wheel_installed = False
 
 if not _wheel_installed and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
@@ -205,6 +208,8 @@ from fixtures import (
     pytest_collection_modifyitems,
     pytest_configure,
     pytest_runtest_setup,
+    pytest_sessionfinish,
+    pytest_unconfigure,
     setup_backend,
 )
 
@@ -216,6 +221,8 @@ __all__ = [
     "pytest_collection_finish",
     "pytest_configure",
     "pytest_runtest_setup",
+    "pytest_sessionfinish",
+    "pytest_unconfigure",
     # Fixtures
     "model_pool",
     "model_client",
