@@ -31,6 +31,9 @@ markers = [
   "e2e: mark test as end-to-end test requiring GPU workers",
   "slow: mark test as slow-running",
   "thread_unsafe: mark test as incompatible with parallel thread execution",
+  "model(name): specify which model spec to use for this test",
+  "gateway(**kwargs): configure gateway extra_args, policy, timeout",
+  "workers(**kwargs): configure worker count, prefill, decode topology",
 ]
 addopts = "-v -s"
 # Explicitly disable live log to avoid "---- live log ----" dividers

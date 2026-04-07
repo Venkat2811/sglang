@@ -1146,12 +1146,17 @@ def _run_http_tool_output_chain_sample(
     }
 
 
-def _write_summary(experiment_folder: str, payload: dict) -> Path:
-    out_dir = Path.cwd() / experiment_folder
+def _maybe_write_summary(label: str, payload: dict) -> None:
+    """Write JSON summary to disk only when SGLANG_WS_BENCH_OUTPUT_DIR is set."""
+    output_dir = os.environ.get("SGLANG_WS_BENCH_OUTPUT_DIR")
+    if not output_dir:
+        return
+    out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "summary.json"
+    slug = label.lower().replace(" ", "_").replace("-", "_")
+    out_path = out_dir / f"{slug}.json"
     out_path.write_text(json.dumps(payload, indent=2))
-    return out_path
+    logger.info("Summary written to %s", out_path)
 
 
 def _print_transport_table(
@@ -1284,10 +1289,6 @@ def _transport_result(
     }
 
 
-def _scoped_experiment_folder(base_name: str, backend_name: str) -> str:
-    return f"{base_name}_{_router_topology_for_backend(backend_name)}"
-
-
 def _transport_ratios(http_summary: dict, ws_summary: dict) -> dict[str, float]:
     def ratio(numerator: float, denominator: float) -> float:
         if denominator <= 0:
@@ -1394,13 +1395,6 @@ class TestWsMicrobench:
         samples_per_concurrency = int(
             os.environ.get("SGLANG_WS_BENCH_SAMPLES_PER_CONCURRENCY", "2")
         )
-        experiment_folder = _scoped_experiment_folder(
-            os.environ.get(
-                "SGLANG_WS_BENCH_EXPERIMENT",
-                f"benchmark_ws_microbench_{model.replace('/', '_')}",
-            ),
-            backend_name,
-        )
         benchmark_context = _benchmark_context(
             benchmark_family="transport_qos",
             run_class="ws_microbench_profile",
@@ -1425,9 +1419,7 @@ class TestWsMicrobench:
         payload["worker_backend"] = backend_name
         payload["router_url"] = gateway.base_url
         payload["model"] = model
-        payload["experiment_folder"] = experiment_folder
-
-        _write_summary(experiment_folder, payload)
+        _maybe_write_summary("ws_microbench", payload)
         print(f"\n{'=' * 50}")
         print(f"  WS Microbenchmark  |  model: {model}")
         print(f"{'=' * 50}")
@@ -1462,13 +1454,6 @@ class TestResponsesTransportCompare:
         backend_name, model, client, gateway = setup_backend
 
         samples = int(os.environ.get("SGLANG_HTTP_WS_COMPARE_SAMPLES", "2"))
-        experiment_folder = _scoped_experiment_folder(
-            os.environ.get(
-                "SGLANG_HTTP_WS_COMPARE_EXPERIMENT",
-                f"benchmark_http_ws_compare_{model.replace('/', '_')}",
-            ),
-            backend_name,
-        )
         benchmark_context = _benchmark_context(
             benchmark_family="transport_qos",
             run_class="http_vs_ws_transport_compare",
@@ -1497,7 +1482,6 @@ class TestResponsesTransportCompare:
             "worker_backend": backend_name,
             "router_url": gateway.base_url,
             "model": model,
-            "experiment_folder": experiment_folder,
             "samples_per_transport": samples,
             "http": _transport_result(
                 context=benchmark_context,
@@ -1514,7 +1498,7 @@ class TestResponsesTransportCompare:
             "ratios": _transport_ratios(http_summary, ws_summary),
         }
 
-        _write_summary(experiment_folder, payload)
+        _maybe_write_summary("http_vs_ws_transport_compare", payload)
         _print_transport_table(
             "HTTP vs WS Transport Compare",
             model,
@@ -1545,16 +1529,6 @@ class TestResponsesContinuationChainCompare:
 
         turns = int(os.environ.get("SGLANG_HTTP_WS_CHAIN_TURNS", "20"))
         samples = int(os.environ.get("SGLANG_HTTP_WS_CHAIN_SAMPLES", "1"))
-        experiment_folder = _scoped_experiment_folder(
-            os.environ.get(
-                "SGLANG_HTTP_WS_CHAIN_EXPERIMENT",
-                (
-                    "benchmark_http_ws_chain_compare_"
-                    f"{model.replace('/', '_')}_{turns}turns"
-                ),
-            ),
-            backend_name,
-        )
         benchmark_context = _benchmark_context(
             benchmark_family="continuation_qos",
             run_class="http_vs_ws_continuation_compare",
@@ -1591,7 +1565,6 @@ class TestResponsesContinuationChainCompare:
             "model": model,
             "turns": turns,
             "samples": samples,
-            "experiment_folder": experiment_folder,
             "http": _transport_result(
                 context=benchmark_context,
                 client_transport="http_sse",
@@ -1607,7 +1580,7 @@ class TestResponsesContinuationChainCompare:
             "ratios": _chain_transport_ratios(http_summary, ws_summary),
         }
 
-        _write_summary(experiment_folder, payload)
+        _maybe_write_summary("continuation_chain_compare", payload)
         _print_chain_table(
             "Continuation Chain Compare",
             model,
@@ -1636,16 +1609,6 @@ class TestResponsesToolOutputChainCompare:
 
         tool_turns = int(os.environ.get("SGLANG_HTTP_WS_TOOL_CHAIN_TURNS", "20"))
         samples = int(os.environ.get("SGLANG_HTTP_WS_TOOL_CHAIN_SAMPLES", "1"))
-        experiment_folder = _scoped_experiment_folder(
-            os.environ.get(
-                "SGLANG_HTTP_WS_TOOL_CHAIN_EXPERIMENT",
-                (
-                    "benchmark_http_ws_tool_chain_compare_"
-                    f"{model.replace('/', '_')}_{tool_turns}toolturns"
-                ),
-            ),
-            backend_name,
-        )
         benchmark_context = _benchmark_context(
             benchmark_family="continuation_qos",
             run_class="http_vs_ws_tool_output_compare",
@@ -1682,7 +1645,6 @@ class TestResponsesToolOutputChainCompare:
             "model": model,
             "tool_turns": tool_turns,
             "samples": samples,
-            "experiment_folder": experiment_folder,
             "http": _transport_result(
                 context=benchmark_context,
                 client_transport="http_sse",
@@ -1698,7 +1660,7 @@ class TestResponsesToolOutputChainCompare:
             "ratios": _chain_transport_ratios(http_summary, ws_summary),
         }
 
-        _write_summary(experiment_folder, payload)
+        _maybe_write_summary("tool_output_chain_compare", payload)
         _print_chain_table(
             "Tool-Output Chain Compare",
             model,
@@ -1727,16 +1689,6 @@ class TestResponsesFrozenToolTranscriptCompare:
 
         scenarios = _selected_frozen_tool_transcript_scenarios()
         samples = int(os.environ.get("SGLANG_HTTP_WS_FROZEN_TRANSCRIPT_SAMPLES", "1"))
-        experiment_folder = _scoped_experiment_folder(
-            os.environ.get(
-                "SGLANG_HTTP_WS_FROZEN_TRANSCRIPT_EXPERIMENT",
-                (
-                    "benchmark_http_ws_frozen_tool_transcript_compare_"
-                    f"{model.replace('/', '_')}"
-                ),
-            ),
-            backend_name,
-        )
         benchmark_context = _benchmark_context(
             benchmark_family="agentic_transcript_qos",
             run_class="http_vs_ws_frozen_tool_transcript_compare",
@@ -1778,7 +1730,6 @@ class TestResponsesFrozenToolTranscriptCompare:
             "router_url": gateway.base_url,
             "model": model,
             "samples": samples,
-            "experiment_folder": experiment_folder,
             "scenarios": [
                 {
                     "id": scenario.id,
@@ -1804,7 +1755,7 @@ class TestResponsesFrozenToolTranscriptCompare:
             "ratios": _frozen_transcript_transport_ratios(http_summary, ws_summary),
         }
 
-        _write_summary(experiment_folder, payload)
+        _maybe_write_summary("frozen_tool_transcript_compare", payload)
         ratios = payload["ratios"]
         print(f"\n{'=' * 70}")
         print(f"  Frozen Transcript Compare  |  model: {model}")

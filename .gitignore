@@ -177,13 +177,6 @@ benchmark/mmlu/data
 benchmark/mmlu/data.tar
 benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
-sgl-model-gateway/e2e_test/benchmark_ws_microbench_*/
-sgl-model-gateway/e2e_test/benchmark_http_ws_compare_*/
-sgl-model-gateway/e2e_test/benchmark_http_ws_chain_compare_*/
-sgl-model-gateway/e2e_test/benchmark_http_ws_tool_chain_compare_*/
-sgl-model-gateway/e2e_test/benchmark_http_ws_model_tool_chain_compare_*/
-sgl-model-gateway/e2e_test/benchmark_http_ws_model_tool_chain_diagnostic_*/
-sgl-model-gateway/e2e_test/benchmark_http_ws_bfcl_subset_compare_*/
 *.jsonl
 tmp*.txt
 /tmp/

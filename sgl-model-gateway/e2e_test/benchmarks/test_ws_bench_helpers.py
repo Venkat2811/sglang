@@ -1,7 +1,7 @@
 """Unit tests for WS benchmark helper functions.
 
-These tests validate the benchmark contract mapping, context construction,
-and experiment folder scoping logic without requiring GPU or model access.
+These tests validate the benchmark contract mapping and context construction
+logic without requiring GPU or model access.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ import pytest
 from benchmarks.test_ws_microbench import (
     _benchmark_context,
     _benchmark_contract,
-    _scoped_experiment_folder,
 )
 
 
@@ -56,9 +55,3 @@ def test_benchmark_context_rejects_unknown_backend():
             store_mode="store_false",
             workload_kind="single_turn_text",
         )
-
-
-def test_scoped_experiment_folder_uses_router_topology_suffix():
-    assert _scoped_experiment_folder("benchmark_http_ws_compare", "grpc") == (
-        "benchmark_http_ws_compare_regular_grpc_worker"
-    )

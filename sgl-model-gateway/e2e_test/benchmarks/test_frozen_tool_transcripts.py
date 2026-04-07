@@ -1,3 +1,5 @@
+"""Unit tests for the frozen tool transcript loader."""
+
 from __future__ import annotations
 
 import pytest

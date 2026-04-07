@@ -747,14 +747,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--result-file",
         type=str,
-        default="benchmark_router_multiturn_results.jsonl",
-        help="JSONL file for compact run summaries.",
+        default=None,
+        help="JSONL file for compact run summaries (omit to skip file output).",
     )
     parser.add_argument(
         "--summary-file",
         type=str,
-        default="benchmark_router_multiturn_summary.json",
-        help="JSON file for full run details.",
+        default=None,
+        help="JSON file for full run details (omit to skip file output).",
     )
     return parser.parse_args()
 
