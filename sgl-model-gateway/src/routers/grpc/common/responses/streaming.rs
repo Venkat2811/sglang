@@ -1,8 +1,10 @@
 //! Streaming infrastructure for /v1/responses endpoint
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{body::Body, extract::ws::Message, http::StatusCode, response::Response};
 use bytes::Bytes;
@@ -98,9 +100,7 @@ impl ResponseEventSink for SseResponseEventSink {
             let (_, delta_chars) = response_event_log_fields(event);
             debug!(
                 transport = "sse",
-                event_type,
-                delta_chars,
-                "forwarding responses stream event"
+                event_type, delta_chars, "forwarding responses stream event"
             );
         }
         let sse_message = format!("event: {}\ndata: {}\n\n", event_type, event_json);
@@ -178,9 +178,7 @@ impl ResponseEventSink for WsResponseEventSink {
         if should_log_response_event(event_type) {
             debug!(
                 transport = "ws",
-                event_type,
-                delta_chars,
-                "forwarding responses stream event"
+                event_type, delta_chars, "forwarding responses stream event"
             );
         }
         if self.tx.send(Message::Text(event_json.into())).is_err() {

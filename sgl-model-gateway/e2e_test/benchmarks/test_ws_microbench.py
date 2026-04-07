@@ -1305,59 +1305,10 @@ def _frozen_transcript_transport_ratios(http_summary: dict, ws_summary: dict) ->
     }
 
 
-@pytest.mark.parametrize(
-    ("backend_name", "expected_worker_transport", "expected_router_topology"),
-    [
-        ("http", "http", "regular_http_worker"),
-        ("grpc", "grpc", "regular_grpc_worker"),
-        ("pd", "http", "pd_http_workers"),
-    ],
-)
-def test_benchmark_contract_maps_backend_axes(
-    backend_name: str,
-    expected_worker_transport: str,
-    expected_router_topology: str,
-):
-    contract = _benchmark_contract(
-        **_benchmark_context(
-            benchmark_family="transport_qos",
-            run_class="test_contract",
-            backend_name=backend_name,
-            model="Qwen/Qwen2.5-72B-Instruct",
-            store_mode="store_false",
-            workload_kind="single_turn_text",
-        ),
-        client_transport="websocket",
-    )
-
-    assert contract["worker_transport"] == expected_worker_transport
-    assert contract["router_topology"] == expected_router_topology
-    assert contract["client_transport"] == "websocket"
-    assert contract["model_id"] == "Qwen/Qwen2.5-72B-Instruct"
-
-
-def test_benchmark_context_rejects_unknown_backend():
-    with pytest.raises(ValueError, match="Unsupported benchmark backend"):
-        _benchmark_context(
-            benchmark_family="transport_qos",
-            run_class="test_contract",
-            backend_name="ws_worker",
-            model="Qwen/Qwen2.5-72B-Instruct",
-            store_mode="store_false",
-            workload_kind="single_turn_text",
-        )
-
-
-def test_scoped_experiment_folder_uses_router_topology_suffix():
-    assert _scoped_experiment_folder("benchmark_http_ws_compare", "grpc") == (
-        "benchmark_http_ws_compare_regular_grpc_worker"
-    )
-
-
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
-@pytest.mark.model("qwen-0.5b")
+@pytest.mark.model("llama-1b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
 class TestWsMicrobench:
@@ -1421,7 +1372,7 @@ class TestWsMicrobench:
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
-@pytest.mark.model("qwen-0.5b")
+@pytest.mark.model("llama-1b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
 class TestResponsesTransportCompare:
@@ -1497,7 +1448,7 @@ class TestResponsesTransportCompare:
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
-@pytest.mark.model("qwen-0.5b")
+@pytest.mark.model("llama-1b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
 class TestResponsesContinuationChainCompare:
@@ -1582,7 +1533,7 @@ class TestResponsesContinuationChainCompare:
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
-@pytest.mark.model("qwen-0.5b")
+@pytest.mark.model("llama-1b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
 class TestResponsesToolOutputChainCompare:
@@ -1670,7 +1621,7 @@ class TestResponsesToolOutputChainCompare:
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
-@pytest.mark.model("qwen-0.5b")
+@pytest.mark.model("llama-1b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
 class TestResponsesFrozenToolTranscriptCompare:

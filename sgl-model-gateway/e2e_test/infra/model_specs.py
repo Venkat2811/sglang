@@ -39,24 +39,6 @@ MODEL_SPECS: dict[str, dict] = {
         "tp": 1,
         "features": ["chat", "streaming", "tool_choice"],
     },
-    # Public small model cached locally on many dev machines.
-    # Keep this as the preferred local smoke target for single 12 GB GPUs.
-    "qwen-0.5b": {
-        "model": _resolve_model_path("Qwen/Qwen2.5-0.5B-Instruct"),
-        "memory_gb": 2,
-        "tp": 1,
-        "features": ["chat", "streaming"],
-    },
-    # Single-GPU function-calling model that fits common 12 GB dev GPUs.
-    "qwen-3b": {
-        "model": _resolve_model_path("Qwen/Qwen2.5-3B-Instruct"),
-        "memory_gb": 6,
-        "tp": 1,
-        "features": ["chat", "streaming", "function_calling"],
-        "worker_args": [
-            "--context-length=1000"
-        ],  # Faster startup and enough for local tool-loop smoke.
-    },
     # Function calling specialist
     "qwen-7b": {
         "model": _resolve_model_path("Qwen/Qwen2.5-7B-Instruct"),
@@ -73,27 +55,6 @@ MODEL_SPECS: dict[str, dict] = {
         "worker_args": [
             "--context-length=1000"
         ],  # Faster startup, prevents memory issues
-    },
-    # Preferred production-readiness validation model on the B200 host.
-    "qwen-72b": {
-        "model": _resolve_model_path("Qwen/Qwen2.5-72B-Instruct"),
-        "memory_gb": 160,
-        "tp": 1,
-        "features": ["chat", "streaming", "function_calling", "pythonic_tools"],
-    },
-    # Two-GPU launch profile for the current RTX PRO Blackwell host.
-    "qwen-72b-tp2": {
-        "model": _resolve_model_path("Qwen/Qwen2.5-72B-Instruct"),
-        "memory_gb": 160,
-        "tp": 2,
-        "features": ["chat", "streaming", "function_calling", "pythonic_tools"],
-    },
-    # Cheap local chat benchmark target available on the current RTX PRO host.
-    "deepseek-lite": {
-        "model": _resolve_model_path("deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"),
-        "memory_gb": 40,
-        "tp": 1,
-        "features": ["chat", "streaming"],
     },
     # Reasoning model
     "deepseek-7b": {

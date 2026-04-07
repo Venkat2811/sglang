@@ -1,3 +1,10 @@
+"""Frozen tool-call transcript loader for transport comparison benchmarks.
+
+Provides dataclasses and a loader for pre-recorded multi-turn tool-call
+scenarios used to measure HTTP vs WebSocket continuation overhead without
+executing live tools.
+"""
+
 from __future__ import annotations
 
 import json

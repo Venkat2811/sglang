@@ -215,7 +215,7 @@ def _collect_http_event_types(client, model: str) -> list[str]:
 
 
 @pytest.mark.e2e
-@pytest.mark.model("qwen-0.5b")
+@pytest.mark.model("llama-1b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestResponsesLocalSmoke:
@@ -711,13 +711,13 @@ class TestResponsesLocalSmoke:
 
 
 @pytest.mark.e2e
-@pytest.mark.model("qwen-3b")
+@pytest.mark.model("qwen-7b")
 @pytest.mark.gateway(
     extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"]
 )
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestResponsesLocalToolSmoke:
-    """Single-GPU function-tool Responses smoke on qwen-3b."""
+    """Function-tool Responses smoke on qwen-7b."""
 
     def test_chat_streaming_function_call_first_turn(self, setup_backend):
         """Local chat streaming should surface qwen tool-call deltas before Responses adapts them."""
@@ -755,7 +755,7 @@ class TestResponsesLocalToolSmoke:
         assert finish_reason == "tool_calls"
 
     def test_http_responses_function_call_first_turn(self, setup_backend):
-        """The router should emit a real function call on qwen-3b locally."""
+        """The router should emit a real function call via qwen-7b."""
         _, model, client, _ = setup_backend
 
         resp = client.responses.create(

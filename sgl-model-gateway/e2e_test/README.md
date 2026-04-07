@@ -7,12 +7,12 @@ local iteration path on a single GPU should stay small and reproducible.
 
 Hardware target:
 
-- 1x RTX 3060 with 12 GB VRAM
+- Single GPU with ≥12 GB VRAM
 
 Environment:
 
 ```bash
-export HF_HOME=/home/venkat/.cache/huggingface
+export HF_HOME="${HOME}/.cache/huggingface"
 export SHOW_WORKER_LOGS=1
 export SHOW_ROUTER_LOGS=1
 ```
@@ -34,10 +34,10 @@ export ROUTER_LOCAL_MODEL_PATH=/path/to/local/model/root
 
 ## Small-Model Smoke Tests
 
-Preferred local smoke model:
+Preferred smoke models:
 
-- `qwen-0.5b` -> `Qwen/Qwen2.5-0.5B-Instruct`
-- `qwen-3b` -> `Qwen/Qwen2.5-3B-Instruct` for local function-calling work
+- `llama-1b` -> `meta-llama/Llama-3.2-1B-Instruct` for text-only tests
+- `qwen-7b` -> `Qwen/Qwen2.5-7B-Instruct` for function-calling tests
 
 Run the local Responses smoke tier:
 
@@ -84,7 +84,7 @@ export SGLANG_WS_BENCH_SAMPLES_PER_CONCURRENCY=2
 
 ## HTTP vs WS Comparison
 
-Run the apples-to-apples HTTP SSE versus WebSocket comparison on the same local
+Run the apples-to-apples HTTP SSE versus WebSocket comparison on the same
 prompt shape and model:
 
 ```bash
@@ -125,11 +125,9 @@ Notes:
 ## Notes
 
 - The larger default e2e models such as `llama-8b`, `qwen-14b`, and `gpt-oss`
-  are not intended to be the first green path on a 12 GB developer GPU.
-- `qwen-3b` is the best current local candidate for router-only transport and
-  continuation benchmarking on a single RTX 3060-class machine.
+  are not intended to be the first green path on a single mid-range developer GPU.
 - Keep the small-model smoke path green before expanding to heavier semantic
   or compatibility coverage.
 - Normal pytest exit now tears down the pooled local worker automatically.
 - If a run is hard-killed, kill stale `sglang.launch_server` processes before
-  rerunning if the 3060 appears unexpectedly full.
+  rerunning if the GPU appears unexpectedly full.

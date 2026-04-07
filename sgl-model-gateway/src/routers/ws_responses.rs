@@ -1,3 +1,10 @@
+//! WebSocket transport for the Responses API.
+//!
+//! Implements `GET /v1/responses` WebSocket upgrade handling at the router
+//! layer.  Each connection owns a single-entry response cache and allows one
+//! in-flight `response.create` at a time.  Connections are capped at a
+//! configurable lifetime (default 60 minutes) with ping/pong liveness checks.
+
 use std::{
     sync::{Arc, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -30,7 +37,12 @@ fn ws_message_event_type(message: &Message) -> String {
     match message {
         Message::Text(text) => serde_json::from_str::<Value>(text)
             .ok()
-            .and_then(|value| value.get("type").and_then(|value| value.as_str()).map(str::to_owned))
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            })
             .unwrap_or_else(|| "text".to_string()),
         Message::Binary(_) => "binary".to_string(),
         Message::Ping(_) => "ping".to_string(),
@@ -175,11 +187,11 @@ fn format_duration_label(duration: Duration) -> String {
         return pluralize(seconds as u128, "second");
     }
 
-    if seconds < 3_600 && seconds % 60 == 0 {
+    if seconds < 3_600 && seconds.is_multiple_of(60) {
         return pluralize((seconds / 60) as u128, "minute");
     }
 
-    if seconds % 3_600 == 0 {
+    if seconds.is_multiple_of(3_600) {
         return pluralize((seconds / 3_600) as u128, "hour");
     }
 

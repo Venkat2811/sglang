@@ -3,12 +3,10 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::{
-    protocols::{
-        responses::{
-            ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
-            ResponseStatus, ResponsesRequest, ResponsesResponse, ServiceTier,
-            StringOrContentParts, Truncation,
-        },
+    protocols::responses::{
+        ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
+        ResponseStatus, ResponsesRequest, ResponsesResponse, ServiceTier, StringOrContentParts,
+        Truncation,
     },
     routers::{
         grpc::{
@@ -118,9 +116,9 @@ fn build_incremental_items(item_count: usize, text_bytes: usize) -> Vec<Response
         if index % 2 == 0 {
             items.push(ResponseInputOutputItem::SimpleInputMessage {
                 role: "user".to_string(),
-                content: StringOrContentParts::Array(vec![
-                    ResponseContentPart::InputText { text: text.clone() },
-                ]),
+                content: StringOrContentParts::Array(vec![ResponseContentPart::InputText {
+                    text: text.clone(),
+                }]),
                 r#type: None,
             });
         } else {
@@ -144,7 +142,11 @@ fn make_incremental_request(item_count: usize, text_bytes: usize) -> ResponsesRe
     }
 }
 
-fn emit_text_stream_batch(sink: &impl ResponseEventSink, delta_events: usize, delta_bytes: usize) -> usize {
+fn emit_text_stream_batch(
+    sink: &impl ResponseEventSink,
+    delta_events: usize,
+    delta_bytes: usize,
+) -> usize {
     let delta = repeated_text(delta_bytes);
     let mut emitter = ResponseStreamEventEmitter::new(
         "resp_bench_stream".to_string(),

@@ -1,3 +1,8 @@
+//! Shared request validation for the Responses API.
+//!
+//! Provides input normalization and validation that is shared across both the
+//! HTTP and WebSocket Responses paths.
+
 use axum::{
     extract::{rejection::JsonRejection, FromRequest, Request},
     http::StatusCode,

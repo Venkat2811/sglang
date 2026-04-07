@@ -11,9 +11,9 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use axum::extract::ws::Message;
 use axum::{
     body::Body,
+    extract::ws::Message,
     http::{self, header, StatusCode},
     response::Response,
 };
@@ -1284,6 +1284,113 @@ struct ChatResponseAccumulator {
     usage: Option<Usage>,
 }
 
+impl ChatResponseAccumulator {
+    fn new() -> Self {
+        Self {
+            id: String::new(),
+            model: String::new(),
+            content: String::new(),
+            reasoning_content: None,
+            tool_calls: HashMap::new(),
+            finish_reason: None,
+            usage: None,
+        }
+    }
+
+    fn process_chunk(&mut self, chunk: &ChatCompletionStreamResponse) {
+        if !chunk.id.is_empty() {
+            self.id = chunk.id.clone();
+        }
+        if !chunk.model.is_empty() {
+            self.model = chunk.model.clone();
+        }
+
+        if let Some(choice) = chunk.choices.first() {
+            // Accumulate content
+            if let Some(content) = &choice.delta.content {
+                self.content.push_str(content);
+            }
+
+            // Accumulate reasoning content
+            if let Some(reasoning) = &choice.delta.reasoning_content {
+                self.reasoning_content
+                    .get_or_insert_with(String::new)
+                    .push_str(reasoning);
+            }
+
+            // Accumulate tool calls
+            if let Some(tool_call_deltas) = &choice.delta.tool_calls {
+                for delta in tool_call_deltas {
+                    let index = delta.index as usize;
+                    let entry = self.tool_calls.entry(index).or_insert_with(|| ToolCall {
+                        id: String::new(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCallResponse {
+                            name: String::new(),
+                            arguments: Some(String::new()),
+                        },
+                    });
+
+                    if let Some(id) = &delta.id {
+                        entry.id = id.clone();
+                    }
+                    if let Some(function) = &delta.function {
+                        if let Some(name) = &function.name {
+                            entry.function.name = name.clone();
+                        }
+                        if let Some(args) = &function.arguments {
+                            if let Some(ref mut existing_args) = entry.function.arguments {
+                                existing_args.push_str(args);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Capture finish reason
+            if let Some(reason) = &choice.finish_reason {
+                self.finish_reason = Some(reason.clone());
+            }
+        }
+
+        // Update usage
+        if let Some(usage) = &chunk.usage {
+            self.usage = Some(usage.clone());
+        }
+    }
+
+    fn finalize(self) -> ChatCompletionResponse {
+        let mut tool_calls_vec: Vec<_> = self.tool_calls.into_iter().collect();
+        tool_calls_vec.sort_by_key(|(index, _)| *index);
+        let tool_calls: Vec<_> = tool_calls_vec.into_iter().map(|(_, call)| call).collect();
+
+        ChatCompletionResponse::builder(&self.id, &self.model)
+            .choices(vec![ChatChoice {
+                index: 0,
+                message: ChatCompletionMessage {
+                    role: "assistant".to_string(),
+                    content: if self.content.is_empty() {
+                        None
+                    } else {
+                        Some(self.content)
+                    },
+                    tool_calls: if tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(tool_calls)
+                    },
+                    reasoning_content: self.reasoning_content,
+                },
+                finish_reason: self.finish_reason,
+                logprobs: None,
+                matched_stop: None,
+                hidden_states: None,
+            }])
+            .maybe_usage(self.usage)
+            .build()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -1552,112 +1659,5 @@ mod tests {
             serialized_output["arguments"],
             "{\"expression\":\"42 * 17\"}"
         );
-    }
-}
-
-impl ChatResponseAccumulator {
-    fn new() -> Self {
-        Self {
-            id: String::new(),
-            model: String::new(),
-            content: String::new(),
-            reasoning_content: None,
-            tool_calls: HashMap::new(),
-            finish_reason: None,
-            usage: None,
-        }
-    }
-
-    fn process_chunk(&mut self, chunk: &ChatCompletionStreamResponse) {
-        if !chunk.id.is_empty() {
-            self.id = chunk.id.clone();
-        }
-        if !chunk.model.is_empty() {
-            self.model = chunk.model.clone();
-        }
-
-        if let Some(choice) = chunk.choices.first() {
-            // Accumulate content
-            if let Some(content) = &choice.delta.content {
-                self.content.push_str(content);
-            }
-
-            // Accumulate reasoning content
-            if let Some(reasoning) = &choice.delta.reasoning_content {
-                self.reasoning_content
-                    .get_or_insert_with(String::new)
-                    .push_str(reasoning);
-            }
-
-            // Accumulate tool calls
-            if let Some(tool_call_deltas) = &choice.delta.tool_calls {
-                for delta in tool_call_deltas {
-                    let index = delta.index as usize;
-                    let entry = self.tool_calls.entry(index).or_insert_with(|| ToolCall {
-                        id: String::new(),
-                        tool_type: "function".to_string(),
-                        function: FunctionCallResponse {
-                            name: String::new(),
-                            arguments: Some(String::new()),
-                        },
-                    });
-
-                    if let Some(id) = &delta.id {
-                        entry.id = id.clone();
-                    }
-                    if let Some(function) = &delta.function {
-                        if let Some(name) = &function.name {
-                            entry.function.name = name.clone();
-                        }
-                        if let Some(args) = &function.arguments {
-                            if let Some(ref mut existing_args) = entry.function.arguments {
-                                existing_args.push_str(args);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Capture finish reason
-            if let Some(reason) = &choice.finish_reason {
-                self.finish_reason = Some(reason.clone());
-            }
-        }
-
-        // Update usage
-        if let Some(usage) = &chunk.usage {
-            self.usage = Some(usage.clone());
-        }
-    }
-
-    fn finalize(self) -> ChatCompletionResponse {
-        let mut tool_calls_vec: Vec<_> = self.tool_calls.into_iter().collect();
-        tool_calls_vec.sort_by_key(|(index, _)| *index);
-        let tool_calls: Vec<_> = tool_calls_vec.into_iter().map(|(_, call)| call).collect();
-
-        ChatCompletionResponse::builder(&self.id, &self.model)
-            .choices(vec![ChatChoice {
-                index: 0,
-                message: ChatCompletionMessage {
-                    role: "assistant".to_string(),
-                    content: if self.content.is_empty() {
-                        None
-                    } else {
-                        Some(self.content)
-                    },
-                    tool_calls: if tool_calls.is_empty() {
-                        None
-                    } else {
-                        Some(tool_calls)
-                    },
-                    reasoning_content: self.reasoning_content,
-                },
-                finish_reason: self.finish_reason,
-                logprobs: None,
-                matched_stop: None,
-                hidden_states: None,
-            }])
-            .maybe_usage(self.usage)
-            .build()
     }
 }

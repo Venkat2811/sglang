@@ -1133,9 +1133,9 @@ async fn test_v1_responses_ws_same_connection_store_false_continuation_completes
 #[tokio::test]
 async fn test_v1_responses_ws_allows_immediate_follow_up_after_completed_event() {
     let url = serve_app(
-        build_stub_app(Arc::new(DelayedReturnWsExecutor::new(Duration::from_millis(
-            20,
-        ))))
+        build_stub_app(Arc::new(DelayedReturnWsExecutor::new(
+            Duration::from_millis(20),
+        )))
         .await,
     )
     .await;

@@ -1,3 +1,5 @@
+"""Unit tests for the router Responses benchmark adapter."""
+
 from __future__ import annotations
 
 from argparse import Namespace

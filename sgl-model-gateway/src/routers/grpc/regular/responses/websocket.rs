@@ -1,3 +1,9 @@
+//! WebSocket executor for the gRPC regular Responses backend.
+//!
+//! Bridges the transport-neutral [`WsResponsesExecutor`] trait to the existing
+//! gRPC regular Responses streaming pipeline so that WebSocket connections
+//! reuse the same event-emission, storage, and persistence logic as HTTP SSE.
+
 use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
@@ -276,8 +282,9 @@ impl WsClientErrorExt for WsClientError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use axum::{body::Body, http::StatusCode, response::IntoResponse};
+
+    use super::*;
 
     #[tokio::test]
     async fn test_response_to_ws_error_preserves_router_error_body_message() {

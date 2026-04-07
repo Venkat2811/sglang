@@ -8,13 +8,21 @@ fn bench_frame_emission(c: &mut Criterion) {
         let label = format!("{delta_events}x{delta_bytes}");
         group.throughput(Throughput::Bytes((delta_events * delta_bytes) as u64));
 
-        group.bench_with_input(BenchmarkId::new("ws", &label), &(delta_events, delta_bytes), |b, &(events, bytes)| {
-            b.iter(|| black_box(bench_support::bench_emit_ws_text_stream(events, bytes)));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("ws", &label),
+            &(delta_events, delta_bytes),
+            |b, &(events, bytes)| {
+                b.iter(|| black_box(bench_support::bench_emit_ws_text_stream(events, bytes)));
+            },
+        );
 
-        group.bench_with_input(BenchmarkId::new("sse", &label), &(delta_events, delta_bytes), |b, &(events, bytes)| {
-            b.iter(|| black_box(bench_support::bench_emit_sse_text_stream(events, bytes)));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("sse", &label),
+            &(delta_events, delta_bytes),
+            |b, &(events, bytes)| {
+                b.iter(|| black_box(bench_support::bench_emit_sse_text_stream(events, bytes)));
+            },
+        );
     }
 
     group.finish();
@@ -24,9 +32,13 @@ fn bench_cached_continuation(c: &mut Criterion) {
     let mut group = c.benchmark_group("cached_continuation_shape");
 
     for history_turns in [4usize, 16, 64] {
-        group.bench_with_input(BenchmarkId::new("cached_to_items", history_turns), &history_turns, |b, &turns| {
-            b.iter(|| black_box(bench_support::bench_cached_response_to_items(turns, 256)));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("cached_to_items", history_turns),
+            &history_turns,
+            |b, &turns| {
+                b.iter(|| black_box(bench_support::bench_cached_response_to_items(turns, 256)));
+            },
+        );
 
         group.bench_with_input(
             BenchmarkId::new("cache_hit_merge", history_turns),
@@ -48,9 +60,17 @@ fn bench_incremental_input_shaping(c: &mut Criterion) {
     let mut group = c.benchmark_group("incremental_input_shaping");
 
     for item_count in [8usize, 32, 128, 512] {
-        group.bench_with_input(BenchmarkId::new("normalize_items", item_count), &item_count, |b, &count| {
-            b.iter(|| black_box(bench_support::bench_normalize_incremental_request(count, 256)));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("normalize_items", item_count),
+            &item_count,
+            |b, &count| {
+                b.iter(|| {
+                    black_box(bench_support::bench_normalize_incremental_request(
+                        count, 256,
+                    ))
+                });
+            },
+        );
     }
 
     group.finish();

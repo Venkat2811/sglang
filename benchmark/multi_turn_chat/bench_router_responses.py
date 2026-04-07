@@ -1,3 +1,9 @@
+"""Multi-turn Responses API benchmark for sgl-model-gateway.
+
+Measures per-turn latency over HTTP SSE and WebSocket transports against a
+running gateway, reusing the existing multi-turn workload generator.
+"""
+
 from __future__ import annotations
 
 import argparse
