@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 import openai
 import pytest
@@ -61,6 +62,9 @@ CALCULATE_CHAT_TOOL = {
         },
     },
 }
+
+_TEXT_SMOKE_MODEL = os.environ.get("SGLANG_TEXT_SMOKE_MODEL", "llama-1b")
+_TOOL_SMOKE_MODEL = os.environ.get("SGLANG_TOOL_SMOKE_MODEL", "qwen-7b")
 
 
 def _gateway_ws_url(base_url: str) -> str:
@@ -215,7 +219,7 @@ def _collect_http_event_types(client, model: str) -> list[str]:
 
 
 @pytest.mark.e2e
-@pytest.mark.model("llama-1b")
+@pytest.mark.model(_TEXT_SMOKE_MODEL)
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestResponsesLocalSmoke:
@@ -711,7 +715,7 @@ class TestResponsesLocalSmoke:
 
 
 @pytest.mark.e2e
-@pytest.mark.model("qwen-7b")
+@pytest.mark.model(_TOOL_SMOKE_MODEL)
 @pytest.mark.gateway(
     extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"]
 )

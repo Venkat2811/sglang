@@ -24,10 +24,21 @@ from benchmarks.frozen_tool_transcripts import load_frozen_tool_transcript_scena
 
 logger = logging.getLogger(__name__)
 
+# Allow CI and local CI-equivalent runs to swap this test model without editing code.
+# Default remains the original 1B model for parity with the plan, but this can be
+# overridden to any model id from MODEL_SPECS for environments without access.
+_WS_BENCHMARK_MODEL = os.environ.get(
+    "SGLANG_WS_BENCHMARK_MODEL", "llama-1b"
+)
+
 FROZEN_TOOL_TRANSCRIPT_RESULT_INSTRUCTIONS = (
     "The tool result has already been provided as structured context. "
     "Answer briefly using that result and do not call any tools."
 )
+
+# WebSocket benchmark coverage is scoped to grpc worker backends in the current
+# router configuration (responses WS is not supported over HTTP-backend worker links).
+_WS_BENCH_BACKENDS = ["grpc"]
 
 
 def _gateway_ws_url(base_url: str) -> str:
@@ -1143,6 +1154,64 @@ def _write_summary(experiment_folder: str, payload: dict) -> Path:
     return out_path
 
 
+def _print_transport_table(
+    label: str,
+    model: str,
+    http_summary: dict,
+    ws_summary: dict,
+    ratios: dict,
+) -> None:
+    """Print a formatted HTTP-vs-WS comparison table to stdout."""
+    rows = [
+        ("First Event (p50 ms)", "request_to_first_event_ms_p50"),
+        ("First Content (p50 ms)", "request_to_first_content_ms_p50"),
+        ("Completed (p50 ms)", "request_to_completed_ms_p50"),
+        ("Output tok/s (mean)", "output_tokens_per_second_mean"),
+    ]
+    hdr = f"\n{'=' * 70}\n  {label}  |  model: {model}\n{'=' * 70}"
+    print(hdr)
+    print(f"  {'Metric':<28} {'HTTP SSE':>12} {'WebSocket':>12} {'WS/HTTP':>10}")
+    print(f"  {'-' * 62}")
+    for name, key in rows:
+        h = http_summary.get(key, 0)
+        w = ws_summary.get(key, 0)
+        r = w / h if h > 0 else 0.0
+        print(f"  {name:<28} {h:>12.2f} {w:>12.2f} {r:>10.3f}")
+    print(f"  {'-' * 62}")
+    print(f"  Samples: {int(http_summary.get('samples', 0))}")
+    print(f"{'=' * 70}\n")
+
+
+def _print_chain_table(
+    label: str,
+    model: str,
+    http_summary: dict,
+    ws_summary: dict,
+    ratios: dict,
+) -> None:
+    """Print a formatted chain comparison table to stdout."""
+    rows = [
+        ("Total Chain (p50 ms)", "total_chain_ms_p50"),
+        ("First Turn (p50 ms)", "first_turn_completed_ms_p50"),
+        ("Continuation Only (p50 ms)", "continuation_only_total_ms_p50"),
+    ]
+    hdr = f"\n{'=' * 70}\n  {label}  |  model: {model}\n{'=' * 70}"
+    print(hdr)
+    print(f"  {'Metric':<28} {'HTTP SSE':>12} {'WebSocket':>12} {'WS/HTTP':>10}")
+    print(f"  {'-' * 62}")
+    for name, key in rows:
+        h = http_summary.get(key, 0)
+        w = ws_summary.get(key, 0)
+        r = w / h if h > 0 else 0.0
+        print(f"  {name:<28} {h:>12.2f} {w:>12.2f} {r:>10.3f}")
+    print(f"  {'-' * 62}")
+    delta_key = "ws_total_chain_delta_pct"
+    if delta_key in ratios:
+        print(f"  WS total chain delta: {ratios[delta_key]:+.2f}%")
+    print(f"  Samples: {int(http_summary.get('samples', 0))}")
+    print(f"{'=' * 70}\n")
+
+
 def _worker_transport_for_backend(backend_name: str) -> str:
     if backend_name == "http":
         return "http"
@@ -1308,9 +1377,9 @@ def _frozen_transcript_transport_ratios(http_summary: dict, ws_summary: dict) ->
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
-@pytest.mark.model("llama-1b")
+@pytest.mark.model(_WS_BENCHMARK_MODEL)
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
-@pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
+@pytest.mark.parametrize("setup_backend", _WS_BENCH_BACKENDS, indirect=True)
 class TestWsMicrobench:
     """WebSocket benchmark for the Responses route on a single small model."""
 
@@ -1358,8 +1427,19 @@ class TestWsMicrobench:
         payload["model"] = model
         payload["experiment_folder"] = experiment_folder
 
-        summary_path = _write_summary(experiment_folder, payload)
-        logger.info("WS microbenchmark summary written to %s", summary_path)
+        _write_summary(experiment_folder, payload)
+        print(f"\n{'=' * 50}")
+        print(f"  WS Microbenchmark  |  model: {model}")
+        print(f"{'=' * 50}")
+        for profile in payload.get("profiles", []):
+            c = profile.get("concurrency", "?")
+            s = profile.get("summary", {})
+            print(
+                f"  concurrency={c}  "
+                f"first_event_p50={s.get('request_to_first_event_ms_p50', 0):.1f}ms  "
+                f"completed_p50={s.get('request_to_completed_ms_p50', 0):.1f}ms"
+            )
+        print(f"{'=' * 50}\n")
 
         for result in payload["results"]:
             summary = result["summary"]
@@ -1372,9 +1452,9 @@ class TestWsMicrobench:
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
-@pytest.mark.model("llama-1b")
+@pytest.mark.model(_WS_BENCHMARK_MODEL)
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
-@pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
+@pytest.mark.parametrize("setup_backend", _WS_BENCH_BACKENDS, indirect=True)
 class TestResponsesTransportCompare:
     """Small-model transport comparison for HTTP SSE vs WebSocket Responses."""
 
@@ -1434,8 +1514,14 @@ class TestResponsesTransportCompare:
             "ratios": _transport_ratios(http_summary, ws_summary),
         }
 
-        summary_path = _write_summary(experiment_folder, payload)
-        logger.info("HTTP-vs-WS transport comparison summary written to %s", summary_path)
+        _write_summary(experiment_folder, payload)
+        _print_transport_table(
+            "HTTP vs WS Transport Compare",
+            model,
+            http_summary,
+            ws_summary,
+            payload["ratios"],
+        )
 
         assert http_summary["samples"] > 0
         assert ws_summary["samples"] > 0
@@ -1448,9 +1534,9 @@ class TestResponsesTransportCompare:
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
-@pytest.mark.model("llama-1b")
+@pytest.mark.model(_WS_BENCHMARK_MODEL)
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
-@pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
+@pytest.mark.parametrize("setup_backend", _WS_BENCH_BACKENDS, indirect=True)
 class TestResponsesContinuationChainCompare:
     """Long-chain continuation comparison for HTTP vs persistent WS."""
 
@@ -1521,8 +1607,14 @@ class TestResponsesContinuationChainCompare:
             "ratios": _chain_transport_ratios(http_summary, ws_summary),
         }
 
-        summary_path = _write_summary(experiment_folder, payload)
-        logger.info("HTTP-vs-WS chain comparison summary written to %s", summary_path)
+        _write_summary(experiment_folder, payload)
+        _print_chain_table(
+            "Continuation Chain Compare",
+            model,
+            http_summary,
+            ws_summary,
+            payload["ratios"],
+        )
 
         assert http_samples[0]["turns"] == turns
         assert ws_samples[0]["turns"] == turns
@@ -1533,9 +1625,9 @@ class TestResponsesContinuationChainCompare:
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
-@pytest.mark.model("llama-1b")
+@pytest.mark.model(_WS_BENCHMARK_MODEL)
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
-@pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
+@pytest.mark.parametrize("setup_backend", _WS_BENCH_BACKENDS, indirect=True)
 class TestResponsesToolOutputChainCompare:
     """Tool-output-heavy continuation comparison for HTTP vs persistent WS."""
 
@@ -1606,10 +1698,13 @@ class TestResponsesToolOutputChainCompare:
             "ratios": _chain_transport_ratios(http_summary, ws_summary),
         }
 
-        summary_path = _write_summary(experiment_folder, payload)
-        logger.info(
-            "HTTP-vs-WS tool-output chain comparison summary written to %s",
-            summary_path,
+        _write_summary(experiment_folder, payload)
+        _print_chain_table(
+            "Tool-Output Chain Compare",
+            model,
+            http_summary,
+            ws_summary,
+            payload["ratios"],
         )
 
         assert http_samples[0]["tool_turns"] == tool_turns
@@ -1621,9 +1716,9 @@ class TestResponsesToolOutputChainCompare:
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.thread_unsafe(reason="Benchmark timing is only meaningful sequentially.")
-@pytest.mark.model("llama-1b")
+@pytest.mark.model(_WS_BENCHMARK_MODEL)
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
-@pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
+@pytest.mark.parametrize("setup_backend", _WS_BENCH_BACKENDS, indirect=True)
 class TestResponsesFrozenToolTranscriptCompare:
     """Dataset-driven tool-output continuations for HTTP SSE vs persistent WS."""
 
@@ -1709,11 +1804,26 @@ class TestResponsesFrozenToolTranscriptCompare:
             "ratios": _frozen_transcript_transport_ratios(http_summary, ws_summary),
         }
 
-        summary_path = _write_summary(experiment_folder, payload)
-        logger.info(
-            "HTTP-vs-WS frozen transcript comparison summary written to %s",
-            summary_path,
-        )
+        _write_summary(experiment_folder, payload)
+        ratios = payload["ratios"]
+        print(f"\n{'=' * 70}")
+        print(f"  Frozen Transcript Compare  |  model: {model}")
+        print(f"{'=' * 70}")
+        print(f"  {'Metric':<28} {'HTTP SSE':>12} {'WebSocket':>12} {'WS/HTTP':>10}")
+        print(f"  {'-' * 62}")
+        for name, key in [
+            ("Total Suite (p50 ms)", "total_suite_ms_p50"),
+            ("First Event (p50 ms)", "request_to_first_event_ms_p50"),
+            ("Completed (p50 ms)", "request_to_completed_ms_p50"),
+        ]:
+            h = float(http_summary.get(key, 0))
+            w = float(ws_summary.get(key, 0))
+            r = w / h if h > 0 else 0.0
+            print(f"  {name:<28} {h:>12.2f} {w:>12.2f} {r:>10.3f}")
+        print(f"  {'-' * 62}")
+        delta = ratios.get("ws_vs_http_total_suite_delta_pct", 0)
+        print(f"  WS suite delta: {delta:+.2f}%  |  Scenarios: {len(scenarios)}")
+        print(f"{'=' * 70}\n")
 
         assert payload["scenarios"]
         assert int(http_summary["turns"]) > 0
