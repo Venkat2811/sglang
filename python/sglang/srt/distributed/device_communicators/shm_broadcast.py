@@ -3,6 +3,8 @@
 import logging
 import os
 import pickle
+import json
+import socket
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -27,7 +29,44 @@ logger = logging.getLogger(__name__)
 
 # ── Myelon IPC Instrumentation ──────────────────────────────────────────
 _MYELON_INSTRUMENT = os.environ.get("MYELON_INSTRUMENT", "0") == "1"
+_MYELON_INSTRUMENT_JSONL = os.environ.get("MYELON_INSTRUMENT_JSONL", "").strip()
+_MYELON_INSTRUMENT_TAG = os.environ.get("MYELON_INSTRUMENT_TAG", "").strip()
+_MYELON_INSTRUMENT_TOPN = int(os.environ.get("MYELON_INSTRUMENT_TOPN", "8"))
 _perf_ns = time.perf_counter_ns
+
+
+def _append_jsonl(path: str, record: dict) -> None:
+    if not path:
+        return
+    payload = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+
+
+def _payload_signature(obj) -> str:
+    obj_type = type(obj)
+    type_name = f"{obj_type.__module__}.{obj_type.__qualname__}"
+    try:
+        if isinstance(obj, list):
+            head = type(obj[0]).__qualname__ if obj else "empty"
+            return f"{type_name}[len={len(obj)},head={head}]"
+        if isinstance(obj, tuple):
+            head = type(obj[0]).__qualname__ if obj else "empty"
+            return f"{type_name}[len={len(obj)},head={head}]"
+        if isinstance(obj, dict):
+            return f"{type_name}[len={len(obj)}]"
+        if isinstance(obj, (bytes, bytearray, memoryview)):
+            return f"{type_name}[len={len(obj)}]"
+        if hasattr(obj, "shape"):
+            return f"{type_name}[shape={getattr(obj, 'shape', None)}]"
+        if hasattr(obj, "__len__") and not isinstance(obj, str):
+            return f"{type_name}[len={len(obj)}]"
+    except Exception:
+        pass
+    return type_name
 
 
 class _MyelonIpcStats:
@@ -37,36 +76,71 @@ class _MyelonIpcStats:
 
     __slots__ = (
         "name",
+        "pid", "hostname", "queue_config", "tag", "dumped",
         # enqueue (writer) stats
         "enq_count", "enq_total_ns", "enq_max_ns", "enq_min_ns",
+        "enq_inline_count", "enq_remote_send_count",
         "pickle_total_ns", "pickle_max_ns",
-        "shm_write_total_ns", "shm_write_max_ns",
-        "zmq_send_total_ns", "zmq_send_max_ns",
-        "enq_bytes_total", "enq_bytes_max",
+        "shm_write_total_ns", "shm_write_max_ns", "shm_write_count",
+        "zmq_send_total_ns", "zmq_send_max_ns", "zmq_send_count",
+        "enq_bytes_total", "enq_bytes_max", "enq_bytes_min",
         "enq_overflow_count",
         # dequeue (reader) stats
         "deq_count", "deq_total_ns", "deq_max_ns", "deq_min_ns",
-        "shm_read_total_ns", "shm_read_max_ns",
-        "zmq_recv_total_ns", "zmq_recv_max_ns",
+        "deq_inline_count", "deq_zmq_count",
+        "shm_read_total_ns", "shm_read_max_ns", "shm_read_count",
+        "zmq_recv_total_ns", "zmq_recv_max_ns", "zmq_recv_count",
         "unpickle_total_ns", "unpickle_max_ns",
-        "deq_bytes_total", "deq_bytes_max",
+        "deq_bytes_total", "deq_bytes_max", "deq_bytes_min",
+        "deq_bytes_known_count",
         # acquire contention
         "write_wait_total_ns", "write_wait_max_ns", "write_wait_count",
         "read_wait_total_ns", "read_wait_max_ns", "read_wait_count",
+        # payload classification
+        "payload_type_counts",
+        "payload_type_max_bytes",
+        "payload_type_overflow_counts",
     )
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, queue_config: Optional[dict] = None):
         self.name = name
+        self.pid = os.getpid()
+        self.hostname = socket.gethostname()
+        self.queue_config = queue_config or {}
+        self.tag = _MYELON_INSTRUMENT_TAG
+        self.dumped = False
+        self.payload_type_counts = {}
+        self.payload_type_max_bytes = {}
+        self.payload_type_overflow_counts = {}
         for slot in self.__slots__:
-            if slot == "name":
+            if slot in {
+                "name",
+                "pid",
+                "hostname",
+                "queue_config",
+                "tag",
+                "dumped",
+                "payload_type_counts",
+                "payload_type_max_bytes",
+                "payload_type_overflow_counts",
+            }:
                 continue
             if "min" in slot:
                 setattr(self, slot, 2**63)
             else:
                 setattr(self, slot, 0)
 
-    def record_enqueue(self, total_ns, pickle_ns, transport_ns,
-                       payload_bytes, is_overflow, wait_ns=0):
+    def record_enqueue(
+        self,
+        total_ns,
+        pickle_ns,
+        transport_ns,
+        payload_bytes,
+        is_overflow,
+        wait_ns=0,
+        obj_type: Optional[str] = None,
+        sent_remote: bool = False,
+    ):
         self.enq_count += 1
         self.enq_total_ns += total_ns
         if total_ns > self.enq_max_ns:
@@ -81,21 +155,47 @@ class _MyelonIpcStats:
             if transport_ns > self.zmq_send_max_ns:
                 self.zmq_send_max_ns = transport_ns
             self.enq_overflow_count += 1
+            self.zmq_send_count += 1
         else:
             self.shm_write_total_ns += transport_ns
             if transport_ns > self.shm_write_max_ns:
                 self.shm_write_max_ns = transport_ns
+            self.shm_write_count += 1
+            self.enq_inline_count += 1
+        if sent_remote:
+            self.enq_remote_send_count += 1
         self.enq_bytes_total += payload_bytes
         if payload_bytes > self.enq_bytes_max:
             self.enq_bytes_max = payload_bytes
+        if payload_bytes < self.enq_bytes_min:
+            self.enq_bytes_min = payload_bytes
         if wait_ns > 0:
             self.write_wait_total_ns += wait_ns
             if wait_ns > self.write_wait_max_ns:
                 self.write_wait_max_ns = wait_ns
             self.write_wait_count += 1
+        if obj_type:
+            self.payload_type_counts[obj_type] = (
+                self.payload_type_counts.get(obj_type, 0) + 1
+            )
+            self.payload_type_max_bytes[obj_type] = max(
+                payload_bytes,
+                self.payload_type_max_bytes.get(obj_type, 0),
+            )
+            if is_overflow:
+                self.payload_type_overflow_counts[obj_type] = (
+                    self.payload_type_overflow_counts.get(obj_type, 0) + 1
+                )
 
-    def record_dequeue(self, total_ns, transport_ns, unpickle_ns,
-                       payload_bytes, is_zmq, wait_ns=0):
+    def record_dequeue(
+        self,
+        total_ns,
+        transport_ns,
+        unpickle_ns,
+        payload_bytes,
+        is_zmq,
+        wait_ns=0,
+    ):
         self.deq_count += 1
         self.deq_total_ns += total_ns
         if total_ns > self.deq_max_ns:
@@ -106,16 +206,24 @@ class _MyelonIpcStats:
             self.zmq_recv_total_ns += transport_ns
             if transport_ns > self.zmq_recv_max_ns:
                 self.zmq_recv_max_ns = transport_ns
+            self.zmq_recv_count += 1
+            self.deq_zmq_count += 1
         else:
             self.shm_read_total_ns += transport_ns
             if transport_ns > self.shm_read_max_ns:
                 self.shm_read_max_ns = transport_ns
+            self.shm_read_count += 1
+            self.deq_inline_count += 1
         self.unpickle_total_ns += unpickle_ns
         if unpickle_ns > self.unpickle_max_ns:
             self.unpickle_max_ns = unpickle_ns
-        self.deq_bytes_total += payload_bytes
-        if payload_bytes > self.deq_bytes_max:
-            self.deq_bytes_max = payload_bytes
+        if payload_bytes is not None:
+            self.deq_bytes_total += payload_bytes
+            if payload_bytes > self.deq_bytes_max:
+                self.deq_bytes_max = payload_bytes
+            if payload_bytes < self.deq_bytes_min:
+                self.deq_bytes_min = payload_bytes
+            self.deq_bytes_known_count += 1
         if wait_ns > 0:
             self.read_wait_total_ns += wait_ns
             if wait_ns > self.read_wait_max_ns:
@@ -133,9 +241,88 @@ class _MyelonIpcStats:
     def _avg(self, total, count):
         return total // count if count > 0 else 0
 
+    def _top_payload_types(self):
+        rows = []
+        for obj_type, count in self.payload_type_counts.items():
+            rows.append(
+                {
+                    "type": obj_type,
+                    "count": count,
+                    "max_bytes": self.payload_type_max_bytes.get(obj_type, 0),
+                    "overflow_count": self.payload_type_overflow_counts.get(obj_type, 0),
+                }
+            )
+        rows.sort(
+            key=lambda row: (
+                row["overflow_count"],
+                row["max_bytes"],
+                row["count"],
+                row["type"],
+            ),
+            reverse=True,
+        )
+        return rows[:_MYELON_INSTRUMENT_TOPN]
+
+    def as_dict(self):
+        a = self._avg
+        return {
+            "kind": "myelon_ipc_stats",
+            "tag": self.tag,
+            "name": self.name,
+            "pid": self.pid,
+            "hostname": self.hostname,
+            "queue_config": self.queue_config,
+            "enqueue": {
+                "count": self.enq_count,
+                "inline_count": self.enq_inline_count,
+                "overflow_count": self.enq_overflow_count,
+                "remote_send_count": self.enq_remote_send_count,
+                "avg_ns": a(self.enq_total_ns, self.enq_count),
+                "min_ns": 0 if self.enq_count == 0 else self.enq_min_ns,
+                "max_ns": self.enq_max_ns,
+                "pickle_avg_ns": a(self.pickle_total_ns, self.enq_count),
+                "pickle_max_ns": self.pickle_max_ns,
+                "shm_write_avg_ns": a(self.shm_write_total_ns, self.shm_write_count),
+                "shm_write_max_ns": self.shm_write_max_ns,
+                "zmq_send_avg_ns": a(self.zmq_send_total_ns, self.zmq_send_count),
+                "zmq_send_max_ns": self.zmq_send_max_ns,
+                "payload_avg_bytes": a(self.enq_bytes_total, self.enq_count),
+                "payload_min_bytes": 0 if self.enq_count == 0 else self.enq_bytes_min,
+                "payload_max_bytes": self.enq_bytes_max,
+                "write_wait_avg_ns": a(self.write_wait_total_ns, self.write_wait_count),
+                "write_wait_max_ns": self.write_wait_max_ns,
+                "write_wait_count": self.write_wait_count,
+            },
+            "dequeue": {
+                "count": self.deq_count,
+                "inline_count": self.deq_inline_count,
+                "zmq_count": self.deq_zmq_count,
+                "avg_ns": a(self.deq_total_ns, self.deq_count),
+                "min_ns": 0 if self.deq_count == 0 else self.deq_min_ns,
+                "max_ns": self.deq_max_ns,
+                "shm_read_avg_ns": a(self.shm_read_total_ns, self.shm_read_count),
+                "shm_read_max_ns": self.shm_read_max_ns,
+                "zmq_recv_avg_ns": a(self.zmq_recv_total_ns, self.zmq_recv_count),
+                "zmq_recv_max_ns": self.zmq_recv_max_ns,
+                "unpickle_avg_ns": a(self.unpickle_total_ns, self.deq_count),
+                "unpickle_max_ns": self.unpickle_max_ns,
+                "payload_known_count": self.deq_bytes_known_count,
+                "payload_avg_bytes": a(self.deq_bytes_total, self.deq_bytes_known_count),
+                "payload_min_bytes": (
+                    0 if self.deq_bytes_known_count == 0 else self.deq_bytes_min
+                ),
+                "payload_max_bytes": self.deq_bytes_max,
+                "read_wait_avg_ns": a(self.read_wait_total_ns, self.read_wait_count),
+                "read_wait_max_ns": self.read_wait_max_ns,
+                "read_wait_count": self.read_wait_count,
+            },
+            "payload_types": self._top_payload_types(),
+        }
+
     def dump(self):
-        if self.enq_count == 0 and self.deq_count == 0:
+        if self.dumped or (self.enq_count == 0 and self.deq_count == 0):
             return
+        self.dumped = True
         f = self._fmt
         a = self._avg
         lines = [f"[MyelonInstr] === {self.name} shm_broadcast Stats ==="]
@@ -152,9 +339,9 @@ class _MyelonIpcStats:
                 f"max={f(self.pickle_max_ns)}"
             )
             lines.append(
-                f"[MyelonInstr]     shm_write: avg={f(a(self.shm_write_total_ns, self.enq_count - self.enq_overflow_count))} "
+                f"[MyelonInstr]     shm_write: avg={f(a(self.shm_write_total_ns, self.shm_write_count))} "
                 f"max={f(self.shm_write_max_ns)} "
-                f"(n={self.enq_count - self.enq_overflow_count})"
+                f"(n={self.shm_write_count})"
             )
             if self.enq_overflow_count > 0:
                 lines.append(
@@ -162,30 +349,51 @@ class _MyelonIpcStats:
                     f"max={f(self.zmq_send_max_ns)} "
                     f"(overflow n={self.enq_overflow_count})"
                 )
+            lines.append(
+                f"[MyelonInstr]     path_mix:   inline={self.enq_inline_count} "
+                f"overflow={self.enq_overflow_count} remote_send={self.enq_remote_send_count}"
+            )
             if self.write_wait_count > 0:
                 lines.append(
                     f"[MyelonInstr]     write_wait: avg={f(a(self.write_wait_total_ns, self.write_wait_count))} "
                     f"max={f(self.write_wait_max_ns)} n={self.write_wait_count}"
                 )
+            top_payload_types = self._top_payload_types()
+            if top_payload_types:
+                lines.append(
+                    "[MyelonInstr]     top_payload_types: "
+                    + ", ".join(
+                        (
+                            f"{row['type']} count={row['count']} "
+                            f"max_bytes={row['max_bytes']} "
+                            f"overflow={row['overflow_count']}"
+                        )
+                        for row in top_payload_types
+                    )
+                )
         if self.deq_count > 0:
-            avg_bytes = a(self.deq_bytes_total, self.deq_count)
+            avg_bytes = a(self.deq_bytes_total, self.deq_bytes_known_count)
             lines.append(
                 f"[MyelonInstr]   dequeue: n={self.deq_count} "
                 f"avg={f(a(self.deq_total_ns, self.deq_count))} "
                 f"min={f(self.deq_min_ns)} max={f(self.deq_max_ns)} "
-                f"avg_bytes={avg_bytes} max_bytes={self.deq_bytes_max}"
+                f"known_avg_bytes={avg_bytes} max_bytes={self.deq_bytes_max}"
             )
             lines.append(
-                f"[MyelonInstr]     shm_read:  avg={f(a(self.shm_read_total_ns, self.deq_count))} "
-                f"max={f(self.shm_read_max_ns)}"
+                f"[MyelonInstr]     shm_read:  avg={f(a(self.shm_read_total_ns, self.shm_read_count))} "
+                f"max={f(self.shm_read_max_ns)} (n={self.shm_read_count})"
             )
             lines.append(
-                f"[MyelonInstr]     zmq_recv:  avg={f(a(self.zmq_recv_total_ns, self.deq_count))} "
-                f"max={f(self.zmq_recv_max_ns)}"
+                f"[MyelonInstr]     zmq_recv:  avg={f(a(self.zmq_recv_total_ns, self.zmq_recv_count))} "
+                f"max={f(self.zmq_recv_max_ns)} (n={self.zmq_recv_count})"
             )
             lines.append(
                 f"[MyelonInstr]     unpickle:  avg={f(a(self.unpickle_total_ns, self.deq_count))} "
                 f"max={f(self.unpickle_max_ns)}"
+            )
+            lines.append(
+                f"[MyelonInstr]     path_mix:   inline={self.deq_inline_count} "
+                f"zmq={self.deq_zmq_count}"
             )
             if self.read_wait_count > 0:
                 lines.append(
@@ -194,6 +402,7 @@ class _MyelonIpcStats:
                 )
         for line in lines:
             logger.info(line)
+        _append_jsonl(_MYELON_INSTRUMENT_JSONL, self.as_dict())
 # ── End Myelon IPC Instrumentation ──────────────────────────────────────
 
 
@@ -411,7 +620,23 @@ class MessageQueue:
         self.local_reader_rank = -1
         # rank does not matter for remote readers
         self._is_remote_reader = False
-        self._stats = _MyelonIpcStats("writer") if _MYELON_INSTRUMENT else None
+        self._last_write_wait_ns = 0
+        self._last_read_wait_ns = 0
+        self._stats = (
+            _MyelonIpcStats(
+                "writer",
+                {
+                    "role": "writer",
+                    "n_reader": n_reader,
+                    "n_local_reader": n_local_reader,
+                    "n_remote_reader": n_remote_reader,
+                    "max_chunk_bytes": max_chunk_bytes,
+                    "max_chunks": max_chunks,
+                },
+            )
+            if _MYELON_INSTRUMENT
+            else None
+        )
 
         self.handle = Handle(
             connect_ip=connect_ip,
@@ -431,7 +656,8 @@ class MessageQueue:
         self = MessageQueue.__new__(MessageQueue)
         self.handle = handle
         self._is_writer = False
-        self._stats = _MyelonIpcStats(f"reader-{rank}") if _MYELON_INSTRUMENT else None
+        self._last_write_wait_ns = 0
+        self._last_read_wait_ns = 0
 
         context = Context()
 
@@ -468,6 +694,27 @@ class MessageQueue:
             logger.debug("Connecting to %s", socket_addr)
             self.remote_socket.connect(socket_addr)
 
+        self._stats = (
+            _MyelonIpcStats(
+                f"reader-{rank}",
+                {
+                    "role": (
+                        "local_reader" if self._is_local_reader else "remote_reader"
+                    ),
+                    "rank": rank,
+                    "local_reader_rank": self.local_reader_rank,
+                    "n_local_reader": len(handle.local_reader_ranks),
+                    "max_chunk_bytes": (
+                        handle.buffer.max_chunk_bytes if handle.buffer is not None else None
+                    ),
+                    "max_chunks": (
+                        handle.buffer.max_chunks if handle.buffer is not None else None
+                    ),
+                },
+            )
+            if _MYELON_INSTRUMENT
+            else None
+        )
         return self
 
     def wait_until_ready(self):
@@ -507,6 +754,7 @@ class MessageQueue:
     def acquire_write(self):
         assert self._is_writer, "Only writers can acquire write"
         start_time = time.monotonic()
+        wait_start_ns = _perf_ns() if self._stats is not None else 0
         n_warning = 1
         while True:
             with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
@@ -539,6 +787,8 @@ class MessageQueue:
 
                 # mark the block as not written
                 metadata_buffer[0] = 0
+                if wait_start_ns:
+                    self._last_write_wait_ns = _perf_ns() - wait_start_ns
                 # let caller write to the buffer
                 with self.buffer.get_data(self.current_idx) as buf:
                     yield buf
@@ -560,6 +810,7 @@ class MessageQueue:
     def acquire_read(self):
         assert self._is_local_reader, "Only readers can acquire read"
         start_time = time.monotonic()
+        wait_start_ns = _perf_ns() if self._stats is not None else 0
         n_warning = 1
         while True:
             with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
@@ -590,6 +841,8 @@ class MessageQueue:
 
                     continue
                 # found a block that is not read by this reader
+                if wait_start_ns:
+                    self._last_read_wait_ns = _perf_ns() - wait_start_ns
                 # let caller read from the buffer
                 with self.buffer.get_data(self.current_idx) as buf:
                     yield buf
@@ -604,6 +857,7 @@ class MessageQueue:
         assert self._is_writer, "Only writers can enqueue"
         if self._stats is not None:
             t0 = _perf_ns()
+            obj_type = _payload_signature(obj)
             serialized_obj = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
             t_pickle = _perf_ns()
             payload_bytes = len(serialized_obj)
@@ -624,7 +878,11 @@ class MessageQueue:
             t_end = _perf_ns()
             self._stats.record_enqueue(
                 t_end - t0, t_pickle - t0, t_transport - t_pickle,
-                payload_bytes, is_overflow)
+                payload_bytes, is_overflow,
+                wait_ns=self._last_write_wait_ns,
+                obj_type=obj_type,
+                sent_remote=self.n_remote_reader > 0,
+            )
         else:
             serialized_obj = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
             if self.n_local_reader > 0:
@@ -643,7 +901,7 @@ class MessageQueue:
         if self._stats is not None:
             t0 = _perf_ns()
             is_zmq = False
-            payload_bytes = 0
+            payload_bytes = None
             if self._is_local_reader:
                 with self.acquire_read() as buf:
                     overflow = buf[0] == 1
@@ -670,7 +928,7 @@ class MessageQueue:
             t_end = _perf_ns()
             self._stats.record_dequeue(
                 t_end - t0, t_transport - t0, t_unpickle - t_transport,
-                payload_bytes, is_zmq)
+                payload_bytes, is_zmq, wait_ns=self._last_read_wait_ns)
             return obj
         else:
             if self._is_local_reader:
