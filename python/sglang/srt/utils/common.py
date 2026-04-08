@@ -100,6 +100,58 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
 
+_MYELON_PYOBJ_BCAST_JSONL = os.getenv("MYELON_PYOBJ_BCAST_JSONL")
+_MYELON_PYOBJ_BCAST_TAG = os.getenv("MYELON_PYOBJ_BCAST_TAG", "")
+_MYELON_PYOBJ_BCAST_LOCK = threading.Lock()
+
+
+def _myelon_safe_len(obj: Any) -> Optional[int]:
+    try:
+        return len(obj)
+    except Exception:
+        return None
+
+
+def _emit_myelon_pyobj_bcast(
+    *,
+    role: str,
+    rank: int,
+    src: int,
+    payload_bytes: int,
+    data: Any,
+    elapsed_ns: int,
+    device: torch.device,
+) -> None:
+    if not _MYELON_PYOBJ_BCAST_JSONL:
+        return
+
+    frame = inspect.currentframe()
+    caller = frame.f_back.f_back if frame is not None and frame.f_back is not None else None
+    try:
+        event = {
+            "tag": _MYELON_PYOBJ_BCAST_TAG,
+            "kind": "broadcast_pyobj",
+            "role": role,
+            "rank": rank,
+            "src": src,
+            "payload_bytes": payload_bytes,
+            "item_count": _myelon_safe_len(data),
+            "elapsed_ns": elapsed_ns,
+            "device": str(device),
+            "caller_file": caller.f_code.co_filename if caller is not None else None,
+            "caller_func": caller.f_code.co_name if caller is not None else None,
+            "caller_line": caller.f_lineno if caller is not None else None,
+        }
+        path = Path(_MYELON_PYOBJ_BCAST_JSONL)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _MYELON_PYOBJ_BCAST_LOCK:
+            with path.open("ab") as fh:
+                fh.write(orjson.dumps(event))
+                fh.write(b"\n")
+    finally:
+        del frame
+        del caller
+
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 @lru_cache(maxsize=1)
@@ -1196,14 +1248,17 @@ def broadcast_pyobj(
         if torch.cuda.is_available() and not force_cpu_device
         else "musa" if is_musa() and not force_cpu_device else "cpu"
     )
+    start_ns = time.perf_counter_ns()
 
     if rank == src:
+        payload_bytes = 0
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
+            payload_bytes = size
 
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
@@ -1212,6 +1267,15 @@ def broadcast_pyobj(
 
             dist.broadcast(tensor_size, src=src, group=dist_group)
             dist.broadcast(tensor_data, src=src, group=dist_group)
+        _emit_myelon_pyobj_bcast(
+            role="src",
+            rank=rank,
+            src=src,
+            payload_bytes=payload_bytes,
+            data=data,
+            elapsed_ns=time.perf_counter_ns() - start_ns,
+            device=device,
+        )
         return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long, device=device)
@@ -1219,6 +1283,15 @@ def broadcast_pyobj(
         size = tensor_size.item()
 
         if size == 0:
+            _emit_myelon_pyobj_bcast(
+                role="dst",
+                rank=rank,
+                src=src,
+                payload_bytes=0,
+                data=[],
+                elapsed_ns=time.perf_counter_ns() - start_ns,
+                device=device,
+            )
             return []
 
         tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
@@ -1226,6 +1299,15 @@ def broadcast_pyobj(
 
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
+        _emit_myelon_pyobj_bcast(
+            role="dst",
+            rank=rank,
+            src=src,
+            payload_bytes=size,
+            data=data,
+            elapsed_ns=time.perf_counter_ns() - start_ns,
+            device=device,
+        )
         return data
 
 

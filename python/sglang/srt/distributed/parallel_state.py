@@ -24,15 +24,19 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import json
 import logging
 import os
 import pickle
+import threading
+import time
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from unittest.mock import patch
 
@@ -68,6 +72,87 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
+
+_MYELON_PARALLEL_STATE_JSONL = os.getenv("MYELON_PARALLEL_STATE_JSONL")
+_MYELON_PARALLEL_STATE_TAG = os.getenv("MYELON_PARALLEL_STATE_TAG", "")
+_MYELON_PARALLEL_STATE_LOG = get_bool_env_var(
+    "MYELON_PARALLEL_STATE_LOG", "false"
+)
+_MYELON_PARALLEL_STATE_LOCK = threading.Lock()
+
+
+def _myelon_parallel_state_trace_enabled() -> bool:
+    return bool(_MYELON_PARALLEL_STATE_JSONL or _MYELON_PARALLEL_STATE_LOG)
+
+
+def _myelon_safe_len(obj: Any) -> Optional[int]:
+    try:
+        return len(obj)
+    except Exception:
+        return None
+
+
+def _myelon_payload_bytes(obj: Any) -> Optional[int]:
+    if obj is None:
+        return 0
+    try:
+        return len(pickle.dumps(obj))
+    except Exception:
+        return None
+
+
+def _myelon_tensor_numel(size: torch.Size) -> int:
+    numel = 1
+    for dim in size:
+        numel *= dim
+    return numel
+
+
+def _myelon_tensor_dict_summary(
+    metadata_list: List[Tuple[Any, Any]],
+) -> Dict[str, Optional[int]]:
+    tensor_count = 0
+    cpu_tensor_count = 0
+    device_tensor_count = 0
+    total_tensor_numel = 0
+    for _, value in metadata_list:
+        if isinstance(value, TensorMetadata):
+            tensor_count += 1
+            total_tensor_numel += _myelon_tensor_numel(value.size)
+            if value.device == "cpu":
+                cpu_tensor_count += 1
+            else:
+                device_tensor_count += 1
+    return {
+        "entry_count": len(metadata_list),
+        "tensor_count": tensor_count,
+        "cpu_tensor_count": cpu_tensor_count,
+        "device_tensor_count": device_tensor_count,
+        "total_tensor_numel": total_tensor_numel,
+    }
+
+
+def _emit_myelon_parallel_state_event(event: str, **payload: Any) -> None:
+    if not _myelon_parallel_state_trace_enabled():
+        return
+
+    record = {
+        "tag": _MYELON_PARALLEL_STATE_TAG,
+        "event": event,
+        **payload,
+    }
+    if _MYELON_PARALLEL_STATE_LOG:
+        logger.info("[myelon.parallel_state] %s", record)
+    if not _MYELON_PARALLEL_STATE_JSONL:
+        return
+
+    path = Path(_MYELON_PARALLEL_STATE_JSONL)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, sort_keys=True)
+    with _MYELON_PARALLEL_STATE_LOCK:
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.write("\n")
 
 
 def get_torch_distributed_pg_options(group_name=None):
@@ -436,6 +521,35 @@ class GroupCoordinator:
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6
             )
+        logger.info(
+            "GroupCoordinator initialized: unique_name=%s rank=%s rank_in_group=%s "
+            "world_size=%s local_rank=%s device=%s backend=%s mq_enabled=%s mq_created=%s",
+            self.unique_name,
+            self.rank,
+            self.rank_in_group,
+            self.world_size,
+            self.local_rank,
+            self.device,
+            torch_distributed_backend,
+            self.use_message_queue_broadcaster,
+            self.mq_broadcaster is not None,
+        )
+        _emit_myelon_parallel_state_event(
+            "group_init",
+            unique_name=self.unique_name,
+            rank=self.rank,
+            rank_in_group=self.rank_in_group,
+            world_size=self.world_size,
+            local_rank=self.local_rank,
+            device=str(self.device),
+            backend=str(torch_distributed_backend),
+            use_pynccl=self.use_pynccl,
+            use_pymscclpp=self.use_pymscclpp,
+            use_custom_allreduce=self.use_custom_allreduce,
+            use_torch_symm_mem_all_reduce=self.use_torch_symm_mem_all_reduce,
+            use_message_queue_broadcaster=self.use_message_queue_broadcaster,
+            mq_created=self.mq_broadcaster is not None,
+        )
 
     def __repr__(self):
         return (
@@ -994,20 +1108,44 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return obj
+        route = (
+            "mq_broadcaster"
+            if self.mq_broadcaster is not None
+            else "cpu_group.broadcast_object_list"
+        )
+        role = "src" if self.rank_in_group == src else "dst"
+        start_ns = time.perf_counter_ns() if _myelon_parallel_state_trace_enabled() else 0
         if self.mq_broadcaster is not None:
             assert src == 0, "Message queue broadcaster only supports src=0"
-            return self.mq_broadcaster.broadcast_object(obj)
-        if self.rank_in_group == src:
+            result = self.mq_broadcaster.broadcast_object(obj)
+        elif self.rank_in_group == src:
             torch.distributed.broadcast_object_list(
                 [obj], src=self.ranks[src], group=self.cpu_group
             )
-            return obj
+            result = obj
         else:
             recv = [None]
             torch.distributed.broadcast_object_list(
                 recv, src=self.ranks[src], group=self.cpu_group
             )
-            return recv[0]
+            result = recv[0]
+        _emit_myelon_parallel_state_event(
+            "broadcast_object",
+            unique_name=self.unique_name,
+            rank=self.rank,
+            rank_in_group=self.rank_in_group,
+            world_size=self.world_size,
+            src=src,
+            role=role,
+            route=route,
+            mq_created=self.mq_broadcaster is not None,
+            payload_bytes=_myelon_payload_bytes(result),
+            item_count=_myelon_safe_len(result),
+            elapsed_ns=(
+                time.perf_counter_ns() - start_ns if start_ns else None
+            ),
+        )
+        return result
 
     def broadcast_object_list(
         self, obj_list: List[Any], src: int = 0, group: Optional[ProcessGroup] = None
@@ -1133,6 +1271,12 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
         assert src < self.world_size, f"Invalid src rank ({src})"
+        start_ns = time.perf_counter_ns() if _myelon_parallel_state_trace_enabled() else 0
+        metadata_route = (
+            "mq_broadcaster"
+            if self.mq_broadcaster is not None
+            else "cpu_group.broadcast_object_list"
+        )
 
         rank_in_group = self.rank_in_group
         if rank_in_group == src:
@@ -1163,6 +1307,20 @@ class GroupCoordinator:
                 async_handles.append(handle)
             for async_handle in async_handles:
                 async_handle.wait()
+            _emit_myelon_parallel_state_event(
+                "broadcast_tensor_dict",
+                unique_name=self.unique_name,
+                rank=self.rank,
+                rank_in_group=self.rank_in_group,
+                world_size=self.world_size,
+                src=src,
+                role="src",
+                metadata_route=metadata_route,
+                elapsed_ns=(
+                    time.perf_counter_ns() - start_ns if start_ns else None
+                ),
+                **_myelon_tensor_dict_summary(metadata_list),
+            )
 
         else:
             metadata_list = self.broadcast_object(None, src=src)
@@ -1196,6 +1354,20 @@ class GroupCoordinator:
                     tensor_dict[key] = value
             for async_handle in async_handles:
                 async_handle.wait()
+            _emit_myelon_parallel_state_event(
+                "broadcast_tensor_dict",
+                unique_name=self.unique_name,
+                rank=self.rank,
+                rank_in_group=self.rank_in_group,
+                world_size=self.world_size,
+                src=src,
+                role="dst",
+                metadata_route=metadata_route,
+                elapsed_ns=(
+                    time.perf_counter_ns() - start_ns if start_ns else None
+                ),
+                **_myelon_tensor_dict_summary(metadata_list),
+            )
         return tensor_dict
 
     def send_tensor_dict(
