@@ -31,16 +31,43 @@ if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
   uv venv "${VENV_DIR}"
 fi
 
+export PATH="${VENV_DIR}/bin:${PATH}"
+
 if ! "${VENV_DIR}/bin/python" -c "import sglang" >/dev/null 2>&1; then
   uv pip install --python "${VENV_DIR}/bin/python" -e "${PY_PROJECT_DIR}"
 fi
 
 SERVER_PID=""
-cleanup() {
-  if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
-    kill -TERM "${SERVER_PID}" >/dev/null 2>&1 || true
-    wait "${SERVER_PID}" || true
+stop_server() {
+  if [[ -z "${SERVER_PID}" ]] || ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
+    return 0
   fi
+
+  kill -INT "${SERVER_PID}" >/dev/null 2>&1 || true
+  for _ in $(seq 1 30); do
+    if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
+      SERVER_PID=""
+      return 0
+    fi
+    sleep 1
+  done
+
+  kill -TERM "${SERVER_PID}" >/dev/null 2>&1 || true
+  for _ in $(seq 1 10); do
+    if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
+      SERVER_PID=""
+      return 0
+    fi
+    sleep 1
+  done
+
+  kill -KILL "${SERVER_PID}" >/dev/null 2>&1 || true
+  wait "${SERVER_PID}" || true
+  SERVER_PID=""
+}
+
+cleanup() {
+  stop_server
 }
 trap cleanup EXIT
 
@@ -61,16 +88,26 @@ SERVER_PID=$!
 
 echo "Server PID: ${SERVER_PID}"
 
-"${VENV_DIR}/bin/python" - <<'PY' "${HOST}" "${PORT}" "${SERVER_TIMEOUT_SEC}"
+"${VENV_DIR}/bin/python" - <<'PY' "${HOST}" "${PORT}" "${SERVER_TIMEOUT_SEC}" "${SERVER_PID}"
 import sys
 import time
 import requests
+import os
 
-host, port, timeout_s = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+host, port, timeout_s, server_pid = (
+    sys.argv[1],
+    int(sys.argv[2]),
+    int(sys.argv[3]),
+    int(sys.argv[4]),
+)
 url = f"http://{host}:{port}/health"
 deadline = time.time() + timeout_s
 last_error = None
 while time.time() < deadline:
+    try:
+        os.kill(server_pid, 0)
+    except ProcessLookupError:
+        raise SystemExit(f"server exited before reaching health: {last_error}")
     try:
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
@@ -96,9 +133,7 @@ PY
   --max-parallel "${MAX_PARALLEL}" \
   --request-rate "${REQUEST_RATE}"
 
-kill -TERM "${SERVER_PID}" >/dev/null 2>&1 || true
-wait "${SERVER_PID}" || true
-SERVER_PID=""
+stop_server
 
 "${VENV_DIR}/bin/python" "${ROOT_DIR}/scripts/myelon/analyze_ipc_jsonl.py" \
   --input "${IPC_JSONL}" \

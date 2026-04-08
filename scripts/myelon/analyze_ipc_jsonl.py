@@ -6,6 +6,8 @@ from pathlib import Path
 
 
 def load_records(path: Path, tag: str | None) -> list[dict]:
+    if not path.exists():
+        return []
     records = []
     for line in path.read_text().splitlines():
         line = line.strip()

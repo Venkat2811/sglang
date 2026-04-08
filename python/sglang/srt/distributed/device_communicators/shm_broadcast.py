@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/shm_broadcast.py
 
+import atexit
 import logging
 import os
 import pickle
@@ -637,6 +638,8 @@ class MessageQueue:
             if _MYELON_INSTRUMENT
             else None
         )
+        if self._stats is not None:
+            atexit.register(self.dump_stats)
 
         self.handle = Handle(
             connect_ip=connect_ip,
@@ -715,6 +718,8 @@ class MessageQueue:
             if _MYELON_INSTRUMENT
             else None
         )
+        if self._stats is not None:
+            atexit.register(self.dump_stats)
         return self
 
     def wait_until_ready(self):
