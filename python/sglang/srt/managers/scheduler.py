@@ -365,6 +365,10 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
+        self.use_group_broadcast_object = (
+            envs.SGLANG_SCHEDULER_USE_GROUP_BROADCAST_OBJECT.get()
+        )
+        self._logged_scheduler_broadcast_routes: set[str] = set()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
@@ -1468,6 +1472,40 @@ class Scheduler(
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
+    def _broadcast_tp_scheduler_reqs(
+        self,
+        recv_reqs: List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]],
+        route_name: str,
+    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
+        if self.tp_size == 1:
+            return recv_reqs
+
+        if not self.use_group_broadcast_object:
+            return broadcast_pyobj(
+                recv_reqs,
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
+
+        if route_name not in self._logged_scheduler_broadcast_routes:
+            route = (
+                "mq_broadcaster"
+                if self.tp_group.mq_broadcaster is not None
+                else "cpu_group.broadcast_object_list"
+            )
+            logger.info(
+                "Scheduler TP request fanout route: "
+                f"route_name={route_name} unique_name={self.tp_group.unique_name} "
+                f"route={route} mq_created={self.tp_group.mq_broadcaster is not None}"
+            )
+            self._logged_scheduler_broadcast_routes.add(route_name)
+
+        return self.tp_group.broadcast_object(
+            recv_reqs if self.tp_group.rank_in_group == 0 else None,
+            src=0,
+        )
+
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -1543,19 +1581,15 @@ class Scheduler(
                 )
 
             if self.tp_size != 1:
-                control_reqs = broadcast_pyobj(
+                control_reqs = self._broadcast_tp_scheduler_reqs(
                     control_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
+                    route_name="dp_attention_control_reqs",
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
+            recv_reqs = self._broadcast_tp_scheduler_reqs(
                 recv_reqs,
-                self.tp_group.rank,
-                self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
+                route_name="tp_recv_reqs",
             )
 
         # Process MM requests under EPD-disaggregation mode
