@@ -9,6 +9,7 @@ PORT="${PORT:-30000}"
 TP="${TP:-8}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.80}"
 HOST="${HOST:-127.0.0.1}"
+SERVER_EXTRA_ARGS_STR="${SERVER_EXTRA_ARGS:-}"
 REQUEST_LENGTH="${REQUEST_LENGTH:-2048}"
 OUTPUT_LENGTH="${OUTPUT_LENGTH:-256}"
 NUM_CLIENTS="${NUM_CLIENTS:-80}"
@@ -35,6 +36,12 @@ export PATH="${VENV_DIR}/bin:${PATH}"
 
 if ! "${VENV_DIR}/bin/python" -c "import sglang" >/dev/null 2>&1; then
   uv pip install --python "${VENV_DIR}/bin/python" -e "${PY_PROJECT_DIR}"
+fi
+
+SERVER_EXTRA_ARGS=()
+if [[ -n "${SERVER_EXTRA_ARGS_STR}" ]]; then
+  # shellcheck disable=SC2206
+  SERVER_EXTRA_ARGS=( ${SERVER_EXTRA_ARGS_STR} )
 fi
 
 SERVER_PID=""
@@ -83,6 +90,7 @@ SGLANG_USE_MESSAGE_QUEUE_BROADCASTER="${SGLANG_USE_MESSAGE_QUEUE_BROADCASTER:-tr
   --host 0.0.0.0 \
   --port "${PORT}" \
   --mem-fraction-static "${MEM_FRACTION_STATIC}" \
+  "${SERVER_EXTRA_ARGS[@]}" \
   >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
