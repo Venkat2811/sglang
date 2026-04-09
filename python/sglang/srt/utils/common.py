@@ -102,6 +102,9 @@ torch_release = pkg_version.parse(torch.__version__).release
 
 _MYELON_PYOBJ_BCAST_JSONL = os.getenv("MYELON_PYOBJ_BCAST_JSONL")
 _MYELON_PYOBJ_BCAST_TAG = os.getenv("MYELON_PYOBJ_BCAST_TAG", "")
+_MYELON_PYOBJ_BCAST_NONEMPTY_ONLY = os.getenv(
+    "MYELON_PYOBJ_BCAST_NONEMPTY_ONLY", "0"
+) in ("1", "true", "True")
 _MYELON_PYOBJ_BCAST_LOCK = threading.Lock()
 
 
@@ -110,6 +113,29 @@ def _myelon_safe_len(obj: Any) -> Optional[int]:
         return len(obj)
     except Exception:
         return None
+
+
+def _myelon_payload_signature(obj: Any) -> str:
+    obj_type = type(obj)
+    type_name = f"{obj_type.__module__}.{obj_type.__qualname__}"
+    try:
+        if isinstance(obj, list):
+            head = type(obj[0]).__qualname__ if obj else "empty"
+            return f"{type_name}[len={len(obj)},head={head}]"
+        if isinstance(obj, tuple):
+            head = type(obj[0]).__qualname__ if obj else "empty"
+            return f"{type_name}[len={len(obj)},head={head}]"
+        if isinstance(obj, dict):
+            return f"{type_name}[len={len(obj)}]"
+        if isinstance(obj, (bytes, bytearray, memoryview)):
+            return f"{type_name}[len={len(obj)}]"
+        if hasattr(obj, "shape"):
+            return f"{type_name}[shape={getattr(obj, 'shape', None)}]"
+        if hasattr(obj, "__len__") and not isinstance(obj, str):
+            return f"{type_name}[len={len(obj)}]"
+    except Exception:
+        pass
+    return type_name
 
 
 def _emit_myelon_pyobj_bcast(
@@ -121,8 +147,19 @@ def _emit_myelon_pyobj_bcast(
     data: Any,
     elapsed_ns: int,
     device: torch.device,
+    pickle_ns: Optional[int] = None,
+    tensorize_ns: Optional[int] = None,
+    tensor_alloc_ns: Optional[int] = None,
+    size_broadcast_ns: Optional[int] = None,
+    payload_broadcast_ns: Optional[int] = None,
+    tensor_to_bytes_ns: Optional[int] = None,
+    unpickle_ns: Optional[int] = None,
 ) -> None:
     if not _MYELON_PYOBJ_BCAST_JSONL:
+        return
+    if _MYELON_PYOBJ_BCAST_NONEMPTY_ONLY and _myelon_payload_signature(
+        data
+    ) == "builtins.list[len=0,head=empty]":
         return
 
     frame = inspect.currentframe()
@@ -135,9 +172,18 @@ def _emit_myelon_pyobj_bcast(
             "rank": rank,
             "src": src,
             "payload_bytes": payload_bytes,
+            "payload_signature": _myelon_payload_signature(data),
             "item_count": _myelon_safe_len(data),
             "elapsed_ns": elapsed_ns,
+            "trace_time_ns": time.perf_counter_ns(),
             "device": str(device),
+            "pickle_ns": pickle_ns,
+            "tensorize_ns": tensorize_ns,
+            "tensor_alloc_ns": tensor_alloc_ns,
+            "size_broadcast_ns": size_broadcast_ns,
+            "payload_broadcast_ns": payload_broadcast_ns,
+            "tensor_to_bytes_ns": tensor_to_bytes_ns,
+            "unpickle_ns": unpickle_ns,
             "caller_file": caller.f_code.co_filename if caller is not None else None,
             "caller_func": caller.f_code.co_name if caller is not None else None,
             "caller_line": caller.f_lineno if caller is not None else None,
@@ -1252,21 +1298,35 @@ def broadcast_pyobj(
 
     if rank == src:
         payload_bytes = 0
+        pickle_ns = 0
+        tensorize_ns = 0
+        size_broadcast_ns = 0
+        payload_broadcast_ns = 0
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
+            t_size = time.perf_counter_ns()
             dist.broadcast(tensor_size, src=src, group=dist_group)
+            size_broadcast_ns = time.perf_counter_ns() - t_size
         else:
+            t_pickle = time.perf_counter_ns()
             serialized_data = pickle.dumps(data)
+            pickle_ns = time.perf_counter_ns() - t_pickle
             size = len(serialized_data)
             payload_bytes = size
 
+            t_tensorize = time.perf_counter_ns()
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
             ).to(device)
             tensor_size = torch.tensor([size], dtype=torch.long, device=device)
+            tensorize_ns = time.perf_counter_ns() - t_tensorize
 
+            t_size = time.perf_counter_ns()
             dist.broadcast(tensor_size, src=src, group=dist_group)
+            size_broadcast_ns = time.perf_counter_ns() - t_size
+            t_payload = time.perf_counter_ns()
             dist.broadcast(tensor_data, src=src, group=dist_group)
+            payload_broadcast_ns = time.perf_counter_ns() - t_payload
         _emit_myelon_pyobj_bcast(
             role="src",
             rank=rank,
@@ -1275,11 +1335,17 @@ def broadcast_pyobj(
             data=data,
             elapsed_ns=time.perf_counter_ns() - start_ns,
             device=device,
+            pickle_ns=pickle_ns,
+            tensorize_ns=tensorize_ns,
+            size_broadcast_ns=size_broadcast_ns,
+            payload_broadcast_ns=payload_broadcast_ns,
         )
         return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long, device=device)
+        t_size = time.perf_counter_ns()
         dist.broadcast(tensor_size, src=src, group=dist_group)
+        size_broadcast_ns = time.perf_counter_ns() - t_size
         size = tensor_size.item()
 
         if size == 0:
@@ -1291,14 +1357,23 @@ def broadcast_pyobj(
                 data=[],
                 elapsed_ns=time.perf_counter_ns() - start_ns,
                 device=device,
+                size_broadcast_ns=size_broadcast_ns,
             )
             return []
 
+        t_alloc = time.perf_counter_ns()
         tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
+        tensor_alloc_ns = time.perf_counter_ns() - t_alloc
+        t_payload = time.perf_counter_ns()
         dist.broadcast(tensor_data, src=src, group=dist_group)
+        payload_broadcast_ns = time.perf_counter_ns() - t_payload
 
+        t_bytes = time.perf_counter_ns()
         serialized_data = bytes(tensor_data.cpu().numpy())
+        tensor_to_bytes_ns = time.perf_counter_ns() - t_bytes
+        t_unpickle = time.perf_counter_ns()
         data = pickle.loads(serialized_data)
+        unpickle_ns = time.perf_counter_ns() - t_unpickle
         _emit_myelon_pyobj_bcast(
             role="dst",
             rank=rank,
@@ -1307,6 +1382,11 @@ def broadcast_pyobj(
             data=data,
             elapsed_ns=time.perf_counter_ns() - start_ns,
             device=device,
+            tensor_alloc_ns=tensor_alloc_ns,
+            size_broadcast_ns=size_broadcast_ns,
+            payload_broadcast_ns=payload_broadcast_ns,
+            tensor_to_bytes_ns=tensor_to_bytes_ns,
+            unpickle_ns=unpickle_ns,
         )
         return data
 

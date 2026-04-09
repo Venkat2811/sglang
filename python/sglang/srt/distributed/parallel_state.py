@@ -78,6 +78,9 @@ _MYELON_PARALLEL_STATE_TAG = os.getenv("MYELON_PARALLEL_STATE_TAG", "")
 _MYELON_PARALLEL_STATE_LOG = get_bool_env_var(
     "MYELON_PARALLEL_STATE_LOG", "false"
 )
+_MYELON_PARALLEL_STATE_NONEMPTY_ONLY = get_bool_env_var(
+    "MYELON_PARALLEL_STATE_NONEMPTY_ONLY", "false"
+)
 _MYELON_PARALLEL_STATE_LOCK = threading.Lock()
 
 
@@ -90,6 +93,29 @@ def _myelon_safe_len(obj: Any) -> Optional[int]:
         return len(obj)
     except Exception:
         return None
+
+
+def _myelon_payload_signature(obj: Any) -> str:
+    obj_type = type(obj)
+    type_name = f"{obj_type.__module__}.{obj_type.__qualname__}"
+    try:
+        if isinstance(obj, list):
+            head = type(obj[0]).__qualname__ if obj else "empty"
+            return f"{type_name}[len={len(obj)},head={head}]"
+        if isinstance(obj, tuple):
+            head = type(obj[0]).__qualname__ if obj else "empty"
+            return f"{type_name}[len={len(obj)},head={head}]"
+        if isinstance(obj, dict):
+            return f"{type_name}[len={len(obj)}]"
+        if isinstance(obj, (bytes, bytearray, memoryview)):
+            return f"{type_name}[len={len(obj)}]"
+        if hasattr(obj, "shape"):
+            return f"{type_name}[shape={getattr(obj, 'shape', None)}]"
+        if hasattr(obj, "__len__") and not isinstance(obj, str):
+            return f"{type_name}[len={len(obj)}]"
+    except Exception:
+        pass
+    return type_name
 
 
 def _myelon_payload_bytes(obj: Any) -> Optional[int]:
@@ -135,10 +161,17 @@ def _myelon_tensor_dict_summary(
 def _emit_myelon_parallel_state_event(event: str, **payload: Any) -> None:
     if not _myelon_parallel_state_trace_enabled():
         return
+    if (
+        _MYELON_PARALLEL_STATE_NONEMPTY_ONLY
+        and event == "broadcast_object"
+        and payload.get("payload_signature") == "builtins.list[len=0,head=empty]"
+    ):
+        return
 
     record = {
         "tag": _MYELON_PARALLEL_STATE_TAG,
         "event": event,
+        "trace_time_ns": time.perf_counter_ns(),
         **payload,
     }
     if _MYELON_PARALLEL_STATE_LOG:
@@ -1140,6 +1173,7 @@ class GroupCoordinator:
             route=route,
             mq_created=self.mq_broadcaster is not None,
             payload_bytes=_myelon_payload_bytes(result),
+            payload_signature=_myelon_payload_signature(result),
             item_count=_myelon_safe_len(result),
             elapsed_ns=(
                 time.perf_counter_ns() - start_ns if start_ns else None

@@ -33,6 +33,12 @@ _MYELON_INSTRUMENT = os.environ.get("MYELON_INSTRUMENT", "0") == "1"
 _MYELON_INSTRUMENT_JSONL = os.environ.get("MYELON_INSTRUMENT_JSONL", "").strip()
 _MYELON_INSTRUMENT_TAG = os.environ.get("MYELON_INSTRUMENT_TAG", "").strip()
 _MYELON_INSTRUMENT_TOPN = int(os.environ.get("MYELON_INSTRUMENT_TOPN", "8"))
+_MYELON_INSTRUMENT_EVENT_JSONL = os.environ.get(
+    "MYELON_INSTRUMENT_EVENT_JSONL", ""
+).strip()
+_MYELON_INSTRUMENT_EVENT_NONEMPTY_ONLY = os.environ.get(
+    "MYELON_INSTRUMENT_EVENT_NONEMPTY_ONLY", "1"
+) not in ("0", "false", "False")
 _perf_ns = time.perf_counter_ns
 
 
@@ -68,6 +74,10 @@ def _payload_signature(obj) -> str:
     except Exception:
         pass
     return type_name
+
+
+def _emit_event_jsonl(record: dict) -> None:
+    _append_jsonl(_MYELON_INSTRUMENT_EVENT_JSONL, record)
 
 
 class _MyelonIpcStats:
@@ -888,6 +898,31 @@ class MessageQueue:
                 obj_type=obj_type,
                 sent_remote=self.n_remote_reader > 0,
             )
+            if _MYELON_INSTRUMENT_EVENT_JSONL and (
+                not _MYELON_INSTRUMENT_EVENT_NONEMPTY_ONLY or payload_bytes > 5
+            ):
+                _emit_event_jsonl(
+                    {
+                        "kind": "myelon_ipc_event",
+                        "tag": _MYELON_INSTRUMENT_TAG,
+                        "trace_time_ns": t_end,
+                        "name": "writer",
+                        "pid": os.getpid(),
+                        "queue_role": "writer",
+                        "event": "enqueue",
+                        "payload_bytes": payload_bytes,
+                        "payload_signature": obj_type,
+                        "transport_kind": (
+                            "zmq_overflow" if is_overflow else "shm_inline"
+                        ),
+                        "is_overflow": is_overflow,
+                        "wait_ns": self._last_write_wait_ns,
+                        "total_ns": t_end - t0,
+                        "pickle_ns": t_pickle - t0,
+                        "transport_ns": t_transport - t_pickle,
+                        "remote_send": self.n_remote_reader > 0,
+                    }
+                )
         else:
             serialized_obj = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
             if self.n_local_reader > 0:
@@ -934,6 +969,34 @@ class MessageQueue:
             self._stats.record_dequeue(
                 t_end - t0, t_transport - t0, t_unpickle - t_transport,
                 payload_bytes, is_zmq, wait_ns=self._last_read_wait_ns)
+            if _MYELON_INSTRUMENT_EVENT_JSONL:
+                payload_signature = _payload_signature(obj)
+                event_payload_bytes = payload_bytes
+                if event_payload_bytes is None:
+                    event_payload_bytes = len(
+                        pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+                    )
+                is_nonempty = payload_signature != "builtins.list[len=0,head=empty]"
+                if not _MYELON_INSTRUMENT_EVENT_NONEMPTY_ONLY or is_nonempty:
+                    _emit_event_jsonl(
+                        {
+                            "kind": "myelon_ipc_event",
+                            "tag": _MYELON_INSTRUMENT_TAG,
+                            "trace_time_ns": t_end,
+                            "name": self._stats.name,
+                            "pid": os.getpid(),
+                            "queue_role": self._stats.queue_config.get("role"),
+                            "event": "dequeue",
+                            "payload_bytes": event_payload_bytes,
+                            "payload_signature": payload_signature,
+                            "transport_kind": "zmq" if is_zmq else "shm_inline",
+                            "is_overflow": is_zmq,
+                            "wait_ns": self._last_read_wait_ns,
+                            "total_ns": t_end - t0,
+                            "transport_ns": t_transport - t0,
+                            "unpickle_ns": t_unpickle - t_transport,
+                        }
+                    )
             return obj
         else:
             if self._is_local_reader:
