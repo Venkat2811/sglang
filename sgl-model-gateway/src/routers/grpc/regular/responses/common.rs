@@ -401,7 +401,10 @@ pub(crate) async fn load_conversation_history_with_cache(
                 modified_request.input = ResponseInput::Items(items);
             }
             Err(e) => {
-                warn!("Failed to load conversation history: {}", e);
+                return Err(error::internal_error(
+                    "load_conversation_history_failed",
+                    format!("Failed to load conversation history: {}", e),
+                ));
             }
         }
     }

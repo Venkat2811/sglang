@@ -1066,7 +1066,7 @@ class TestWsMicrobench:
         print(f"\n{'=' * 50}")
         print(f"  WS Microbenchmark  |  model: {model}")
         print(f"{'=' * 50}")
-        for profile in payload.get("profiles", []):
+        for profile in payload.get("results", []):
             c = profile.get("concurrency", "?")
             s = profile.get("summary", {})
             print(

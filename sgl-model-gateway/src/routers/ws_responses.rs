@@ -77,9 +77,11 @@ impl CachedWsResponse {
 
         for output_item in &self.response.output {
             let Ok(value) = serde_json::to_value(output_item) else {
+                warn!("failed to serialize output item for conversation cache");
                 continue;
             };
             let Ok(item) = serde_json::from_value::<ResponseInputOutputItem>(value) else {
+                warn!("failed to deserialize output item into ResponseInputOutputItem for conversation cache");
                 continue;
             };
             items.push(item);
@@ -323,7 +325,7 @@ pub async fn serve_responses_ws_with_config(
                 }
                 let handle = handle_text_event(
                     text.as_ref(),
-                    headers.clone(),
+                    &headers,
                     executor.clone(),
                     session.clone(),
                     outbound_tx.clone(),
@@ -363,7 +365,7 @@ pub async fn serve_responses_ws_with_config(
 /// task is spawned so the caller can abort it on disconnect.
 async fn handle_text_event(
     payload: &str,
-    headers: HeaderMap,
+    headers: &HeaderMap,
     executor: Arc<dyn WsResponsesExecutor>,
     session: Arc<Mutex<WsSessionState>>,
     outbound_tx: mpsc::Sender<Message>,
@@ -417,6 +419,7 @@ async fn handle_text_event(
                 generate = options.generate.unwrap_or(true),
                 "accepted websocket response.create request"
             );
+            let headers = headers.clone();
             let session_clone = session.clone();
             let outbound_clone = outbound_tx.clone();
             let handle = tokio::spawn(async move {
