@@ -215,23 +215,19 @@ async fn warmup_response_create(
         .output(vec![])
         .build();
 
-    let created = json!({
-        "type": "response.created",
-        "response": {
-            "id": response.id,
-            "object": "response",
-            "status": "in_progress",
-            "model": response.model,
-            "output": []
-        }
-    });
-    send_ws_message(&outbound_tx, created)?;
-
-    let completed = json!({
-        "type": "response.completed",
-        "response": response.clone(),
-    });
-    send_ws_message(&outbound_tx, completed)?;
+    let in_progress_response = ResponsesResponse::builder(&response.id, &response.model)
+        .copy_from_request(request)
+        .status(ResponseStatus::InProgress)
+        .output(vec![])
+        .build();
+    send_ws_message(
+        &outbound_tx,
+        json!({ "type": "response.created", "response": in_progress_response }),
+    )?;
+    send_ws_message(
+        &outbound_tx,
+        json!({ "type": "response.completed", "response": response.clone() }),
+    )?;
 
     persist_response_if_needed(
         ctx.conversation_storage.clone(),

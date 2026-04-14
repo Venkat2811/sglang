@@ -193,17 +193,21 @@ async fn process_and_transform_stream(
 
     // Process stream chunks, handling SSE records even when multiple events are
     // coalesced into one body chunk or split across chunk boundaries.
+    // We track a start offset to avoid O(n^2) reallocation; compact only when
+    // the consumed prefix exceeds half the buffer.
+    let mut sse_start = 0usize;
     'stream: while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| format!("Stream read error: {}", e))?;
         let chunk_str = String::from_utf8_lossy(&chunk).replace("\r\n", "\n");
         pending_sse.push_str(&chunk_str);
 
-        while let Some(record_end) = pending_sse.find("\n\n") {
-            let record = pending_sse[..record_end].to_string();
-            pending_sse = pending_sse[record_end + 2..].to_string();
+        while let Some(rel_end) = pending_sse[sse_start..].find("\n\n") {
+            let record_end = sse_start + rel_end;
+            let record = &pending_sse[sse_start..record_end];
+            sse_start = record_end + 2;
 
             match process_non_mcp_sse_record(
-                &record,
+                record,
                 &mut accumulator,
                 &mut event_emitter,
                 sink,
@@ -217,11 +221,17 @@ async fn process_and_transform_stream(
                 }
             }
         }
+
+        // Compact buffer when consumed prefix exceeds half the capacity
+        if sse_start > pending_sse.len() / 2 {
+            pending_sse = pending_sse[sse_start..].to_string();
+            sse_start = 0;
+        }
     }
 
-    if !upstream_error_forwarded && !pending_sse.trim().is_empty() {
+    if !upstream_error_forwarded && !pending_sse[sse_start..].trim().is_empty() {
         if let SseRecordOutcome::UpstreamError = process_non_mcp_sse_record(
-            &pending_sse,
+            &pending_sse[sse_start..],
             &mut accumulator,
             &mut event_emitter,
             sink,
@@ -498,7 +508,10 @@ impl StreamingResponseAccumulator {
 
         // Process first choice (responses API doesn't support n>1)
         if let Some(choice) = chunk.choices.first() {
-            // Accumulate content
+            // Accumulate content only when no tool calls have been seen.
+            // When tool calls are present, content is typically empty or
+            // whitespace; including it would create a spurious Message
+            // output item alongside the FunctionToolCall items.
             if let Some(content) = &choice.delta.content {
                 if self.tool_calls.is_empty() {
                     self.content_buffer.push_str(content);

@@ -18,6 +18,7 @@ import urllib.request
 from pathlib import Path
 
 import pytest
+from ws_utils import gateway_ws_url as _gateway_ws_url, percentile as _percentile_impl
 
 logger = logging.getLogger(__name__)
 
@@ -31,23 +32,9 @@ _WS_BENCHMARK_MODEL = os.environ.get("SGLANG_WS_BENCHMARK_MODEL", "llama-1b")
 _WS_BENCH_BACKENDS = ["grpc"]
 
 
-def _gateway_ws_url(base_url: str) -> str:
-    if base_url.startswith("https://"):
-        return f"wss://{base_url.removeprefix('https://')}/v1/responses"
-    return f"ws://{base_url.removeprefix('http://')}/v1/responses"
-
-
 def _percentile(values: list[float], percentile: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return ordered[0]
-    rank = (len(ordered) - 1) * percentile
-    lower = int(rank)
-    upper = min(lower + 1, len(ordered) - 1)
-    weight = rank - lower
-    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+    """Wrapper to keep call-sites unchanged (0-1 scale -> 0-100 scale)."""
+    return _percentile_impl(values, percentile * 100)
 
 
 def _benchmark_request_body(model: str) -> dict:

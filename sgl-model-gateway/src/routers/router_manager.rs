@@ -618,7 +618,19 @@ impl RouterTrait for RouterManager {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let selected_model = model_id.or(Some(body.model.as_str()));
+        let effective_model_id = if self.enable_igw {
+            let model = model_id.or(Some(body.model.as_str()));
+            match self.resolve_model_id(model) {
+                Ok(id) => Some(id),
+                Err(err_response) => return *err_response,
+            }
+        } else {
+            None
+        };
+        let selected_model = effective_model_id
+            .as_deref()
+            .or(model_id)
+            .or(Some(body.model.as_str()));
         let router = self.select_router_for_request(headers, selected_model);
 
         if let Some(router) = router {
