@@ -504,7 +504,7 @@ pub(super) fn build_next_request(
     // current request except the ones we explicitly override.
     ResponsesRequest {
         input: ResponseInput::Items(input_items),
-        store: Some(false),      // Don't store intermediate responses
+        store: Some(false), // Don't store intermediate responses
         background: Some(false),
         previous_response_id: None,
         conversation: None,

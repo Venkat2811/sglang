@@ -206,11 +206,11 @@ fn format_duration_label(duration: Duration) -> String {
         return pluralize(seconds as u128, "second");
     }
 
-    if seconds < 3_600 && seconds % 60 == 0 {
+    if seconds < 3_600 && seconds.is_multiple_of(60) {
         return pluralize((seconds / 60) as u128, "minute");
     }
 
-    if seconds % 3_600 == 0 {
+    if seconds.is_multiple_of(3_600) {
         return pluralize((seconds / 3_600) as u128, "hour");
     }
 
@@ -299,10 +299,12 @@ pub async fn serve_responses_ws_with_config(
                 None,
             )
             .await;
-            let _ = outbound_tx.send(Message::Close(Some(CloseFrame {
-                code: axum::extract::ws::close_code::NORMAL,
-                reason: message.into(),
-            }))).await;
+            let _ = outbound_tx
+                .send(Message::Close(Some(CloseFrame {
+                    code: axum::extract::ws::close_code::NORMAL,
+                    reason: message.into(),
+                })))
+                .await;
         })
     };
 

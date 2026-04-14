@@ -104,8 +104,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                             },
                         });
                         if let Some(output_text) = output {
-                            pending_tool_outputs
-                                .push((call_id.clone(), output_text.clone()));
+                            pending_tool_outputs.push((call_id.clone(), output_text.clone()));
                         }
                     }
                     other => {
@@ -258,7 +257,10 @@ fn role_to_chat_message(role: &str, text: String) -> ChatMessage {
             name: None,
         },
         other => {
-            tracing::warn!(role = other, "unknown message role in responses input, treating as user");
+            tracing::warn!(
+                role = other,
+                "unknown message role in responses input, treating as user"
+            );
             ChatMessage::User {
                 content: MessageContent::Text(text),
                 name: None,

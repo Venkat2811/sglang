@@ -663,9 +663,7 @@ impl RouterTrait for RouterManager {
                     "message": "No router supports WebSocket Responses for this request."
                 }
             });
-            let _ = socket
-                .send(Message::Text(error.to_string().into()))
-                .await;
+            let _ = socket.send(Message::Text(error.to_string().into())).await;
             let _ = socket.close().await;
         }
     }

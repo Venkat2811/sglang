@@ -18,7 +18,8 @@ import urllib.request
 from pathlib import Path
 
 import pytest
-from ws_utils import gateway_ws_url as _gateway_ws_url, percentile as _percentile_impl
+from ws_utils import gateway_ws_url as _gateway_ws_url
+from ws_utils import percentile as _percentile_impl
 
 logger = logging.getLogger(__name__)
 
@@ -499,6 +500,11 @@ async def _run_concurrency_profile(
     concurrency_levels: list[int],
     samples_per_concurrency: int,
 ) -> dict:
+    # Warmup: run a single request to exclude cold-start costs (model load,
+    # JIT compilation, connection pool init) from timed samples.
+    logger.info("Warmup: sending one request before timed samples")
+    await _run_single_ws_sample(ws_url, model)
+
     results = []
     for concurrency in concurrency_levels:
         samples: list[dict[str, float | int]] = []
