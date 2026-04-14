@@ -59,6 +59,11 @@ use crate::{
     },
 };
 
+/// Generate a unique item ID with the given prefix (e.g. `"fc"` → `"fc_a1b2c3..."`).
+fn generate_item_id(prefix: &str) -> String {
+    format!("{}_{}", prefix, Uuid::new_v4().to_string().replace("-", ""))
+}
+
 // ============================================================================
 // Non-MCP Streaming Path
 // ============================================================================
@@ -511,10 +516,11 @@ impl StreamingResponseAccumulator {
                     // Use index directly (it's a u32, not Option<u32>)
                     let index = delta.index as usize;
 
-                    // Ensure we have enough tool calls
+                    // Ensure we have enough tool calls.  The item `id` is
+                    // pre-generated so it remains stable across deltas.
                     while self.tool_calls.len() <= index {
                         self.tool_calls.push(ResponseOutputItem::FunctionToolCall {
-                            id: String::new(),
+                            id: generate_item_id("fc"),
                             call_id: String::new(),
                             name: String::new(),
                             arguments: String::new(),
@@ -525,16 +531,18 @@ impl StreamingResponseAccumulator {
 
                     // Update the tool call at this index
                     if let ResponseOutputItem::FunctionToolCall {
-                        id,
                         call_id,
                         name,
                         arguments,
                         ..
                     } = &mut self.tool_calls[index]
                     {
+                        // The tool call ID arrives on the first delta; assign
+                        // once rather than appending on every chunk.
                         if let Some(delta_id) = &delta.id {
-                            id.push_str(delta_id);
-                            call_id.push_str(delta_id);
+                            if call_id.is_empty() {
+                                call_id.clone_from(delta_id);
+                            }
                         }
                         if let Some(function) = &delta.function {
                             if let Some(delta_name) = &function.name {
@@ -719,7 +727,7 @@ pub(super) async fn execute_tool_loop_streaming_with_sink(
     original_request: &ResponsesRequest,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    outbound_tx: mpsc::UnboundedSender<Message>,
+    outbound_tx: mpsc::Sender<Message>,
 ) -> Result<ResponsesResponse, String> {
     let sink = WsResponseEventSink::new(outbound_tx);
     execute_tool_loop_streaming_internal(
@@ -1238,7 +1246,10 @@ async fn execute_tool_loop_streaming_internal(
     }
 }
 
-/// Convert chat stream to Responses API events while accumulating for tool call detection
+/// Convert chat stream to Responses API events while accumulating for tool call detection.
+///
+/// Like the non-MCP path, uses a `pending_sse` buffer to correctly handle SSE
+/// records that are split across chunk boundaries or coalesced into a single chunk.
 async fn convert_and_accumulate_stream(
     body: Body,
     emitter: &mut ResponseStreamEventEmitter,
@@ -1246,25 +1257,41 @@ async fn convert_and_accumulate_stream(
 ) -> Result<ChatCompletionResponse, String> {
     let mut accumulator = ChatResponseAccumulator::new();
     let mut stream = body.into_data_stream();
+    let mut pending_sse = String::new();
 
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| format!("Stream read error: {}", e))?;
+        let chunk_str = String::from_utf8_lossy(&chunk).replace("\r\n", "\n");
+        pending_sse.push_str(&chunk_str);
 
-        // Parse chunk
-        let event_str = String::from_utf8_lossy(&chunk);
-        let event = event_str.trim();
+        while let Some(record_end) = pending_sse.find("\n\n") {
+            let record = pending_sse[..record_end].to_string();
+            pending_sse = pending_sse[record_end + 2..].to_string();
 
-        if event == "data: [DONE]" {
-            break;
+            let record = record.trim();
+            if record == "data: [DONE]" {
+                return Ok(accumulator.finalize());
+            }
+
+            if let Some(json_str) = record.strip_prefix("data: ") {
+                let json_str = json_str.trim();
+                if let Ok(chat_chunk) =
+                    serde_json::from_str::<ChatCompletionStreamResponse>(json_str)
+                {
+                    emitter.process_chunk(&chat_chunk, sink)?;
+                    accumulator.process_chunk(&chat_chunk);
+                }
+            }
         }
+    }
 
-        if let Some(json_str) = event.strip_prefix("data: ") {
+    // Flush any remaining partial record.
+    let remaining = pending_sse.trim();
+    if !remaining.is_empty() && remaining != "data: [DONE]" {
+        if let Some(json_str) = remaining.strip_prefix("data: ") {
             let json_str = json_str.trim();
             if let Ok(chat_chunk) = serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
-                // Convert chat chunk to Responses API events and emit
                 emitter.process_chunk(&chat_chunk, sink)?;
-
-                // Accumulate for tool call detection
                 accumulator.process_chunk(&chat_chunk);
             }
         }

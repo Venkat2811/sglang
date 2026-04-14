@@ -10,7 +10,10 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use axum::{
     body::Body,
-    extract::{ws::WebSocket, Request},
+    extract::{
+        ws::{Message, WebSocket},
+        Request,
+    },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -640,6 +643,17 @@ impl RouterTrait for RouterManager {
         if let Some(router) = self.select_router_for_ws(&headers) {
             router.route_responses_ws(headers, socket).await;
         } else {
+            let error = serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "server_error",
+                    "code": "no_ws_router_available",
+                    "message": "No router supports WebSocket Responses for this request."
+                }
+            });
+            let _ = socket
+                .send(Message::Text(error.to_string().into()))
+                .await;
             let _ = socket.close().await;
         }
     }
