@@ -298,7 +298,7 @@ class TestDcpStoragePages(CustomTestCase):
                             target.kv_buffer, expected, rtol=0, atol=0
                         )
 
-    def test_invalid_logical_starts_and_zero_copy_are_rejected(self):
+    def test_invalid_logical_starts_are_rejected(self):
         pool = _make_host_pool(1, dcp_size=2, layout="page_first")
         for index in (-128, 1, 64):
             with self.subTest(index=index), self.assertRaises(ValueError):
@@ -307,8 +307,9 @@ class TestDcpStoragePages(CustomTestCase):
                 pool.set_from_flat_data_page(index, pool.get_dummy_flat_data_page())
         with self.assertRaises(IndexError):
             pool.get_data_page(pool.logical_size)
-        with self.assertRaises(NotImplementedError):
-            pool.get_page_buffer_meta(torch.arange(128))
+        pointers, sizes = pool.get_page_buffer_meta(torch.arange(128))
+        self.assertEqual(pointers, [pool.kv_buffer.data_ptr()])
+        self.assertEqual(sizes, [64 * 2 * 12 * pool.kv_buffer.element_size()])
 
 
 if __name__ == "__main__":

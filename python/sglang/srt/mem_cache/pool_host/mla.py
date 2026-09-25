@@ -1068,7 +1068,24 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         meta data for zero copy
         """
         if self.dcp_size > 1:
-            raise NotImplementedError("DCP L3 zero-copy storage is not supported.")
+            if (
+                indices.ndim != 1
+                or indices.dtype not in (torch.int32, torch.int64)
+                or len(indices) % self.logical_page_size
+            ):
+                raise ValueError("DCP L3 indices must contain complete logical pages.")
+            pages = indices.reshape(-1, self.logical_page_size)
+            starts = pages[:, 0]
+            for start in starts.tolist():
+                self._storage_page_index(start)
+            offsets = torch.arange(self.logical_page_size, device=indices.device)
+            if not torch.equal(pages, starts[:, None] + offsets):
+                raise ValueError(
+                    "DCP L3 indices must contain contiguous logical pages."
+                )
+            # The controller supplies logical rows; pointers and byte sizes use
+            # only this rank's physical shard. Translate exactly once.
+            indices = maybe_dcp_kernel_indices(indices, self.dcp_size, self.dcp_rank)
         assert len(indices) % self.page_size == 0
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()

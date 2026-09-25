@@ -554,7 +554,7 @@ class HiCacheController:
                 "page_first_direct",
             ):
                 raise NotImplementedError(
-                    "HiCache L3 with DCP requires a generic MLA file-page layout."
+                    "HiCache L3 with DCP requires a generic MLA storage-page layout."
                 )
             if (
                 getattr(self.storage_host_pool.device_pool, "kv_scale_buffer", None)
