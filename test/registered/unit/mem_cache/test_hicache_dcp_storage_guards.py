@@ -1,16 +1,24 @@
-"""Startup and runtime support boundaries for DCP file storage."""
+"""Startup and runtime support boundaries for DCP storage."""
 
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from test_hicache_dcp_host_pool import _make_host_pool
+
 from sglang.srt.arg_groups.hicache_hook import (
     resolve_hicache_dcp_compatibility,
     validate_hicache_dcp_storage,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
+from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -33,7 +41,49 @@ def _args(**changes):
     return ServerArgs(**options)
 
 
-class TestDcpStorageGuards(unittest.TestCase):
+class TestDcpStorageGuards(CustomTestCase):
+    def test_dynamic_sidecar_cannot_bypass_single_pool_storage_guard(self):
+        for dcp in (1, 2):
+            with self.subTest(dcp=dcp):
+                pool = _make_host_pool(0, dcp_size=dcp, layout="page_first")
+                anchor = PoolEntry(
+                    PoolName.KV,
+                    pool,
+                    pool.device_pool,
+                    lambda x: x,
+                    is_primary_index_anchor=True,
+                )
+                sidecar = PoolEntry(PoolName.DRAFT, pool, pool.device_pool, lambda x: x)
+                controller = HybridCacheController.__new__(HybridCacheController)
+                controller.mem_pool_host = HostPoolGroup([anchor])
+                controller.enable_storage = True
+                controller.storage_config = SimpleNamespace(dcp_size=dcp)
+                controller.storage_backend = mock.Mock()
+                controller.extra_host_mem_release_queues = {}
+                if dcp > 1:
+                    with self.assertRaisesRegex(
+                        NotImplementedError, "one materialized MLA"
+                    ):
+                        controller.register_host_pool_entry(sidecar)
+                    self.assertEqual(controller.mem_pool_host.entries, [anchor])
+                    self.assertEqual(controller.extra_host_mem_release_queues, {})
+                else:
+                    controller.register_host_pool_entry(sidecar)
+                    self.assertEqual(
+                        controller.mem_pool_host.entries, [anchor, sidecar]
+                    )
+                    self.assertIn(
+                        PoolName.DRAFT, controller.extra_host_mem_release_queues
+                    )
+
+    def test_mooncake_uses_the_same_startup_and_attach_validation(self):
+        with mock.patch(
+            "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
+        ):
+            args = _args(hicache_storage_backend="mooncake")
+            resolve_hicache_dcp_compatibility(args)
+            validate_hicache_dcp_storage(_args(), storage_backend="mooncake")
+
     def test_supported_topologies(self):
         with mock.patch(
             "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
@@ -89,7 +139,7 @@ class TestDcpStorageGuards(unittest.TestCase):
         for attached in (False, True):
             for mla, backend, message in (
                 (False, "file", "MLA"),
-                (True, "mooncake", "file storage"),
+                (True, "nixl", "file or Mooncake storage"),
             ):
                 cache = SimpleNamespace(
                     cache_controller=SimpleNamespace(), enable_storage=attached

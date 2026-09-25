@@ -145,14 +145,16 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
 
 
 def validate_hicache_dcp_storage(server_args: Any, *, storage_backend=None):
-    """Only the MLA file path currently implements DCP shard storage."""
+    """Backends implementing fixed-topology MLA DCP shard storage."""
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1:
         return
     if not use_mla_backend(server_args):
         raise NotImplementedError("HiCache L3 with DCP requires MLA.")
-    if (storage_backend or cfg.hicache_storage_backend) != "file":
-        raise NotImplementedError("HiCache L3 with DCP requires file storage.")
+    if (storage_backend or cfg.hicache_storage_backend) not in ("file", "mooncake"):
+        raise NotImplementedError(
+            "HiCache L3 with DCP requires file or Mooncake storage."
+        )
 
 
 def resolve_layout_io_compatibility(server_args: Any):
