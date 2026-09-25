@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -221,6 +222,177 @@ def _io(store, config, pages, api, write):
     return method([PoolTransfer(PoolName.KV, host_indices=indices, keys=KEYS)])[
         PoolName.KV
     ]
+
+
+def _mamba_pool(
+    *,
+    capacity=8,
+    layers=2,
+    layout="page_first",
+    temporal_dtype=torch.float32,
+    temporal_shape=(2, 3),
+    conv_dtype=torch.bfloat16,
+    conv_shapes=((3, 4), (3, 4)),
+):
+    device = SimpleNamespace(
+        size=capacity,
+        device="cpu",
+        num_mamba_layers=layers,
+        mamba_cache=SimpleNamespace(
+            temporal=torch.empty(
+                (layers, capacity, *temporal_shape), dtype=temporal_dtype
+            ),
+            conv=[
+                torch.empty((layers, capacity, *shape), dtype=conv_dtype)
+                for shape in conv_shapes
+            ],
+        ),
+    )
+    return MambaPoolHost(
+        device,
+        host_to_device_ratio=2,
+        host_size=0,
+        pin_memory=False,
+        device="cpu",
+        layout=layout,
+    )
+
+
+def _own_mamba(client, pool, slots):
+    # Independent slot slices, without the production pointer descriptor helper.
+    client.owned.extend(
+        (buffer[slot].data_ptr(), buffer[slot].numel() * buffer.element_size())
+        for buffer in pool.get_hybrid_pool_buffer()
+        for slot in slots
+        if buffer[slot].numel()
+    )
+
+
+class TestMooncakeDcpMambaStorage(CustomTestCase):
+    def test_incompatible_state_formats_miss_even_when_object_sizes_match(self):
+        """Equal bytes do not imply equal KDA shape, precision or component order."""
+        config = _config(tp=4, dcp=2, rank=2)
+        objects = {}
+        kv = _pool(config)
+        state = _mamba_pool()
+        store = _store(config, kv, objects)
+        store.register_mem_host_pool_v2(state, PoolName.MAMBA)
+        store.store.own(kv, SOURCE_PAGES)
+        self.assertEqual(_io(store, config, SOURCE_PAGES, 1, True), [True] * 3)
+        _own_mamba(store.store, state, SOURCE_PAGES[:2])
+        transfer = PoolTransfer(
+            PoolName.MAMBA, host_indices=torch.tensor(SOURCE_PAGES[:2]), keys=KEYS[:2]
+        )
+        self.assertEqual(store.batch_set_v2([transfer])[PoolName.MAMBA], [True] * 2)
+        for changes in (
+            {"temporal_shape": (3, 2)},
+            {"temporal_dtype": torch.bfloat16, "temporal_shape": (2, 6)},
+            {"conv_dtype": torch.float16},
+            {"conv_shapes": ((2, 6), (3, 4))},
+            {"layers": 1, "temporal_shape": (4, 3), "conv_shapes": ((6, 4), (6, 4))},
+            {"layout": "page_first_direct"},
+        ):
+            with self.subTest(changes=changes):
+                reader_kv = _pool(config)
+                reader_state = _mamba_pool(**changes)
+                reader = _store(config, reader_kv, objects)
+                reader.register_mem_host_pool_v2(reader_state, PoolName.MAMBA)
+                reader.store.own(reader_kv, TARGET_PAGES)
+                _own_mamba(reader.store, reader_state, TARGET_PAGES[:2])
+                for buf in reader_state.get_hybrid_pool_buffer():
+                    buf.view(torch.uint8).fill_(165)
+                before = [
+                    buf.view(torch.uint8).clone()
+                    for buf in reader_state.get_hybrid_pool_buffer()
+                ]
+                incoming = PoolTransfer(
+                    PoolName.MAMBA,
+                    host_indices=torch.tensor(TARGET_PAGES[:2]),
+                    keys=KEYS[:2],
+                )
+                self.assertEqual(
+                    reader.batch_exists_v2(KEYS[:2], [incoming]).kv_hit_pages, 0
+                )
+                self.assertEqual(
+                    reader.batch_get_v2([incoming])[PoolName.MAMBA], [False] * 2
+                )
+                for actual, expected in zip(
+                    reader_state.get_hybrid_pool_buffer(), before
+                ):
+                    torch.testing.assert_close(
+                        actual.view(torch.uint8), expected, rtol=0, atol=0
+                    )
+
+    def test_tp_state_shards_round_trip_into_unrelated_slots(self):
+        """MLA replicas share keys, but each TP rank must restore its own state."""
+        for tp, dcp in ((4, 2), (4, 4), (8, 4), (16, 16)):
+            objects, expected = {}, {}
+            for rank in range(tp):
+                config = _config(tp=tp, dcp=dcp, rank=rank)
+                kv, state = _pool(config), _mamba_pool()
+                store = _store(config, kv, objects)
+                store.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                _own_mamba(store.store, state, (5, 1))
+                expected[rank] = []
+                for component, buf in enumerate(state.get_hybrid_pool_buffer()):
+                    for slot, boundary in ((5, 1), (1, 2)):
+                        buf[slot].view(torch.uint8).fill_(
+                            rank * 11 + component * 3 + boundary
+                        )
+                    expected[rank].append(buf[[5, 1]].view(torch.uint8).clone())
+                outgoing = PoolTransfer(
+                    PoolName.MAMBA, host_indices=torch.tensor([5, 1]), keys=KEYS[:2]
+                )
+                self.assertEqual(
+                    store.batch_set_v2([outgoing])[PoolName.MAMBA], [True] * 2
+                )
+            self.assertEqual(
+                sum(key.startswith(store.config_prefix + "_") for key in objects),
+                tp * 2 * 3,
+            )
+            for rank in range(tp):
+                with self.subTest(tp=tp, dcp=dcp, rank=rank):
+                    config = _config(tp=tp, dcp=dcp, rank=rank)
+                    kv, state = _pool(config), _mamba_pool(capacity=12)
+                    store = _store(config, kv, objects)
+                    store.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                    _own_mamba(store.store, state, (3, 9))
+                    for buf in state.get_hybrid_pool_buffer():
+                        buf.view(torch.uint8).fill_(165)
+                    incoming = PoolTransfer(
+                        PoolName.MAMBA, host_indices=torch.tensor([3, 9]), keys=KEYS[:2]
+                    )
+                    self.assertEqual(
+                        store.batch_get_v2([incoming])[PoolName.MAMBA], [True] * 2
+                    )
+                    for buf, values in zip(
+                        state.get_hybrid_pool_buffer(), expected[rank]
+                    ):
+                        oracle = torch.full_like(buf.view(torch.uint8), 165)
+                        oracle[[3, 9]] = values
+                        torch.testing.assert_close(
+                            buf.view(torch.uint8), oracle, rtol=0, atol=0
+                        )
+
+    def test_dcp1_state_keys_keep_the_existing_format(self):
+        config = _config(tp=4, dcp=1, rank=2)
+        kv, state = _pool(config), _mamba_pool()
+        objects = {}
+        store = _store(config, kv, objects)
+        store.register_mem_host_pool_v2(state, PoolName.MAMBA)
+        _own_mamba(store.store, state, (5,))
+        before_keys = set(objects)
+        transfer = PoolTransfer(
+            PoolName.MAMBA, host_indices=torch.tensor([5]), keys=KEYS[:1]
+        )
+        self.assertEqual(store.batch_set_v2([transfer])[PoolName.MAMBA], [True])
+        self.assertEqual(
+            set(objects) - before_keys,
+            {
+                f"{store.config_prefix}_{KEYS[0]}_2_{component}"
+                for component in ("temporal", "conv_0", "conv_1")
+            },
+        )
 
 
 class TestMooncakeDcpStorage(CustomTestCase):
