@@ -5,12 +5,22 @@ import pytest
 import torch
 
 from sglang.kernels.ops.kvcache.hicache import can_use_write_back_jit_kernel
+from sglang.srt.configs.mamba_utils import (
+    KimiLinearCacheParams,
+    KimiLinearStateShape,
+    Mamba2StateDType,
+)
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    MambaPool,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+)
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
 )
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
@@ -679,6 +689,133 @@ def test_mla_dcp_storage_descriptors_round_trip_on_gpu(layout, backend, dcp):
                     )
             torch.cuda.synchronize()
             for actual, wanted in zip(device_pool.kv_buffer, expected):
+                torch.testing.assert_close(
+                    actual.view(torch.uint8), wanted.view(torch.uint8), rtol=0, atol=0
+                )
+        finally:
+            torch.cuda.synchronize()
+            for host in hosts:
+                host.destroy()
+
+
+@pytest.mark.parametrize(
+    "layout,backend", [("page_first", "kernel"), ("page_first_direct", "direct")]
+)
+@pytest.mark.parametrize("temporal_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("tp", [4, 16])
+def test_kda_storage_descriptors_round_trip_on_gpu(layout, backend, temporal_dtype, tp):
+    """A TP state slot must survive GPU/host/storage copies independently of KV pages.
+
+    Exercise Kimi's transposed convolution shape and mixed component precisions.
+    Descriptor bytes model the synchronous storage boundary; other tests cover
+    Mooncake and rank agreement. No model or distributed GPU group is needed.
+    """
+    shape = KimiLinearStateShape.create(tp_world_size=tp, num_heads=32, head_dim=16)
+    params = KimiLinearCacheParams(
+        shape=shape,
+        layers=[1, 3],
+        dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=temporal_dtype),
+    )
+    for rank in (0, tp - 1):
+        pool = MambaPool(
+            size=16,
+            spec_state_size=0,
+            cache_params=params,
+            mamba_layer_ids=params.layers,
+            device=DEVICE,
+        )
+        hosts = []
+        try:
+            for _ in range(2):
+                hosts.append(
+                    MambaPoolHost(
+                        pool,
+                        host_to_device_ratio=2,
+                        host_size=0,
+                        pin_memory=True,
+                        layout=layout,
+                    )
+                )
+            source, target = hosts
+            buffers = [pool.mamba_cache.temporal, *pool.mamba_cache.conv]
+            source_slots, target_slots = (7, 2, 11), (4, 10, 1)
+            source_host, target_host = (5, 1, 9), (8, 3, 0)
+            originals, expected = [], []
+            for component, buffer in enumerate(buffers):
+                words = buffer.view(torch.int16)
+                words.copy_(
+                    (
+                        torch.arange(words.numel(), device=DEVICE)
+                        + component * 7001
+                        + rank * 1009
+                    ).reshape(words.shape)
+                )
+                originals.append(buffer.cpu().clone())
+                wanted = torch.full_like(buffer, 3)
+                for src, dst in zip(source_slots, target_slots):
+                    wanted[:, dst] = buffer[:, src]
+                expected.append(wanted)
+            for host in hosts:
+                for buffer in host.get_hybrid_pool_buffer():
+                    buffer.fill_(3)
+            index_device = "cpu" if backend == "direct" else DEVICE
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                source.backup_from_device_all_layer(
+                    pool,
+                    torch.tensor(source_host),
+                    torch.tensor(source_slots, device=index_device),
+                    backend,
+                )
+            stream.synchronize()
+            # Check every host slot before using descriptors, so symmetric
+            # descriptor mistakes cannot hide a wrong device-to-host copy.
+            for actual, original in zip(source.get_hybrid_pool_buffer(), originals):
+                wanted = torch.full_like(actual, 3)
+                for src, dst in zip(source_slots, source_host):
+                    wanted[dst, :, 0] = original[:, src]
+                torch.testing.assert_close(
+                    actual.view(torch.uint8), wanted.view(torch.uint8), rtol=0, atol=0
+                )
+            src_ptrs, sizes = source.get_page_buffer_meta(torch.tensor(source_host))
+            dst_ptrs, dst_sizes = target.get_page_buffer_meta(torch.tensor(target_host))
+            assert sizes == dst_sizes
+            assert sum(sizes) == len(source_slots) * sum(
+                b[:, 0].numel() * b.element_size() for b in buffers
+            )
+            for src, dst, size in zip(src_ptrs, dst_ptrs, sizes):
+                for host, ptr, slots in (
+                    (source, src, source_host),
+                    (target, dst, target_host),
+                ):
+                    assert any(
+                        b[slot].data_ptr() <= ptr
+                        and ptr + size <= b[slot].data_ptr() + b[slot].nbytes
+                        for b in host.get_hybrid_pool_buffer()
+                        for slot in slots
+                    )
+                ctypes.memmove(dst, ctypes.string_at(src, size), size)
+            for actual, original in zip(target.get_hybrid_pool_buffer(), originals):
+                wanted = torch.full_like(actual, 3)
+                for src, dst in zip(source_slots, target_host):
+                    wanted[dst, :, 0] = original[:, src]
+                torch.testing.assert_close(
+                    actual.view(torch.uint8), wanted.view(torch.uint8), rtol=0, atol=0
+                )
+            with torch.cuda.stream(stream):
+                for buffer in buffers:
+                    buffer.fill_(3)
+                for layer in range(len(params.layers)):
+                    target.load_to_device_per_layer(
+                        pool,
+                        torch.tensor(target_host),
+                        torch.tensor(target_slots, device=index_device),
+                        layer,
+                        backend,
+                    )
+            stream.synchronize()
+            for actual, wanted in zip(buffers, expected):
                 torch.testing.assert_close(
                     actual.view(torch.uint8), wanted.view(torch.uint8), rtol=0, atol=0
                 )
