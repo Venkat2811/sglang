@@ -66,6 +66,7 @@ class _FaultClient:
         self.rank = rank
         self.hashes = hashes
         self.mode = None
+        self.put_keys = []
         self.entered = threading.Event()
         self.release = threading.Event()
 
@@ -89,6 +90,8 @@ class _FaultClient:
                     self.entered.set()
                     assert self.release.wait(15), "test did not release native IO"
             result = method(keys, *args)
+            if kind == "put":
+                self.put_keys.extend(keys)
             if (
                 self.rank == 1
                 and self.mode == "short_read"
@@ -438,9 +441,9 @@ def _worker(rank, directory, objects, cases=CASES, address=None):
         dist.destroy_process_group()
 
 
-def run_workers(directory, objects, cases=CASES, address=None):
+def run_workers(directory, objects, cases=CASES, address=None, worker=_worker):
     context = mp.spawn(
-        _worker, args=(directory, objects, cases, address), nprocs=4, join=False
+        worker, args=(directory, objects, cases, address), nprocs=4, join=False
     )
     deadline = time.monotonic() + 180
     try:

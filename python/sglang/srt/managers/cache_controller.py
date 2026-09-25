@@ -1262,6 +1262,17 @@ class HiCacheController:
 
         return hash_value, storage_query_count
 
+    def _reduce_storage_hit_count(
+        self, operation, storage_hit_count: int, sync_groups=None
+    ) -> int:
+        hit_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce(
+            hit_tensor,
+            torch.distributed.ReduceOp.MIN,
+            self.prefetch_hits_sync_groups if sync_groups is None else sync_groups,
+        )
+        return int(hit_tensor.item())
+
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
@@ -1275,15 +1286,9 @@ class HiCacheController:
                     hash_value, storage_hit_count = [], 0
                 else:
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
+                storage_hit_count = self._reduce_storage_hit_count(
+                    operation, storage_hit_count
                 )
-                self._all_reduce(
-                    storage_hit_count_tensor,
-                    torch.distributed.ReduceOp.MIN,
-                    self.prefetch_hits_sync_groups,
-                )
-                storage_hit_count = storage_hit_count_tensor.item()
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.
