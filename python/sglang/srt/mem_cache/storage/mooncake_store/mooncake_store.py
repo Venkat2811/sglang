@@ -1378,37 +1378,58 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             config = self._replicate_config_cls()
             config.group_ids = group_ids
 
-        if self._uses_multi_buffer(buffer_ptrs):
-            config = config or self._replicate_config_cls()
-            return self.store.batch_put_from_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes, config
-            )
-        elif config is not None:
-            return self.store.batch_put_from(
-                key_strs, buffer_ptrs, buffer_sizes, config
-            )
-        else:
-            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        try:
+            if self._uses_multi_buffer(buffer_ptrs):
+                config = config or self._replicate_config_cls()
+                results = self.store.batch_put_from_multi_buffers(
+                    key_strs, buffer_ptrs, buffer_sizes, config
+                )
+            elif config is not None:
+                results = self.store.batch_put_from(
+                    key_strs, buffer_ptrs, buffer_sizes, config
+                )
+            else:
+                results = self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        except Exception:
+            # Native calls are synchronous: after return/raise their buffers
+            # can be released by the normal controller completion protocol.
+            logger.exception("Mooncake batch PUT failed")
+            return [-1] * len(key_strs)
+        return self._checked_batch_results(results, len(key_strs), "PUT")
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
-        if self._uses_multi_buffer(buffer_ptrs):
-            results = self.store.batch_get_into_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes
-            )
-            expected_sizes = [sum(sizes) for sizes in buffer_sizes]
-        else:
-            results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
-            expected_sizes = buffer_sizes
-        if len(results) != len(key_strs):
+        multi_buffer = self._uses_multi_buffer(buffer_ptrs)
+        expected_sizes = (
+            [sum(sizes) for sizes in buffer_sizes] if multi_buffer else buffer_sizes
+        )
+        try:
+            if multi_buffer:
+                results = self.store.batch_get_into_multi_buffers(
+                    key_strs, buffer_ptrs, buffer_sizes
+                )
+            else:
+                results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        except Exception:
+            logger.exception("Mooncake batch GET failed")
             return [-1] * len(key_strs)
+        results = self._checked_batch_results(results, len(key_strs), "GET")
         # A positive count can still be a truncated object. Only a complete
         # physical shard is safe for the controller to publish as restored.
         return [
             result if result == expected else -1
             for result, expected in zip(results, expected_sizes)
         ]
+
+    @staticmethod
+    def _checked_batch_results(results, count: int, operation: str) -> List[int]:
+        if not isinstance(results, Sequence) or len(results) != count:
+            logger.warning(
+                "Mooncake batch %s returned an invalid result count", operation
+            )
+            return [-1] * count
+        return results
 
     def _batch_exist(
         self, key_strs: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
@@ -1427,14 +1448,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     f"{self._dcp_namespace}_pp{pp_rank}_{key[len(prefix) :]}"
                     for key in key_strs
                 ]
-                return self.store.batch_is_exist(key_strs)
-            # PP is the last rank field before the pool suffix. Replace from
-            # the right so an identical TP rank or backend tag stays unchanged.
-            key_strs = [
-                f"_{pp_rank}_".join(key.rsplit(f"_{self.pp_rank}_", 1))
-                for key in key_strs
-            ]
-        return self.store.batch_is_exist(key_strs)
+            else:
+                # PP is the last rank field before the pool suffix. Replace from
+                # the right so an identical TP rank or backend tag stays unchanged.
+                key_strs = [
+                    f"_{pp_rank}_".join(key.rsplit(f"_{self.pp_rank}_", 1))
+                    for key in key_strs
+                ]
+        try:
+            results = self.store.batch_is_exist(key_strs)
+        except Exception:
+            logger.exception("Mooncake batch EXISTS failed")
+            return [-1] * len(key_strs)
+        return self._checked_batch_results(results, len(key_strs), "EXISTS")
 
     def get_stats(self):
         storage_metrics = StorageMetrics()

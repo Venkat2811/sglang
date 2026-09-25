@@ -4,6 +4,9 @@ Run from the repository root with PYTHONPATH=python:. and a CPU-visible Torch
 environment. Requires mooncake_master on PATH and the Mooncake Python binding.
 No existing service is used: the driver owns a master and a storage donor, and
 both worker processes have zero-byte storage segments. No model weights needed.
+
+Add --controller to exercise four Gloo ranks and real controller workers against
+the same isolated native TCP service, including eviction and in-flight aborts.
 """
 
 import argparse
@@ -83,7 +86,21 @@ def worker(mode, address):
             store.store.close()
 
 
-def run():
+def controller_worker(address):
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parents[2] / "registered/unit/mem_cache")
+    )
+    try:
+        from test_mooncake_dcp_storage_controller import run_workers
+
+        with tempfile.TemporaryDirectory(prefix="mooncake-controller-") as directory:
+            reports = run_workers(directory, None, address=address)
+            assert all(len(rows) == 14 for rows in reports)
+    finally:
+        sys.path.pop(0)
+
+
+def run(controller=False):
     from mooncake.store import MooncakeDistributedStore
 
     with socket.socket() as sock:
@@ -125,7 +142,7 @@ def run():
                     )
                     == 0
                 )
-                for mode in ("write", "read"):
+                for mode in ("controller",) if controller else ("write", "read"):
                     subprocess.run(
                         [
                             sys.executable,
@@ -136,10 +153,12 @@ def run():
                             address,
                         ],
                         check=True,
-                        timeout=180,
+                        timeout=240,
                     )
                 print(
-                    "PASS fresh-process TCP restore: 12 cases, writer exited before reader"
+                    "PASS native TCP controller: 14 scenarios on four Gloo ranks"
+                    if controller
+                    else "PASS fresh-process TCP restore: 12 cases, writer exited before reader"
                 )
             finally:
                 if donor is not None:
@@ -156,10 +175,13 @@ def run():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--worker", choices=("write", "read"))
+    parser.add_argument("--worker", choices=("write", "read", "controller"))
     parser.add_argument("--address")
+    parser.add_argument("--controller", action="store_true")
     args = parser.parse_args()
-    if args.worker:
+    if args.worker == "controller":
+        controller_worker(args.address)
+    elif args.worker:
         worker(args.worker, args.address)
     else:
-        run()
+        run(args.controller)
