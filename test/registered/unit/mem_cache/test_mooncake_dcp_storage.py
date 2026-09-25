@@ -224,6 +224,54 @@ def _io(store, config, pages, api, write):
 
 
 class TestMooncakeDcpStorage(CustomTestCase):
+    def test_native_failures_are_explicit_per_object_failures(self):
+        """A failed native call must not kill workers or acknowledge a write.
+
+        A short result vector also cannot prove that every requested object
+        completed, even when all returned statuses indicate success.
+        """
+        for layout, api, operation, failure in product(
+            ("page_first", "layer_first"),
+            (1, 2),
+            ("get", "put", "exists"),
+            ("exception", "short", "extra", "none"),
+        ):
+            with self.subTest(
+                layout=layout, api=api, operation=operation, failure=failure
+            ):
+                config = _config(layout=layout)
+                pool = _pool(config)
+                store = _store(config, pool, {})
+                native_method = (
+                    "batch_is_exist"
+                    if operation == "exists"
+                    else f"batch_{operation}_{'into' if operation == 'get' else 'from'}"
+                    + ("_multi_buffers" if layout == "layer_first" else "")
+                )
+                outcomes = {
+                    "short": [],
+                    "extra": [1 if operation == "exists" else 0] * 4,
+                    "none": None,
+                }
+                fault = (
+                    {"side_effect": RuntimeError("injected native I/O failure")}
+                    if failure == "exception"
+                    else {"return_value": outcomes[failure]}
+                )
+                with patch.object(store.store, native_method, **fault):
+                    if operation == "exists":
+                        hits = (
+                            store.batch_exists(KEYS)
+                            if api == 1
+                            else store.batch_exists_v2(KEYS).kv_hit_pages
+                        )
+                        self.assertEqual(hits, 0)
+                    else:
+                        self.assertEqual(
+                            _io(store, config, SOURCE_PAGES, api, operation == "put"),
+                            [False] * 3,
+                        )
+
     def test_round_trip_has_no_cross_request_or_cross_shard_writes(self):
         for dcp, layout, api, dtype in product(
             (1, 2, 4, 8, 16),

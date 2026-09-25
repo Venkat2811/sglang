@@ -50,14 +50,21 @@ def _parallel(rank, dcp_size):
     )
 
 
-def _controller(rank, dcp_size=2, is_mla=True, dtype=torch.bfloat16, parallel=None):
+def _controller(
+    rank,
+    dcp_size=2,
+    is_mla=True,
+    dtype=torch.bfloat16,
+    parallel=None,
+    storage_factory=None,
+):
     # GPU allocation and process-group creation are outside this component test.
     device = SimpleNamespace(
         size=256,
         host_capacity_tokens=None,
-        store_dtype=torch.uint8
-        if dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-        else dtype,
+        store_dtype=(
+            torch.uint8 if dtype in (torch.float8_e4m3fn, torch.float8_e5m2) else dtype
+        ),
         dtype=dtype,
         kv_lora_rank=8,
         qk_rope_head_dim=4,
@@ -113,7 +120,11 @@ def _controller(rank, dcp_size=2, is_mla=True, dtype=torch.bfloat16, parallel=No
                 "enable_metadata_cache": False,
             },
         )
-    cc.storage_backend = HiCacheFile(cc.storage_config)
+    cc.storage_backend = (
+        storage_factory(cc.storage_config, host)
+        if storage_factory is not None
+        else HiCacheFile(cc.storage_config)
+    )
     cc.page_set_func = cc._generic_page_set
     return cc
 
