@@ -205,6 +205,101 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 self.assertEqual(req.kv.cache_protected_len, expected)
                 self.assertEqual(pm.decode_prefix_len, expected)
 
+    def test_mamba_preallocation_reserves_tracking_slots_before_prefix_match(self):
+        # (free, extra buffer, lazy, overlap slots, holds state, holds buffer,
+        #  reclaimable, admitted, slots requested from eviction)
+        cases = [
+            (2, True, False, 2, False, False, 1, True, 1),
+            (2, True, False, 2, False, False, 0, False, 1),
+            (0, True, False, 2, False, False, 1, False, 3),
+            (2, True, False, 1, False, False, 0, True, 0),
+            (2, True, True, 2, False, False, 0, True, 0),
+            (1, False, False, 2, False, False, 0, True, 0),
+            (2, True, False, 2, True, False, 0, True, 0),
+            (1, True, False, 2, False, True, 0, True, 0),
+        ]
+        for (
+            free,
+            extra,
+            lazy,
+            slots,
+            state,
+            buffer,
+            reclaimable,
+            admitted,
+            evicted,
+        ) in cases:
+            with self.subTest(
+                free=free,
+                extra=extra,
+                lazy=lazy,
+                slots=slots,
+                state=state,
+                buffer=buffer,
+                reclaimable=reclaimable,
+            ):
+                req = SimpleNamespace(
+                    finished_reason=None,
+                    kv=SimpleNamespace(
+                        holds_mamba=state,
+                        mamba_ping_pong_track_buffer=object() if buffer else None,
+                    ),
+                )
+                dr = SimpleNamespace(req=req, waiting_for_input=True)
+                queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+                queue.pp_size = 1
+                queue.queue = [dr]
+                queue.pending_reqs = []
+                queue._resolve_pending_reqs = lambda: None
+                queue._update_handshake_waiters = lambda *_: None
+                queue._uses_swa_tail_prealloc = lambda: False
+                queue._uses_swa_reservation = lambda: False
+                queue._allocatable_token_budgets = lambda **_: 1024
+                queue._hicache_pending_restore_tokens = lambda: 0
+                queue.scheduler = SimpleNamespace(
+                    running_batch=SimpleNamespace(reqs=[]),
+                    enable_priority_scheduling=False,
+                    enable_hisparse=False,
+                    enable_lora=False,
+                )
+                queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+                    available_size=lambda: 1
+                )
+                queue.req_to_token_pool = SimpleNamespace(
+                    available_size=lambda: 1,
+                    mamba_allocator=SimpleNamespace(available_size=lambda: free),
+                    enable_mamba_extra_buffer=extra,
+                    enable_mamba_extra_buffer_lazy=lazy,
+                    mamba_ping_pong_track_buffer_size=slots,
+                )
+
+                def evict(params):
+                    nonlocal_free[0] = min(params.mamba_num, reclaimable)
+
+                nonlocal_free = [0]
+                queue.req_to_token_pool.mamba_allocator.available_size = lambda: (
+                    free + nonlocal_free[0]
+                )
+                reclaim = MagicMock(side_effect=evict)
+                queue.tree_cache = SimpleNamespace(
+                    supports_mamba=lambda: True, evict=reclaim, evict_for_alloc=reclaim
+                )
+                # Stop at the first operation after admission, before matching
+                # can COW state or acquire a prefix lock.
+                queue._rebootstrap_prefill_len = MagicMock(side_effect=StopIteration)
+                if admitted:
+                    with self.assertRaises(StopIteration):
+                        queue.pop_preallocated()
+                else:
+                    self.assertEqual(queue.pop_preallocated(), ([], []))
+                    queue._rebootstrap_prefill_len.assert_not_called()
+                self.assertEqual(queue.queue, [dr])
+                if evicted:
+                    self.assertEqual(reclaim.call_args.args[0].mamba_num, evicted)
+                    self.assertEqual(reclaim.call_count, 1)
+                else:
+                    reclaim.assert_not_called()
+
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
         req = SimpleNamespace(

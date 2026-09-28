@@ -1375,17 +1375,28 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            # Hybrid models (e.g. K3 with KDA): guard against prealloc
-            # draining the mamba pool before the KV pool (would assert "Not
-            # enough space for mamba cache"). Evict a cached mamba slot from
-            # the radix tree first (only if it manages mamba states;
-            # ChunkCache.evict is a no-op), else stop.
+            # Reserve running state and tracking buffers before prefix matching
+            # can COW a cached Mamba state. A nonempty pool alone is insufficient.
             mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
-            if mamba_allocator is not None and mamba_allocator.available_size() <= 0:
-                supports_mamba = self.tree_cache.supports_mamba()
-                if supports_mamba and hasattr(self.tree_cache, "evict"):
-                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                if mamba_allocator.available_size() <= 0:
+            if mamba_allocator is not None:
+                pool = self.req_to_token_pool
+                kv = decode_req.req.kv
+                needed = int(not kv.holds_mamba)
+                if (
+                    pool.enable_mamba_extra_buffer
+                    and kv.mamba_ping_pong_track_buffer is None
+                ):
+                    needed += (
+                        1
+                        if pool.enable_mamba_extra_buffer_lazy
+                        else pool.mamba_ping_pong_track_buffer_size
+                    )
+                shortfall = needed - mamba_allocator.available_size()
+                if shortfall > 0 and self.tree_cache.supports_mamba():
+                    self.tree_cache.evict_for_alloc(
+                        EvictParams(num_tokens=0, mamba_num=shortfall)
+                    )
+                if mamba_allocator.available_size() < needed:
                     break
 
             if hisparse_req_budget <= 0:
