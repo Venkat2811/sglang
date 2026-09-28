@@ -284,6 +284,9 @@ class TestMooncakeDcpMambaStorage(CustomTestCase):
             PoolName.MAMBA, host_indices=torch.tensor(SOURCE_PAGES[:2]), keys=KEYS[:2]
         )
         self.assertEqual(store.batch_set_v2([transfer])[PoolName.MAMBA], [True] * 2)
+        reader_kv = _pool(config)
+        reader = _store(config, reader_kv, objects)
+        reader.store.own(reader_kv, TARGET_PAGES)
         for changes in (
             {"temporal_shape": (3, 2)},
             {"temporal_dtype": torch.bfloat16, "temporal_shape": (2, 6)},
@@ -293,11 +296,8 @@ class TestMooncakeDcpMambaStorage(CustomTestCase):
             {"layout": "page_first_direct"},
         ):
             with self.subTest(changes=changes):
-                reader_kv = _pool(config)
                 reader_state = _mamba_pool(**changes)
-                reader = _store(config, reader_kv, objects)
                 reader.register_mem_host_pool_v2(reader_state, PoolName.MAMBA)
-                reader.store.own(reader_kv, TARGET_PAGES)
                 _own_mamba(reader.store, reader_state, TARGET_PAGES[:2])
                 for buf in reader_state.get_hybrid_pool_buffer():
                     buf.view(torch.uint8).fill_(165)
@@ -322,6 +322,48 @@ class TestMooncakeDcpMambaStorage(CustomTestCase):
                     torch.testing.assert_close(
                         actual.view(torch.uint8), expected, rtol=0, atol=0
                     )
+
+    def test_state_registration_preserves_v1_objects(self):
+        """Pool replacement must not strand v1 objects or read an old schema."""
+        config = _config(tp=4, dcp=2, rank=2)
+        objects = {}
+        store = _store(config, _pool(config), objects)
+        state = _mamba_pool()
+        store.register_mem_host_pool_v2(state, PoolName.MAMBA)
+        _own_mamba(store.store, state, (3,))
+        for buf in state.get_hybrid_pool_buffer():
+            buf.view(torch.uint8).fill_(37)
+        expected = state.get_data_page(3).clone()
+        transfer = PoolTransfer(
+            PoolName.MAMBA, host_indices=torch.tensor([3]), keys=["checkpoint"]
+        )
+        before_keys = set(objects)
+        self.assertEqual(store.batch_set_v2([transfer])[PoolName.MAMBA], [True])
+        self.assertEqual(
+            set(objects) - before_keys,
+            {
+                "test-model_dcp_v1_tp4_ds2_pp1_cp0of1_page8_float8_e4m3fn_page_first"
+                "_pp0_checkpoint_2_mamba_v1_"
+                "8bdd9a3cc60b2b24ade8e664a2a7c00d308e05e1266716c2d7740755939d9384_"
+                + component
+                for component in ("temporal", "conv_0", "conv_1")
+            },
+        )
+        for changes, hit in (
+            ({"temporal_shape": (3, 2)}, False),
+            ({"capacity": 16}, True),
+        ):
+            with self.subTest(changes=changes):
+                target = _mamba_pool(**changes)
+                store.register_mem_host_pool_v2(target, PoolName.MAMBA)
+                _own_mamba(store.store, target, (3,))
+                for buf in target.get_hybrid_pool_buffer():
+                    buf.view(torch.uint8).fill_(165)
+                before = target.get_data_page(3).clone()
+                self.assertEqual(store.batch_get_v2([transfer])[PoolName.MAMBA], [hit])
+                torch.testing.assert_close(
+                    target.get_data_page(3), expected if hit else before, rtol=0, atol=0
+                )
 
     def test_tp_state_shards_round_trip_into_unrelated_slots(self):
         """MLA replicas share keys, but each TP rank must restore its own state."""

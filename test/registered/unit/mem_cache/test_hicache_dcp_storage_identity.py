@@ -210,6 +210,7 @@ class TestDcpStorageIdentity(CustomTestCase):
             PoolName.MAMBA, host_indices=torch.tensor([3]), keys=["checkpoint"]
         )
         self.assertEqual(writer.batch_set_v2([transfer])[PoolName.MAMBA], [True])
+        reader = self.backend(make_config())
         for changes in (
             {"temporal_shape": (3, 2)},
             {"temporal_dtype": torch.bfloat16, "temporal_shape": (2, 6)},
@@ -219,7 +220,6 @@ class TestDcpStorageIdentity(CustomTestCase):
             {"layout": "page_first_direct"},
         ):
             with self.subTest(changes=changes):
-                reader = self.backend(make_config())
                 target = _mamba_pool(**changes)
                 reader.register_mem_host_pool_v2(target, PoolName.MAMBA)
                 for buffer in target.get_hybrid_pool_buffer():
@@ -229,6 +229,43 @@ class TestDcpStorageIdentity(CustomTestCase):
                     reader.batch_get_v2([transfer])[PoolName.MAMBA], [False]
                 )
                 torch.testing.assert_close(target.get_data_page(3), before)
+
+    def test_file_state_registration_preserves_v1_objects(self):
+        """Replacing a pool must preserve compatible files and reject stale schemas."""
+        backend = self.backend(make_config(tp_rank=2))
+        source = _mamba_pool()
+        backend.register_mem_host_pool_v2(source, PoolName.MAMBA)
+        for buf in source.get_hybrid_pool_buffer():
+            buf.view(torch.uint8).fill_(37)
+        expected = source.get_data_page(3).clone()
+        transfer = PoolTransfer(
+            PoolName.MAMBA, host_indices=torch.tensor([3]), keys=["checkpoint"]
+        )
+        self.assertEqual(backend.batch_set_v2([transfer])[PoolName.MAMBA], [True])
+        self.assertEqual(
+            [p.name for p in Path(self.directory).glob("*.bin")],
+            [
+                "checkpoint.mamba_tp2_v1_"
+                "8bdd9a3cc60b2b24ade8e664a2a7c00d308e05e1266716c2d7740755939d9384"
+                "_test-model_tp4_dcp0_2_page128_bfloat16_page_first_mamba_tp2_4.bin"
+            ],
+        )
+        for changes, hit in (
+            ({"temporal_shape": (3, 2)}, False),
+            ({"capacity": 16}, True),
+        ):
+            with self.subTest(changes=changes):
+                target = _mamba_pool(**changes)
+                backend.register_mem_host_pool_v2(target, PoolName.MAMBA)
+                for buf in target.get_hybrid_pool_buffer():
+                    buf.view(torch.uint8).fill_(165)
+                before = target.get_data_page(3).clone()
+                self.assertEqual(
+                    backend.batch_get_v2([transfer])[PoolName.MAMBA], [hit]
+                )
+                torch.testing.assert_close(
+                    target.get_data_page(3), expected if hit else before, rtol=0, atol=0
+                )
 
     def test_bounded_mla_replica_can_write_and_evict_only_its_state(self):
         """An MLA replica still owns its TP-sharded recurrent checkpoint."""
