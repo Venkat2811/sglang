@@ -1,31 +1,37 @@
-"""Bounded one-GPU MLA inference witness with a fresh Mooncake reader.
+"""Bounded MLA inference witness with a fresh Mooncake reader.
 
 MOONCAKE_SMOKE_OUTPUT_DIR must name a new artifact directory. Run with one GPU:
   python -m pytest test/manual/hicache/test_mooncake_mla_inference.py -q -s
 
-This is DCP1 characterization, not distributed DCP or hybrid qualification.
+Set MOONCAKE_SMOKE_TP=8 MOONCAKE_SMOKE_DCP=8 for eight-GPU qualification.
+Distributed runs also remove one private shard and require a common shorter
+prefix on every rank. This does not qualify hybrid models or disaggregation.
 The private TCP donor survives both engines; neither engine owns store capacity.
 No shared service or cache is modified. Model download/JIT are startup costs.
 Set MOONCAKE_SMOKE_MODE=cold_repeat to diagnose uncached numerical variation
 before interpreting a restore parity failure.
-The default uses SGLang's deterministic Triton MLA path. Set
-MOONCAKE_SMOKE_PROFILE=flashinfer for the ordinary, potentially batch-sensitive
-backend; exact parity failures in its cold control are not storage regressions.
+DCP1 defaults to deterministic Triton; DCP>1 defaults to FlashInfer, matching
+the file-backed DCP inference gate. MOONCAKE_SMOKE_PROFILE overrides this choice.
+FlashInfer can be batch-sensitive: a failed cold control invalidates the oracle
+and is not evidence of a storage regression.
 """
 
 import hashlib
 import json
 import math
 import os
+import re
 import socket
 import subprocess
 import time
 import unittest
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
 import requests
+import torch
 from transformers import AutoConfig, AutoTokenizer
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
@@ -58,8 +64,31 @@ class TestMooncakeMlaInference(CustomTestCase):
         output = Path(os.environ["MOONCAKE_SMOKE_OUTPUT_DIR"])
         output.mkdir(parents=True, exist_ok=False)
         (output / "runner.py").write_bytes(Path(__file__).read_bytes())
-        profile = os.environ.get("MOONCAKE_SMOKE_PROFILE", "deterministic")
+        tp = int(os.environ.get("MOONCAKE_SMOKE_TP", "1"))
+        dcp = int(os.environ.get("MOONCAKE_SMOKE_DCP", "1"))
+        profile = os.environ.get(
+            "MOONCAKE_SMOKE_PROFILE", "deterministic" if dcp == 1 else "flashinfer"
+        )
         self.assertIn(profile, ("deterministic", "flashinfer"))
+        self.assertGreaterEqual(dcp, 1)
+        self.assertGreaterEqual(tp, dcp)
+        self.assertEqual(tp % dcp, 0)
+        self.assertGreaterEqual(torch.cuda.device_count(), tp)
+        logical_page = PAGE * dcp
+        chunk_size = 4 * logical_page
+        # FlashInfer's C4 cold control can diverge in the free continuation
+        # after the six-token answer. Qualify the complete answer instead,
+        # retaining exact IDs and the same predeclared logprob tolerance.
+        new_tokens = 8 if dcp == 1 else 6
+        lengths = (
+            LENGTHS
+            if dcp == 1
+            else tuple(
+                boundary + delta
+                for boundary in (PAGE, logical_page, 2 * logical_page, chunk_size)
+                for delta in (-1, 0, 1)
+            )
+        )
         tokenizer = AutoTokenizer.from_pretrained(
             MODEL, revision=REVISION, trust_remote_code=True
         )
@@ -68,7 +97,7 @@ class TestMooncakeMlaInference(CustomTestCase):
         )
         cases = []
         for concurrency in (1, 4):
-            for index, length in enumerate(LENGTHS):
+            for index, length in enumerate(lengths):
                 prefix = tokenizer.encode(
                     f"Record {concurrency}-{index}: The access code is {7300 + index}. "
                 )
@@ -84,7 +113,12 @@ class TestMooncakeMlaInference(CustomTestCase):
                 ids += suffix
                 self.assertEqual(len(ids), length)
                 cases.append(
-                    {"name": f"c{concurrency}-n{length}", "c": concurrency, "ids": ids}
+                    {
+                        "name": f"c{concurrency}-n{length}",
+                        "c": concurrency,
+                        "ids": ids,
+                        "answer": f"{7300 + index}.",
+                    }
                 )
         # No two prompts share a complete first page, even across concurrency arms.
         self.assertEqual(len({tuple(c["ids"][:PAGE]) for c in cases}), len(cases))
@@ -94,10 +128,12 @@ class TestMooncakeMlaInference(CustomTestCase):
             "model": MODEL,
             "revision": REVISION,
             "cases_sha256": hashlib.sha256(serialized.encode()).hexdigest(),
-            "tp": 1,
-            "dcp": 1,
+            "tp": tp,
+            "dcp": dcp,
             "page_size": PAGE,
-            "chunked_prefill_size": 256,
+            "logical_page_size": logical_page,
+            "chunked_prefill_size": chunk_size,
+            "new_tokens": new_tokens,
             "logprob_atol": LOGPROB_ATOL,
             "phases": {},
             "status": "running",
@@ -120,9 +156,11 @@ class TestMooncakeMlaInference(CustomTestCase):
             "--host",
             "127.0.0.1",
             "--tp-size",
-            "1",
+            str(tp),
             "--dcp-size",
-            "1",
+            str(dcp),
+            "--dcp-comm-backend",
+            "ag_rs",
             "--attention-backend",
             "triton" if profile == "deterministic" else "flashinfer",
             "--dtype",
@@ -132,11 +170,11 @@ class TestMooncakeMlaInference(CustomTestCase):
             "--page-size",
             str(PAGE),
             "--context-length",
-            "4096",
+            str(max(4096, 2 * chunk_size)),
             "--chunked-prefill-size",
-            "256",
+            str(chunk_size),
             "--max-total-tokens",
-            "8192",
+            str(max(8192, 8 * chunk_size)),
             "--max-running-requests",
             "4",
             "--mem-fraction-static",
@@ -192,7 +230,7 @@ class TestMooncakeMlaInference(CustomTestCase):
             response.raise_for_status()
             (output / f"{phase}-{boundary}.prom").write_text(response.text)
 
-        def run_phase(phase):
+        def run_phase(phase, phase_cases=cases):
             snapshot(phase, "before")
 
             def generate(case):
@@ -200,7 +238,7 @@ class TestMooncakeMlaInference(CustomTestCase):
                     "input_ids": case["ids"],
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 8,
+                        "max_new_tokens": new_tokens,
                         "ignore_eos": True,
                     },
                     "return_logprob": True,
@@ -216,6 +254,12 @@ class TestMooncakeMlaInference(CustomTestCase):
                         status_code=response.status_code, response=response.json()
                     )
                     response.raise_for_status()
+                    if dcp > 1:
+                        self.assertEqual(
+                            record["response"]["text"].strip(),
+                            case["answer"],
+                            case["name"],
+                        )
                     return record["response"]
                 except Exception as error:
                     record["error"] = repr(error)
@@ -225,7 +269,7 @@ class TestMooncakeMlaInference(CustomTestCase):
 
             responses = []
             for concurrency in (1, 4):
-                cohort = [c for c in cases if c["c"] == concurrency]
+                cohort = [c for c in phase_cases if c["c"] == concurrency]
                 with ThreadPoolExecutor(max_workers=concurrency) as executor:
                     # Submit one bounded wave at a time. A failed request must
                     # not leave the rest of the sweep queued behind a timeout.
@@ -238,22 +282,40 @@ class TestMooncakeMlaInference(CustomTestCase):
             save()
             return responses
 
-        def assert_parity(reference, actual):
-            for case, expected, result in zip(cases, reference, actual):
+        def assert_parity(reference, actual, phase_cases=cases):
+            self.assertEqual(len(actual), len(phase_cases))
+            self.assertEqual(len(reference), len(phase_cases))
+            for case, expected, result in zip(phase_cases, reference, actual):
                 self.assertEqual(
                     result["output_ids"], expected["output_ids"], case["name"]
                 )
-                self.assertEqual(len(result["output_ids"]), 8, case["name"])
+                self.assertEqual(len(result["output_ids"]), new_tokens, case["name"])
                 a = result["meta_info"]["output_token_logprobs"]
                 b = expected["meta_info"]["output_token_logprobs"]
-                self.assertEqual(len(a), 8)
-                self.assertEqual(len(b), 8)
+                self.assertEqual(len(a), new_tokens)
+                self.assertEqual(len(b), new_tokens)
                 for got, want in zip(a, b):
                     self.assertEqual(got[1], want[1])
                     self.assertTrue(math.isfinite(got[0]) and math.isfinite(want[0]))
                     self.assertLessEqual(
                         abs(got[0] - want[0]), LOGPROB_ATOL, case["name"]
                     )
+
+        def assert_rank_prefixes(phase, expected):
+            if dcp == 1:
+                return
+            matches = re.findall(
+                r"DCP L3 prefetch: tp_rank=(\d+) tokens=(\d+)",
+                (output / f"{phase}-server.log").read_text(),
+            )
+            by_rank = {
+                rank: Counter(int(n) for r, n in matches if int(r) == rank and int(n))
+                for rank in range(tp)
+            }
+            report.setdefault("rank_prefixes", {})[phase] = by_rank
+            save()
+            for rank, counts in by_rank.items():
+                self.assertEqual(counts, Counter(n for n in expected if n), rank)
 
         master = donor = None
         try:
@@ -335,16 +397,30 @@ class TestMooncakeMlaInference(CustomTestCase):
                 "--hicache-storage-backend-extra-config",
                 json.dumps(storage_config),
             ]
-            keys = sorted(
-                {
-                    f"{tag}_{MODEL.replace('/', '-')}_{key}__k"
-                    for case in cases
+            key_prefix = f"{tag}_{MODEL.replace('/', '-')}"
+            if dcp > 1:
+                key_prefix += (
+                    f"_dcp_v1_tp{tp}_ds{dcp}_pp1_cp0of1"
+                    f"_page{logical_page}_bfloat16_page_first_pp0"
+                )
+
+            def page_keys(case):
+                return [
+                    [
+                        f"{key_prefix}_{key}_{'dcp' + str(rank) if dcp > 1 else ''}_k"
+                        for rank in range(dcp)
+                    ]
                     for key in get_storage_hash_str(
-                        case["ids"][: (len(case["ids"]) - 1) // PAGE * PAGE],
+                        case["ids"][
+                            : (len(case["ids"]) - 1) // logical_page * logical_page
+                        ],
                         None,
-                        page_size=PAGE,
+                        page_size=logical_page,
                     )
-                }
+                ]
+
+            keys = sorted(
+                {key for case in cases for page in page_keys(case) for key in page}
             )
             with server("writer", extra):
                 writer = run_phase("writer")
@@ -373,11 +449,43 @@ class TestMooncakeMlaInference(CustomTestCase):
             with server("reader", extra):
                 reader = run_phase("reader")
                 assert_parity(reference, reader)
+                expected_prefixes = []
                 for case, result in zip(cases, reader):
-                    expected = (len(case["ids"]) - 1) // PAGE * PAGE
+                    expected = (len(case["ids"]) - 1) // logical_page * logical_page
+                    expected_prefixes.append(expected)
                     details = result["meta_info"]["cached_tokens_details"]
                     storage = details["storage"] if details is not None else 0
                     self.assertEqual(storage, expected, case["name"])
+            assert_rank_prefixes("reader", expected_prefixes)
+            if dcp > 1:
+                case_index = next(
+                    i
+                    for i, case in enumerate(cases)
+                    if case["c"] == 1 and len(case["ids"]) == chunk_size + 1
+                )
+                fault_case = cases[case_index]
+                # A middle-page hole on one rank must stop the global prefix,
+                # even when every later object and every other rank is intact.
+                removed_key = page_keys(fault_case)[1][-1]
+                self.assertEqual(donor.remove(removed_key, force=True), 0)
+                self.assertEqual(donor.is_exist(removed_key), 0)
+                self.assertTrue(
+                    all(donor.is_exist(key) == 1 for key in keys if key != removed_key)
+                )
+                report["missing_shard"] = {
+                    "key": removed_key,
+                    "case": fault_case["name"],
+                    "expected_prefix": logical_page,
+                }
+                save()
+                with server("missing-shard-reader", extra):
+                    missing = run_phase("missing-shard-reader", [fault_case])
+                    assert_parity([reference[case_index]], missing, [fault_case])
+                    self.assertEqual(
+                        missing[0]["meta_info"]["cached_tokens_details"]["storage"],
+                        logical_page,
+                    )
+                assert_rank_prefixes("missing-shard-reader", [logical_page])
             report["status"] = "passed"
         except Exception as error:
             report.update(status="failed", error=repr(error))
