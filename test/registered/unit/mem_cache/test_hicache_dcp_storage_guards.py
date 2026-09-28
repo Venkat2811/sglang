@@ -223,10 +223,13 @@ class TestDcpStorageGuards(CustomTestCase):
                 (True, "nixl", "file or Mooncake storage"),
             ):
                 cache = SimpleNamespace(
-                    cache_controller=SimpleNamespace(), enable_storage=attached
+                    cache_controller=SimpleNamespace(write_policy="write_back"),
+                    enable_storage=attached,
+                    prefetch_stop_policy="timeout",
+                    write_through_threshold=2,
+                    is_write_back=True,
                 )
                 attachment = StorageAttachment(cache)
-                attachment._apply_policies = mock.Mock()
                 with (
                     self.subTest(attached=attached, mla=mla, backend=backend),
                     mock.patch(
@@ -242,12 +245,20 @@ class TestDcpStorageGuards(CustomTestCase):
                         return_value=mla,
                     ),
                 ):
-                    ok, reason = attachment.attach(backend)
+                    ok, reason = attachment.attach(
+                        backend,
+                        hicache_storage_prefetch_policy="wait_complete",
+                        hicache_write_policy="write_through",
+                    )
                     self.assertFalse(ok)
                     self.assertIn(message, reason)
                     with self.assertRaisesRegex(NotImplementedError, message):
                         validate_hicache_dcp_storage(_args(), storage_backend=backend)
-                attachment._apply_policies.assert_not_called()
+                self.assertEqual(cache.prefetch_stop_policy, "timeout")
+                self.assertEqual(cache.cache_controller.write_policy, "write_back")
+                self.assertEqual(cache.write_through_threshold, 2)
+                self.assertTrue(cache.is_write_back)
+                self.assertEqual(cache.enable_storage, attached)
 
     def test_runtime_policy_updates_use_existing_validation(self):
         cache = SimpleNamespace(
@@ -255,7 +266,6 @@ class TestDcpStorageGuards(CustomTestCase):
             enable_storage=True,
         )
         attachment = StorageAttachment(cache)
-        attachment._apply_policies = mock.Mock()
         with (
             mock.patch(
                 "sglang.srt.runtime_context.get_parallel",
@@ -277,11 +287,25 @@ class TestDcpStorageGuards(CustomTestCase):
                             hicache_storage_prefetch_policy=prefetch,
                         )
                         self.assertTrue(ok, reason)
-                        attachment._apply_policies.assert_called_with(prefetch, write)
-            attachment._apply_policies.reset_mock()
-            ok, _ = attachment.attach("file", hicache_write_policy="invalid")
+                        self.assertEqual(cache.prefetch_stop_policy, prefetch)
+                        self.assertEqual(cache.cache_controller.write_policy, write)
+                        self.assertEqual(cache.is_write_back, write == "write_back")
+                        self.assertEqual(
+                            cache.write_through_threshold,
+                            1 if write == "write_through" else 2,
+                        )
+            ok, _ = attachment.attach(
+                "file",
+                hicache_storage_prefetch_policy="best_effort",
+                hicache_write_policy="invalid",
+            )
             self.assertFalse(ok)
-            attachment._apply_policies.assert_not_called()
+            self.assertEqual(cache.prefetch_stop_policy, "wait_complete")
+            self.assertEqual(
+                cache.cache_controller.write_policy, "write_through_selective"
+            )
+            self.assertEqual(cache.write_through_threshold, 2)
+            self.assertFalse(cache.is_write_back)
 
 
 if __name__ == "__main__":
