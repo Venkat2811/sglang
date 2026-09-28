@@ -287,6 +287,22 @@ B300 hybrid lane used DMA-BUF RDMA. Select and record the actual transport;
 a TCP pass does not qualify RDMA. See Mooncake's
 [GPU registration troubleshooting](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/troubleshooting/troubleshooting.md).
 
+The cross-node MLA TCP lane also passed: P2/DCP1 on B200 → D8/DCP8 on B300,
+with a separate TP2 monolithic reference. All 33 scored requests and 21 parity
+checks passed, including six-token known answers at 63/64/65, 511/512/513 and
+1023/1024/1025-token boundaries, cold/repeat handoffs and a matched three-request
+batch. Maximum logprob difference was 0.032632 against 0.05. The request test
+took 9.706 seconds after all three engines were ready; startup is excluded.
+Native logs confirmed TCP on both sides. HiCache/L3 was disabled.
+
+For externally managed engines, set `PD_DCP_ENDPOINTS` to a JSON mapping of
+`reference`, `prefill` and `decode` URLs, plus `PD_DCP_PREFILL_TP`,
+`PD_DCP_DECODE_TP` and `PD_DCP_DECODE_DCP`. The runner checks each endpoint's
+revision, role, TP/DCP and disabled HiCache before issuing scored requests.
+It owns only its local router; the caller must archive and stop the external
+engines. Tested runner SHA256:
+`5003b0cdab504828137c0a70c2e952cd7cf7cfda1c489766a357bf1e6049e875`.
+
 Feature enablement still requires the composed hybrid and role-local cache
 gates below.
 

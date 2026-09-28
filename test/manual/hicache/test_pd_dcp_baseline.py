@@ -4,6 +4,9 @@ Requires PD_DCP_OUTPUT_DIR (new directory). PD_DCP_MODEL_PATH optionally
 selects a local snapshot of the pinned revision. MLA uses P2 + D2/DCP2;
 hybrid uses the existing Kimi P4/EP4 + D4/DCP4 fixture's kernels and KV dtype.
 This exercises actual transfer and multiple decode tokens, not role-local L3.
+PD_DCP_ENDPOINTS may supply a JSON object with reference/prefill/decode URLs
+for externally managed engines. The runner then verifies their topology and
+revision, launches only its router, and leaves engine cleanup to the caller.
 """
 
 import hashlib
@@ -46,8 +49,18 @@ class TestPdDcpBaseline(CustomTestCase):
                 "85864749cd611b4353ce1decdb286193298f64c7",
             )
         )
-        tp = 4 if hybrid else 2
-        self.assertGreaterEqual(torch.cuda.device_count(), 2 * tp)
+        tp = int(os.environ.get("PD_DCP_PREFILL_TP", "4" if hybrid else "2"))
+        decode_tp = int(os.environ.get("PD_DCP_DECODE_TP", str(tp)))
+        decode_dcp = int(os.environ.get("PD_DCP_DECODE_DCP", str(decode_tp)))
+        self.assertGreater(tp, 0)
+        self.assertGreater(decode_dcp, 1)
+        self.assertEqual(decode_tp % decode_dcp, 0)
+        self.assertGreaterEqual(decode_tp, decode_dcp)
+        external = json.loads(os.environ.get("PD_DCP_ENDPOINTS", "null"))
+        if external is None:
+            self.assertGreaterEqual(torch.cuda.device_count(), tp + decode_tp)
+        else:
+            self.assertEqual(set(external), {"reference", "prefill", "decode"})
         model = os.environ.get("PD_DCP_MODEL_PATH", model_id)
         atol = 0.20 if hybrid else 0.05
         output = Path(os.environ["PD_DCP_OUTPUT_DIR"])
@@ -60,8 +73,9 @@ class TestPdDcpBaseline(CustomTestCase):
             "revision": revision,
             "prefill_tp": tp,
             "prefill_dcp": 1,
-            "decode_tp": tp,
-            "decode_dcp": tp,
+            "decode_tp": decode_tp,
+            "decode_dcp": decode_dcp,
+            "external_endpoints": external,
             "logprob_atol": atol,
             "runner_sha256": hashlib.sha256(source).hexdigest(),
             "scope": "live P/D only; no HiCache or L3",
@@ -75,7 +89,7 @@ class TestPdDcpBaseline(CustomTestCase):
         tokenizer = AutoTokenizer.from_pretrained(
             model, revision=revision, trust_remote_code=True
         )
-        logical = 64 * tp
+        logical = 64 * decode_dcp
         lengths = sorted(
             set((63, 64, 65, logical - 1, logical, logical + 1, 1023, 1024, 1025))
         )
@@ -136,6 +150,10 @@ class TestPdDcpBaseline(CustomTestCase):
         for _ in range(6):
             ports.append(find_available_port(max(ports, default=30999) + 1))
         ref_url, p_url, d_url, router_url = [f"http://127.0.0.1:{p}" for p in ports[:4]]
+        if external is not None:
+            ref_url, p_url, d_url = [
+                external[n] for n in ("reference", "prefill", "decode")
+            ]
         bootstrap, nccl = ports[4:]
         env = {
             "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
@@ -184,7 +202,7 @@ class TestPdDcpBaseline(CustomTestCase):
         p_extra = ["--ep-size", str(tp)] if hybrid else []
         d_extra = [
             "--dcp-size",
-            str(tp),
+            str(decode_dcp),
             "--dcp-comm-backend",
             "a2a" if hybrid else "ag_rs",
         ]
@@ -193,7 +211,25 @@ class TestPdDcpBaseline(CustomTestCase):
 
         @contextmanager
         def server(name, url, args, pd=False):
-            (output / f"{name}-args.json").write_text(json.dumps(common + args))
+            role_tp = decode_tp if name == "decode" else tp
+            role_dcp = decode_dcp if name == "decode" else 1
+            if external is not None:
+                r = requests.get(url + "/get_server_info", timeout=30)
+                r.raise_for_status()
+                (output / f"{name}-server-info.json").write_text(r.text)
+                info = r.json()
+                self.assertEqual(info["tp_size"], role_tp)
+                self.assertEqual(info["dcp_size"], role_dcp)
+                self.assertEqual(info["revision"], revision)
+                self.assertEqual(
+                    info["disaggregation_mode"], "null" if name == "reference" else name
+                )
+                self.assertFalse(info["enable_hierarchical_cache"])
+                yield None
+                return
+            role_common = common.copy()
+            role_common[role_common.index("--tp-size") + 1] = str(role_tp)
+            (output / f"{name}-args.json").write_text(json.dumps(role_common + args))
             with (output / f"{name}-server.log").open("w") as log:
                 process = None
                 try:
@@ -202,7 +238,7 @@ class TestPdDcpBaseline(CustomTestCase):
                         model,
                         url,
                         timeout=1200,
-                        other_args=common + args,
+                        other_args=role_common + args,
                         env=env,
                         return_stdout_stderr=(log, log),
                     )
