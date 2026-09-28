@@ -11,14 +11,15 @@ registered L3 backend.
 | Path | Implemented / available | Verification still required |
 | --- | --- | --- |
 | Pure MLA + DCP + Mooncake DRAM | Enabled; TP8/DCP8 and TP4/DCP2 inference passed | Other explicitly selected layouts/policies and runtime attachment |
-| Pure MLA + DCP + file | Enabled; inherited file inference fixture and CPU contracts exist | Independently recorded file run on this branch; same numerical and fault oracles as Mooncake |
-| File directory on SSD | TP1/DCP1 pressure, physical SSD reads and missing-page fallback passed | Multi-rank file/DCP SSD composition |
-| Mooncake SSD offload | TP1/DCP1 pressure, SSD-only replica retrieval and missing-page fallback passed | Multi-rank DCP SSD composition and independent owner/master restart recovery |
+| Pure MLA + DCP + file | Enabled; TP8/DCP8 and TP4/DCP2 SSD inference passed | Other explicitly selected layouts/policies and runtime attachment |
+| File directory on SSD | TP1/DCP1, TP8/DCP8 and TP4/DCP2 pressure, physical SSD reads and missing-shard fallback passed | Independent durability/crash recovery qualification |
+| Mooncake SSD offload | TP1/DCP1, TP8/DCP8 and TP4/DCP2 pressure, SSD-only retrieval and missing-shard fallback passed | Independent owner/master restart recovery |
 | Hybrid KDA + MLA + DCP + L3 | Component contracts implemented; public enablement still guarded | Composed checkpoint capture/publication/restore and real model continuation, for each backend |
 | Live P/D with role-local L3 | Existing P/D fixtures and implementation paths | Explicit cache-off baselines, role-local restores and their composition with live transfer |
 
-The recent 194 passing requests were **Mooncake DRAM** tests. They did not
-exercise the file adapter or SSD. See [the measured results](README-mooncake-mla.md).
+The earlier 194 passing requests were **Mooncake DRAM** tests. The separate
+SSD results below now exercise both backends. See also
+[the DRAM results](README-mooncake-mla.md).
 
 ## File backend
 
@@ -41,13 +42,11 @@ python -m pytest test/manual/hicache/test_dcp_l3.py -q -s
 
 That inherited fixture uses an internally selected temporary storage directory,
 overriding the storage-directory environment variable for its engines. It is
-a file correctness gate, **not an SSD-specific launch recipe**. It currently
-uses one prompt, lacks the pinned revision and paired cold controls of the
-new Mooncake witness, and injects a missing shard only for TP4/DCP2. Bring the
-file witness to the same bounded answer/cold-control contract, expose an owned
-explicit storage root, and add TP8/DCP8 missing-shard evidence before claiming
-equivalent coverage. Reuse shared inference assertions rather than growing
-independent oracles with different tolerances.
+a file correctness gate, **not an SSD-specific launch recipe**. It uses one
+prompt and injects a missing shard only for TP4/DCP2. The shared
+`test_hicache_ssd_pressure.py` runner below supplies pinned revisions, paired
+cold controls, explicit owned storage roots, known answers and missing-shard
+checks for both backends at TP8/DCP8 and TP4/DCP2.
 
 Required file cases: fresh reader after writer exit, exact physical page bytes,
 all-rank prefix agreement, TP>DCP equivalent readers, missing middle shard,
@@ -130,6 +129,18 @@ The master starts eviction at 50% occupancy, and writer requests are spaced
 by two seconds to allow the one-second offload heartbeat to make progress.
 Small-pool tests must scale asynchronous batching as well as DRAM capacity.
 
+Size SSD staging for all concurrent TP readers, including equivalent MLA
+readers that share a stored DCP shard. The runner rounds
+`target KV bytes * (TP / DCP)` up to a power of two, with a 64 MiB floor.
+TP4/DCP2 therefore uses 128 MiB of staging, independently of its unchanged
+128 MiB persistent DRAM segment. The initial 64 MiB staging attempt returned
+native `BUFFER_OVERFLOW` on two ranks; all ranks safely fell back to zero
+storage tokens and recomputed the correct answer. That attempt failed the
+cache-hit acceptance check and is preserved as a diagnostic, not a pass.
+The distinction between staging and cache capacity is also documented in the
+[Mooncake SSD settings](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/deployment/ssd/ssd-offload.md)
+and [vLLM Ascend KV pool guidance](https://docs.vllm.ai/projects/ascend/en/latest/user_guide/feature_guide/kv_pool.html).
+
 The pinned DeepSeek-V2-Lite-Chat run uses TP1/DCP1, BF16, deterministic Triton,
 64-token pages, a 2048-token GPU KV cap and HiCache ratio 1.5. Six distinct
 1537-token prompts exceed L1/L2 capacity. Two cache-disabled controls precede
@@ -195,6 +206,42 @@ The latter adds the Mooncake bucket/eviction settings described above; the file
 restore path is unchanged. Production source was identical for both runs.
 This verifies bounded SSD spill/reuse with `write_through` and `wait_complete`;
 it does not qualify every policy, DCP topology, hybrid model or P/D role.
+
+### Distributed SSD results, 2026-09-28
+
+The same pinned model and runtime passed 21 scored requests in each lane below
+on B300 GPUs: 84 requests total. Every rank agreed on both 1536-token full
+restores and the listed missing-shard prefix. All restores reported zero
+device/host hits. Known answers and all six output token IDs matched the cold
+reference; the output-logprob tolerance remained 0.05.
+
+| Backend / topology | Runtime | Same-engine / fresh-reader NVMe bytes | Missing-shard prefix / NVMe bytes | Largest logprob delta |
+| --- | --- | --- | --- | --- |
+| File TP8/DCP8 | 358.47 s | 47,775,744 / 47,779,840 | 512 / 15,925,248 | 0.008035 |
+| Mooncake TP8/DCP8 | 357.85 s | 47,874,048 / 47,874,048 | 512 / 15,958,016 | 0.008035 |
+| File TP4/DCP2 | 271.94 s | 47,775,744 / 47,775,744 | 128 / 3,981,312 | 0.006237 |
+| Mooncake TP4/DCP2 | 285.16 s | 47,874,048 / 47,874,048 | 128 / 3,989,504 | 0.006237 |
+
+All 24 target objects in each Mooncake lane became complete disk-only replicas
+under the six inference writer prompts; no extra native pressure objects were
+needed. Payload sizes and hashes survived offload. The owner/master remained
+alive across inference restarts. TP4/DCP2 required the staging adjustment
+described above; its failed undersized-buffer run is retained separately.
+
+TP8 production source was `e7fd249387`; TP4 used `730dc17ba2`, including the
+file v2 hybrid identity fix. The primary MLA file path was unchanged by that
+fix. File TP8/TP4 and Mooncake TP8 used runner SHA256
+`d99d6a67d33da4b2e14109b0d3d8de7a8ea9c4f731201c6da7a27f13bbfad901`;
+Mooncake TP4 used `d8eca3f5db763a00ce5a352e7a2a5c71348bd5773df0752040144ce74f9c9f6e`.
+
+Related upstream reports reinforce the need for these separate oracles:
+[Mooncake #3465](https://github.com/kvcache-ai/Mooncake/issues/3465) reports
+listed SSD keys returning empty payloads, while
+[#2632](https://github.com/kvcache-ai/Mooncake/issues/2632) reports expired
+offload tasks despite apparently working offload. Both were open when reviewed
+on 2026-09-28. Our bounded evidence does not resolve those reports: it requires
+completed disk replicas, exact bytes, actual storage hits, and model parity,
+rather than accepting key discovery or an offload log message alone.
 
 ## Next hybrid and live P/D work
 

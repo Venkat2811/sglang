@@ -84,6 +84,11 @@ class TestHiCacheSsdPressure(CustomTestCase):
             * (config.kv_lora_rank + config.qk_rope_head_dim)
             * 2
         )
+        # Equivalent MLA ranks read the same stored shard independently. Size
+        # SSD staging for every simultaneous reader, not just unique objects.
+        # This does not enlarge the persistent 128 MiB DRAM cache segment.
+        restore_bytes = PREFIX // PAGE * object_bytes * (tp // dcp)
+        ssd_staging_bytes = max(64 << 20, 1 << (restore_bytes - 1).bit_length())
         cases = []
         for i in range(6):
             prefix = tokenizer.encode(f"Record {i}: The access code is {7300 + i}. ")
@@ -112,6 +117,9 @@ class TestHiCacheSsdPressure(CustomTestCase):
             "logical_device_token_cap": device_token_cap * dcp,
             "host_to_device_ratio": 1.5,
             "mooncake_dram_bytes": STORE_DRAM if backend == "mooncake" else None,
+            "mooncake_ssd_staging_bytes": (
+                ssd_staging_bytes if backend == "mooncake" else None
+            ),
             "object_bytes": object_bytes,
             "logprob_atol": LOGPROB_ATOL,
             "phases": {},
@@ -364,6 +372,9 @@ class TestHiCacheSsdPressure(CustomTestCase):
             save()
             parity(reference[0], result)
             details = result["meta_info"]["cached_tokens_details"]
+            self.assertIsInstance(
+                details, dict, f"{phase}: no cache tier hit; inspect prefetch logs"
+            )
             self.assertEqual(details["storage"], expected)
             self.assertEqual(details["host"], 0)
             self.assertEqual(details["device"], 0)
@@ -406,7 +417,9 @@ class TestHiCacheSsdPressure(CustomTestCase):
                 from mooncake.store import MooncakeDistributedStore
 
                 # These buffers are staging, separate from the bounded cache segment.
-                os.environ["MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES"] = str(64 << 20)
+                os.environ["MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES"] = str(
+                    ssd_staging_bytes
+                )
                 os.environ["MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES"] = str(1 << 30)
                 os.environ["MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS"] = "1"
                 # Default buckets need 256 MiB or 500 keys before flushing,
