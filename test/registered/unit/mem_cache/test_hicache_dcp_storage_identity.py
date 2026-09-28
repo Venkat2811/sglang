@@ -164,34 +164,42 @@ class TestDcpStorageIdentity(CustomTestCase):
 
     def test_file_state_shards_do_not_alias_mla_replicas(self):
         """TP0 and TP2 share MLA, but must restore different recurrent state."""
-        for layout in ("page_first", "page_first_direct"):
-            expected = {}
-            for rank in (0, 2):
-                state = _mamba_pool(layout=layout)
-                for i, buffer in enumerate(state.get_hybrid_pool_buffer()):
-                    buffer.view(torch.uint8).fill_(17 + rank + i)
-                expected[rank] = state.get_data_page(3).clone()
-                writer = self.backend(make_config(rank))
-                writer.register_mem_host_pool_v2(state, PoolName.MAMBA)
-                transfer = PoolTransfer(
-                    PoolName.MAMBA, host_indices=torch.tensor([3]), keys=["checkpoint"]
-                )
-                self.assertEqual(
-                    writer.batch_set_v2([transfer])[PoolName.MAMBA], [True]
-                )
+        for dcp in (1, 2):
+            with self.subTest(dcp=dcp):
+                for layout in ("page_first", "page_first_direct"):
+                    expected = {}
+                    for rank in (0, 2):
+                        state = _mamba_pool(layout=layout)
+                        for i, buffer in enumerate(state.get_hybrid_pool_buffer()):
+                            buffer.view(torch.uint8).fill_(17 + rank + i)
+                        expected[rank] = state.get_data_page(3).clone()
+                        writer = self.backend(make_config(rank, dcp_size=dcp))
+                        writer.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                        transfer = PoolTransfer(
+                            PoolName.MAMBA,
+                            host_indices=torch.tensor([3]),
+                            keys=["checkpoint"],
+                        )
+                        self.assertEqual(
+                            writer.batch_set_v2([transfer])[PoolName.MAMBA], [True]
+                        )
 
-            for rank in (0, 2):
-                # Cache capacity is not part of a compatible tensor schema.
-                state = _mamba_pool(capacity=16, layout=layout)
-                reader = self.backend(make_config(rank))
-                reader.register_mem_host_pool_v2(state, PoolName.MAMBA)
-                transfer = PoolTransfer(
-                    PoolName.MAMBA, host_indices=torch.tensor([7]), keys=["checkpoint"]
-                )
-                self.assertEqual(
-                    reader.batch_get_v2([transfer])[PoolName.MAMBA], [True]
-                )
-                torch.testing.assert_close(state.get_data_page(7), expected[rank])
+                    for rank in (0, 2):
+                        # Cache capacity is not part of a compatible tensor schema.
+                        state = _mamba_pool(capacity=16, layout=layout)
+                        reader = self.backend(make_config(rank, dcp_size=dcp))
+                        reader.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                        transfer = PoolTransfer(
+                            PoolName.MAMBA,
+                            host_indices=torch.tensor([7]),
+                            keys=["checkpoint"],
+                        )
+                        self.assertEqual(
+                            reader.batch_get_v2([transfer])[PoolName.MAMBA], [True]
+                        )
+                        torch.testing.assert_close(
+                            state.get_data_page(7), expected[rank]
+                        )
 
     def test_file_state_schema_mismatch_is_a_miss_without_mutation(self):
         """Equal-sized KDA tensors can have incompatible shapes or precision."""
@@ -221,6 +229,55 @@ class TestDcpStorageIdentity(CustomTestCase):
                     reader.batch_get_v2([transfer])[PoolName.MAMBA], [False]
                 )
                 torch.testing.assert_close(target.get_data_page(3), before)
+
+    def test_long_model_identity_restores_kv_and_state_from_fresh_backend(self):
+        """Snapshot paths plus state fingerprints exceeded NAME_MAX in Kimi serving."""
+        for model in ("/cache/models--org--model/snapshots/" + "a" * 100, "模型" * 70):
+            with self.subTest(model=model):
+                config = make_config(model_name=model)
+                key = "b" * 64
+                state = _mamba_pool()
+                for buffer in state.get_hybrid_pool_buffer():
+                    buffer.view(torch.uint8).fill_(37)
+                expected = state.get_data_page(3).clone()
+                writer = self.backend(config)
+                writer.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                self.assertTrue(writer.set(key, torch.tensor([19], dtype=torch.uint8)))
+                transfer = PoolTransfer(
+                    PoolName.MAMBA,
+                    host_indices=torch.tensor([3]),
+                    keys=[key],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+                self.assertEqual(
+                    writer.batch_set_v2([transfer])[PoolName.MAMBA], [True]
+                )
+                reader = self.backend(config)
+                target = _mamba_pool(capacity=16)
+                reader.register_mem_host_pool_v2(target, PoolName.MAMBA)
+                self.assertEqual(
+                    reader.batch_exists_v2([key], [transfer]).kv_hit_pages, 1
+                )
+                transfer.host_indices = torch.tensor([7])
+                self.assertEqual(
+                    reader.batch_get_v2([transfer])[PoolName.MAMBA], [True]
+                )
+                torch.testing.assert_close(target.get_data_page(7), expected)
+                torch.testing.assert_close(
+                    reader.get(key, torch.empty(1, dtype=torch.uint8)),
+                    torch.tensor([19], dtype=torch.uint8),
+                )
+                other = self.backend(replace(config, model_name=model + "-other"))
+                other.register_mem_host_pool_v2(target, PoolName.MAMBA)
+                self.assertEqual(
+                    other.batch_exists_v2([key], [transfer]).kv_hit_pages, 0
+                )
+                self.assertTrue(
+                    all(
+                        len(p.name.encode()) <= 255
+                        for p in Path(self.directory).glob("*.bin")
+                    )
+                )
 
     def test_file_v2_uses_logical_mla_indices_and_physical_page_bytes(self):
         """DCP v2 must consume logical index runs, then restore unrelated pages."""

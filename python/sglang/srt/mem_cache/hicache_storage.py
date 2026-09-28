@@ -423,9 +423,11 @@ class HiCacheFile(HiCacheStorage):
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
         self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
-        self._dcp_state_rank = (
-            storage_config.tp_rank if storage_config.dcp_size > 1 else None
+        self._state_tp_rank = (
+            storage_config.tp_rank if storage_config.is_mla_model else None
         )
+        self._state_tp_size = storage_config.tp_size
+        self._dcp_size = storage_config.dcp_size
 
         tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
@@ -456,6 +458,15 @@ class HiCacheFile(HiCacheStorage):
                 f"_tp{tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
                 f"_page{storage_config.logical_page_size}"
                 f"_{dtype_name}_{storage_config.host_layout}"
+            )
+
+        # Keep room for a SHA256 key (including its version tag) and `.bin`
+        # within the common 255-byte filename limit. Preserve ordinary legacy
+        # names; only overlong namespaces need compaction. The stable suffix
+        # must remain intact for metadata scans and LRU ownership filtering.
+        if len(os.fsencode(self.config_suffix)) > 184:
+            self.config_suffix = (
+                "_ns1_" + hashlib.sha256(os.fsencode(self.config_suffix)).hexdigest()
             )
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
@@ -504,6 +515,8 @@ class HiCacheFile(HiCacheStorage):
         )
 
     def _get_suffixed_key(self, key: str) -> str:
+        if len(os.fsencode(key + self.config_suffix + ".bin")) > 255:
+            key = "h1_" + hashlib.sha256(os.fsencode(key)).hexdigest()
         return key + self.config_suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
@@ -723,7 +736,7 @@ class HiCacheFile(HiCacheStorage):
         if pool_name == PoolName.KV:
             return key
         component = f"{key}.{pool_name}"
-        if pool_name == PoolName.MAMBA and self._dcp_state_rank is not None:
+        if pool_name == PoolName.MAMBA and self._state_tp_rank is not None:
             pool = getattr(self, "registered_pools", {}).get(pool_name)
             if pool is None:
                 raise ValueError(f"Unregistered file hybrid pool: {pool_name}")
@@ -739,7 +752,13 @@ class HiCacheFile(HiCacheStorage):
             fingerprint = hashlib.sha256(
                 json.dumps(schema, separators=(",", ":")).encode()
             ).hexdigest()
-            component = f"{key}.mamba_tp{self._dcp_state_rank}_v1_{fingerprint}"
+            owner = str(self._state_tp_rank)
+            # DCP1 MLA's primary suffix intentionally omits TP topology, but
+            # its recurrent state is still TP-sharded. Never reuse the old,
+            # ambiguous `.mamba` files written by all ranks to one filename.
+            if self._dcp_size == 1:
+                owner += f"_{self._state_tp_size}"
+            component = f"{key}.mamba_tp{owner}_v1_{fingerprint}"
         return component
 
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
