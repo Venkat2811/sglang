@@ -504,3 +504,14 @@ pass 12 tests and 3 subtests. This overlaps
 After a prefix has been advertised, insufficient restore coverage must
 still fail the request; shrinking that promise locally cannot recreate
 rows that prefill has already omitted.
+
+
+The D-only file L3 lane also passes with ordinary role-local radix controls:
+15 requests, fresh DCP4 restores of 256/512/1024 tokens on every rank, and
+exact output IDs/logprobs against the matched warm decode control. The
+initial cold-control run failed at 0.204727 (>0.20); this same difference
+appears without L3 when reusing decode-produced FP8 KV instead of recomputing
+it in prefill. The harness retains cold diagnostics and applies the unchanged
+0.20 tolerance to matched producer history. These short follow-ups include
+an EOS tail; longer meaningful continuations and both-role acceptance remain
+separate checks. Raw failed and passing evidence is retained.

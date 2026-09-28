@@ -5,6 +5,8 @@ must select new owned directories. PD_L3_MODEL_PATH may select the pinned
 local snapshot. A cache-off live P/D pair supplies matched controls; the
 writer pair exits before the fresh-reader pair starts. Prompts end one token
 before a DCP page so actual decode kernels publish the next checkpoint.
+Ordinary role-local radix reuse supplies the matched continuation control:
+decode-produced FP8 KV can differ from recomputed prefill KV even without L3.
 """
 
 import hashlib
@@ -185,7 +187,7 @@ class TestPdHybridL3(CustomTestCase):
                             "a2a",
                             "--dcp-replicate-q-proj",
                         ]
-                        if cached and role in roles:
+                        if role in roles:
                             args += ["--disaggregation-decode-enable-radix-cache"]
                     if cached and role in roles:
                         args += cache_args
@@ -236,8 +238,10 @@ class TestPdHybridL3(CustomTestCase):
                 wait_for_http_ready(router_url + "/health", timeout=120, process=router)
                 yield
 
-        def flush():
-            for url in (p_url, d_url):
+        def flush(selected=("prefill", "decode")):
+            for role, url in (("prefill", p_url), ("decode", d_url)):
+                if role not in selected:
+                    continue
                 r = requests.post(
                     url + "/flush_cache", params={"timeout": 30}, timeout=40
                 )
@@ -286,15 +290,22 @@ class TestPdHybridL3(CustomTestCase):
         save()
         try:
             with pair("reference", False):
-                prime_refs, follow_refs, follow_ids = [], [], []
+                prime_refs, follow_refs, cold_follow_refs, follow_ids = [], [], [], []
                 for i, ids in enumerate(primes):
                     flush()
                     ref = generate(f"reference-prime-{i}", ids, 16)
                     self.assertIn("739391", ref["text"])
                     prime_refs.append(ref)
                     follow_ids.append(ids + ref["output_ids"][:2])
-                    flush()
+                    # Retain ordinary radix only on the roles whose persisted
+                    # cache is under test. This preserves the same producer
+                    # kernels and prefix boundary as the future L3 reader.
+                    flush({"prefill", "decode"} - roles)
                     follow_refs.append(
+                        generate(f"reference-warm-follow-{i}", follow_ids[-1], 14)
+                    )
+                    flush()
+                    cold_follow_refs.append(
                         generate(f"reference-follow-{i}", follow_ids[-1], 14)
                     )
             with pair("writer", True):
@@ -325,6 +336,14 @@ class TestPdHybridL3(CustomTestCase):
                     flush()
                     result = generate(f"fresh-follow-{i}", ids, 14)
                     parity(f"fresh-follow-{i}", follow_refs[i], result)
+                    report["checks"][-1]["cold_prefill_logprob_delta"] = max(
+                        abs(a[0] - b[0])
+                        for a, b in zip(
+                            result["meta_info"]["output_token_logprobs"],
+                            cold_follow_refs[i]["meta_info"]["output_token_logprobs"],
+                        )
+                    )
+                    save()
                     if "prefill" in roles:
                         details = result["meta_info"].get("cached_tokens_details")
                         self.assertIsNotNone(details)
