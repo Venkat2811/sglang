@@ -8,6 +8,8 @@ before a DCP page so actual decode kernels publish the next checkpoint.
 Ordinary role-local radix reuse supplies the matched continuation control:
 decode-produced FP8 KV can differ from recomputed prefill KV even without L3.
 PD_L3_BACKEND defaults to file; mooncake starts an independent native donor.
+PD_L3_LIFECYCLE=1 adds three concurrent continuations, observed in-flight
+restore cancellation, and post-promise state-file failure (file/both only).
 """
 
 import hashlib
@@ -17,6 +19,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 import unittest
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
@@ -24,6 +28,7 @@ from pathlib import Path
 import requests
 import torch
 from native_mooncake_test_store import native_test_store
+from pd_l3_lifecycle import LiveRestoreLifecycle, plugin_environment
 from transformers import AutoTokenizer
 
 from sglang.test.test_utils import (
@@ -66,8 +71,12 @@ class TestPdHybridL3(CustomTestCase):
         selection = os.environ["PD_L3_ROLES"]
         self.assertIn(selection, ("prefill", "decode", "both"))
         self.roles = {"prefill", "decode"} if selection == "both" else {selection}
+        self.lifecycle = os.environ.get("PD_L3_LIFECYCLE", "0") == "1"
         self.backend = os.environ.get("PD_L3_BACKEND", "file")
         self.assertIn(self.backend, ("file", "mooncake"))
+        if self.lifecycle:
+            self.assertEqual((self.backend, selection), ("file", "both"))
+        self.report_lock = threading.RLock()
         self.output = Path(os.environ["PD_L3_OUTPUT_DIR"])
         self.storage = Path(os.environ["PD_L3_STORAGE_DIR"])
         self.output.mkdir(parents=True, exist_ok=False)
@@ -75,12 +84,18 @@ class TestPdHybridL3(CustomTestCase):
         self.model = os.environ.get("PD_L3_MODEL_PATH", MODEL)
         source = Path(__file__).read_bytes()
         (self.output / "runner.py").write_bytes(source)
+        if self.lifecycle:
+            for name in ("pd_l3_lifecycle.py", "l3_lifecycle_hooks.py"):
+                (self.output / name).write_bytes(
+                    Path(__file__).with_name(name).read_bytes()
+                )
         self.report = dict(
             status="running",
             model=MODEL,
             revision=REVISION,
             roles=sorted(self.roles),
             backend=self.backend,
+            lifecycle_enabled=self.lifecycle,
             requests=0,
             checks=[],
             logprob_atol=0.20,
@@ -202,7 +217,8 @@ class TestPdHybridL3(CustomTestCase):
         ]
 
     def _save(self):
-        (self.output / "summary.json").write_text(json.dumps(self.report, indent=2))
+        with self.report_lock:
+            (self.output / "summary.json").write_text(json.dumps(self.report, indent=2))
 
     @contextmanager
     def _pair(self, phase, cached):
@@ -234,6 +250,8 @@ class TestPdHybridL3(CustomTestCase):
                     "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
                     "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": str(self.storage / role),
                 }
+                if self.lifecycle and phase == "fresh" and role == "decode":
+                    env.update(plugin_environment(self.output))
                 (self.output / f"{phase}-{role}-args.json").write_text(json.dumps(args))
                 log = stack.enter_context(
                     (self.output / f"{phase}-{role}.log").open("w")
@@ -292,8 +310,14 @@ class TestPdHybridL3(CustomTestCase):
             sampling_params=dict(temperature=0, max_new_tokens=count, ignore_eos=True),
             return_logprob=True,
         )
+        started = time.monotonic()
         r = requests.post(self.router_url + "/generate", json=payload, timeout=240)
-        record = dict(request=payload, status_code=r.status_code, response=r.json())
+        record = dict(
+            request=payload,
+            status_code=r.status_code,
+            response=r.json(),
+            elapsed_seconds=time.monotonic() - started,
+        )
         (self.output / f"{name}.json").write_text(json.dumps(record, indent=2))
         r.raise_for_status()
         result = r.json()
@@ -303,8 +327,9 @@ class TestPdHybridL3(CustomTestCase):
         lps = result["meta_info"]["output_token_logprobs"]
         self.assertEqual([x[1] for x in lps], result["output_ids"])
         self.assertTrue(all(math.isfinite(x[0]) for x in lps))
-        self.report["requests"] += 1
-        self._save()
+        with self.report_lock:
+            self.report["requests"] += 1
+            self._save()
         return result
 
     def _parity(self, name, expected, actual):
@@ -436,17 +461,27 @@ class TestPdHybridL3(CustomTestCase):
                     self.assertEqual(details["host"], 0)
                     if self.roles == {"prefill"}:
                         self.assertEqual(details["device"], 0)
-            self._flush()
-            # One TP shard's state hole must force a common miss even
-            # while all MLA KV shards remain present.
-            self._remove_state_shard()
-            fallback = self._generate("missing-state-follow-1", self.follow_ids[1], 14)
-            self._parity("missing-state-follow-1", self.cold_follow_refs[1], fallback)
-            self.assertEqual(fallback["meta_info"]["cached_tokens"], 0)
+            self._check_fresh_rank_logs()
+            if self.lifecycle:
+                LiveRestoreLifecycle(self).run()
+            else:
+                self._flush()
+                # One TP shard's state hole must force a common miss even
+                # while all MLA KV shards remain present.
+                self._remove_state_shard()
+                fallback = self._generate(
+                    "missing-state-follow-1", self.follow_ids[1], 14
+                )
+                self._parity(
+                    "missing-state-follow-1", self.cold_follow_refs[1], fallback
+                )
+                self.assertEqual(fallback["meta_info"]["cached_tokens"], 0)
             for role, url in (("prefill", self.p_url), ("decode", self.d_url)):
                 r = requests.get(url + "/metrics", timeout=30)
                 r.raise_for_status()
                 (self.output / f"fresh-{role}-metrics.prom").write_text(r.text)
+
+    def _check_fresh_rank_logs(self):
         if "decode" in self.roles:
             matches = re.findall(
                 r"DCP L3 prefetch: tp_rank=(\d+) tokens=(\d+)",
