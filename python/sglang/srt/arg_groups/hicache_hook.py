@@ -149,8 +149,6 @@ def validate_hicache_dcp_storage(server_args: Any, *, storage_backend=None):
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1:
         return
-    if cfg.disaggregation_mode != "null":
-        raise NotImplementedError("HiCache L3 with DCP requires aggregated serving.")
     if not use_mla_backend(server_args):
         raise NotImplementedError("HiCache L3 with DCP requires MLA.")
     if (storage_backend or cfg.hicache_storage_backend) not in ("file", "mooncake"):

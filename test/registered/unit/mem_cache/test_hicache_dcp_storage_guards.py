@@ -44,17 +44,6 @@ def _args(**changes):
 
 
 class TestDcpStorageGuards(CustomTestCase):
-    def test_pd_storage_stays_gated_until_transfer_support(self):
-        with mock.patch(
-            "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
-        ):
-            for role in ("prefill", "decode"):
-                with (
-                    self.subTest(role=role),
-                    self.assertRaisesRegex(NotImplementedError, "aggregated serving"),
-                ):
-                    resolve_hicache_dcp_compatibility(_args(disaggregation_mode=role))
-
     def test_materialized_mamba_registration_preserves_independent_slot_pool(self):
         pool = _make_host_pool(0, dcp_size=2, layout="page_first")
         state = _mamba_pool()
@@ -203,7 +192,7 @@ class TestDcpStorageGuards(CustomTestCase):
             dict(attn_cp_size=2),
             dict(dp_size=2, enable_dp_attention=True),
             dict(speculative_algorithm="DSPARK"),
-            dict(disaggregation_mode="prefill", hicache_storage_backend=None),
+            dict(disaggregation_mode="prefill"),
         )
         with mock.patch(
             "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True

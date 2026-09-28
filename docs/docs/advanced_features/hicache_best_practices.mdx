@@ -81,7 +81,12 @@ independent materialized Mamba/KDA pool. Packed draft pools, additional side
 pools and separate KV scale buffers are outside this storage support. The
 general DCP and model-specific attention-backend restrictions still apply.
 
-P/D serving remains rejected with DCP L3 until live-transfer support is enabled.
+In P/D deployments, keep persisted cache namespaces role-local when the roles
+use different layouts. Use separate file directories or Mooncake
+`extra_backend_tag` values. Live P-to-D transfer remains responsible for moving
+the request's KV and current recurrent state; L3 does not convert the stored
+objects between the roles' topologies. Decode-side radix reuse requires
+`--disaggregation-decode-enable-radix-cache`.
 
 DCP keys include shard and layout identity. Recurrent file keys also preserve
 TP ownership independently of MLA replication, including when long filenames
