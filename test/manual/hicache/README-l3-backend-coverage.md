@@ -454,3 +454,35 @@ and provide `KIMI_L3_EXTRA_CONFIG` for an independently owned persistent
 store; zero-contribution inference clients must not be its only owners.
 Raw failed attempts, successful responses, rank logs and source hashes are
 retained outside this public repository.
+
+
+## Role-local hybrid L3 during live P/D (2026-09-28)
+
+`test_pd_hybrid_l3.py` adds P-only, D-only and both-role file L3 lanes for
+Kimi-Linear P4/EP4 -> D4/DCP4 on one eight-GPU Blackwell node. Each lane
+runs cache-disabled live P/D controls, a writer pair, and a fresh reader
+pair. The roles use separate storage directories. Prime prompts end at
+255/511/1023 tokens; actual decode crosses the next recurrent checkpoint,
+then the fresh pair continues the prime with two generated tokens appended.
+All comparisons require exact output IDs and logprob error at most 0.20.
+
+The P-only lane passes all 12 requests over Mooncake RDMA with DMA-BUF.
+Fresh prefill restores 192/448/960 tokens from file L3 with zero L1/L2 hits;
+the maximum matched logprob difference is 0.114167. This establishes
+role-local prefill reuse during live DCP1 -> DCP4 transfer. Decode-only and
+both-role acceptance are separate gates; the runner's availability does
+not imply those gates have passed.
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+WITH_NVIDIA_PEERMEM=0 MOONCAKE_PROTOCOL=rdma \
+PD_L3_ROLES=prefill \
+PD_L3_OUTPUT_DIR=/tmp/pd-l3-prefill-results \
+PD_L3_STORAGE_DIR=/tmp/pd-l3-prefill-files \
+python test/manual/hicache/test_pd_hybrid_l3.py
+```
+
+Use new directories for each run. `PD_L3_ROLES` also accepts `decode` and
+`both`; `PD_L3_MODEL_PATH` can select the pinned local snapshot, including
+its chat template. These lanes do not establish cross-layout persisted
+object conversion, hybrid SSD residency or Kimi-K3 support.
