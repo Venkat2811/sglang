@@ -1,4 +1,5 @@
 import ctypes
+import hashlib
 import json
 import logging
 import os
@@ -792,14 +793,31 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if pool_name == PoolName.KV:
             suffixes = [f"_{self.mla_suffix}_k"]
         elif pool_name == PoolName.MAMBA:
+            state_suffix = self.mha_suffix
+            if self._dcp_namespace is not None:
+                # Recurrent state is TP-sharded, independently of MLA's DCP
+                # shards. Equal byte counts can still mean different shapes or
+                # precisions. Exclude only host capacity (the first dimension)
+                # so compatible engines with different cache sizes can reuse it.
+                schema = [
+                    host_pool.layout,
+                    [
+                        (str(buf.dtype), list(buf.shape[1:]))
+                        for buf in host_pool.get_hybrid_pool_buffer()
+                    ],
+                ]
+                fingerprint = hashlib.sha256(
+                    json.dumps(schema, separators=(",", ":")).encode()
+                ).hexdigest()
+                state_suffix = f"{state_suffix}_mamba_v1_{fingerprint}"
             # Mamba stores one temporal object plus one object per conv state.
             # conv-only models have no ssm state; drop the 0-element temporal
             # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
             # its temporal pointer under the same condition to stay aligned.
             conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
+            suffixes = [f"_{state_suffix}_conv_{i}" for i in range(conv_num)]
             if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
-                suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
+                suffixes = [f"_{state_suffix}_temporal"] + suffixes
         elif pool_name == PoolName.DRAFT:
             # Draft pool's MLA/MHA layout is independent from the target
             # (e.g. EAGLE-MHA draft on top of an MLA target), so pick the

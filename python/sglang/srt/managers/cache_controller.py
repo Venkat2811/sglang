@@ -517,6 +517,56 @@ class HiCacheController:
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
 
+    @staticmethod
+    def _validate_dcp_storage_pools(primary, entries):
+        """Validate every persisted pool before registering or starting IO."""
+        from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        message = (
+            "HiCache L3 with DCP requires one materialized MLA host pool "
+            "and at most one materialized Mamba state pool."
+        )
+        if not isinstance(primary, MLATokenToKVPoolHost) or primary.kv_buffer is None:
+            raise NotImplementedError(message)
+        if primary.layout not in ("layer_first", "page_first", "page_first_direct"):
+            raise NotImplementedError(
+                "HiCache L3 with DCP requires a generic MLA storage-page layout."
+            )
+        if getattr(primary.device_pool, "kv_scale_buffer", None) is not None:
+            raise NotImplementedError(
+                "HiCache L3 with DCP cannot store separate KV scale buffers."
+            )
+        if entries is None:
+            return
+        if len(entries) not in (1, 2):
+            raise NotImplementedError(message)
+        if len(entries) > 1 and any(
+            getattr(entry, "packed_draft_device_pools", ()) for entry in entries
+        ):
+            raise NotImplementedError(message)
+        seen = set()
+        for entry in entries:
+            name = getattr(entry, "name", None)
+            if name in seen:
+                raise NotImplementedError(message)
+            seen.add(name)
+            if name == PoolName.KV and entry.host_pool is primary:
+                continue
+            if (
+                name != PoolName.MAMBA
+                or not isinstance(entry.host_pool, MambaPoolHost)
+                or entry.host_pool.layout not in ("page_first", "page_first_direct")
+                or entry.device_indices_from_anchor_fn is not None
+                or entry.packed_draft_device_pools
+            ):
+                raise NotImplementedError(message)
+            buffers = entry.host_pool.get_hybrid_pool_buffer()
+            if not buffers or any(b is None or b.numel() == 0 for b in buffers):
+                raise NotImplementedError(message)
+        if PoolName.KV not in seen:
+            raise NotImplementedError(message)
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -533,36 +583,16 @@ class HiCacheController:
             raise RuntimeError("Storage backend already attached.")
         if get_parallel().attn_dcp_size > 1:
             from sglang.srt.arg_groups.hicache_hook import validate_hicache_dcp_storage
-            from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
             from sglang.srt.runtime_context import get_server_args
 
             validate_hicache_dcp_storage(
                 get_server_args(),
                 storage_backend=storage_backend,
             )
-            if (
-                not isinstance(self.storage_host_pool, MLATokenToKVPoolHost)
-                or self.storage_host_pool.kv_buffer is None
-                or len(getattr(self.mem_pool_host, "entries", [None])) != 1
-            ):
-                raise NotImplementedError(
-                    "HiCache L3 with DCP requires one materialized MLA host pool."
-                )
-            if self.storage_host_pool.layout not in (
-                "layer_first",
-                "page_first",
-                "page_first_direct",
-            ):
-                raise NotImplementedError(
-                    "HiCache L3 with DCP requires a generic MLA storage-page layout."
-                )
-            if (
-                getattr(self.storage_host_pool.device_pool, "kv_scale_buffer", None)
-                is not None
-            ):
-                raise NotImplementedError(
-                    "HiCache L3 with DCP cannot store separate KV scale buffers."
-                )
+            self._validate_dcp_storage_pools(
+                self.storage_host_pool,
+                getattr(getattr(self, "mem_pool_host", None), "entries", None),
+            )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
@@ -1262,6 +1292,17 @@ class HiCacheController:
 
         return hash_value, storage_query_count
 
+    def _reduce_storage_hit_count(
+        self, operation, storage_hit_count: int, sync_groups=None
+    ) -> int:
+        hit_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce(
+            hit_tensor,
+            torch.distributed.ReduceOp.MIN,
+            self.prefetch_hits_sync_groups if sync_groups is None else sync_groups,
+        )
+        return int(hit_tensor.item())
+
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
@@ -1275,15 +1316,9 @@ class HiCacheController:
                     hash_value, storage_hit_count = [], 0
                 else:
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
+                storage_hit_count = self._reduce_storage_hit_count(
+                    operation, storage_hit_count
                 )
-                self._all_reduce(
-                    storage_hit_count_tensor,
-                    torch.distributed.ReduceOp.MIN,
-                    self.prefetch_hits_sync_groups,
-                )
-                storage_hit_count = storage_hit_count_tensor.item()
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.
