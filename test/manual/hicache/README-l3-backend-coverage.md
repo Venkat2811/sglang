@@ -96,7 +96,7 @@ Cache-spill correctness is separate from recovering the store after its owner
 or master restarts. The first witness keeps the independent SSD owner alive.
 No shared node-wide page-cache flush or destructive device operation is needed.
 
-### Bounded one-GPU SSD inference witness
+### Bounded SSD inference witness
 
 `test_hicache_ssd_pressure.py` runs the same answer and cache-tier assertions
 against either backend. First independently map the selected filesystem to its
@@ -148,8 +148,26 @@ The selected SSD's cgroup read-byte increase must cover all restored KV bytes.
 Preserve `summary.json`, per-request responses, server arguments/logs, metrics,
 disk metadata, runner hash, and the independent mount/device audit.
 
-This is a TP1/DCP1 tiering gate. It complements the multi-rank tests; it does
-not establish DCP shard agreement, hybrid state restore, or live P/D behavior.
+The default TP1/DCP1 mode verifies tiering. Distributed modes below add shard
+agreement; neither mode establishes hybrid state restore or live P/D behavior.
+
+The same runner also accepts `HICACHE_SSD_TP` and `HICACHE_SSD_DCP` (default
+1/1). Use `8`/`8` with eight visible GPUs, or `4`/`2` with four, to exercise
+distributed SSD restores. DCP runs use FlashInfer with paired cold controls,
+the same exact six-token answer, and the unchanged 0.05 logprob tolerance.
+Each rank must report the same restored logical prefix. The fault removes only
+the last DCP rank's second-page object; all ranks must fall back to one logical
+page (512 tokens at DCP8, 128 at DCP2). Equivalent MLA readers in TP>DCP share
+the same stored shards.
+
+`--max-total-tokens` limits physical rows per rank. The runner scales that cap
+to keep logical capacity small, while retaining room for the rounded prompt
+and the allocator's extra decode page. TP8/DCP8 needs 384 physical rows per
+rank (3072 logical tokens); its effective L2 is 640 physical rows per rank
+(5120 logical tokens). The initial 256-row attempt generated zero tokens in
+the cold control because its decode reserve exhausted the tiny pool; it did
+not reach storage qualification. Six 1537-token prompts still exceed both
+corrected cache capacities. DCP1 retains its original 2048-row cap.
 
 ### Measured SSD results, 2026-09-28
 

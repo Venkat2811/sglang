@@ -1,10 +1,12 @@
-"""One-GPU file/Mooncake SSD inference under bounded cache pressure.
+"""File/Mooncake SSD inference under bounded cache pressure.
 
 Required environment: HICACHE_SSD_BACKEND=file|mooncake,
 HICACHE_SSD_OUTPUT_DIR (new directory), HICACHE_SSD_STORAGE_ROOT (new directory
 on a verified SSD filesystem), HICACHE_SSD_BLOCK_DEVICE (cgroup io.stat id).
 The supplied device must be independently mapped to the storage mount. Only
 owned files are fsynced/advised; no global page-cache flush or device changes.
+HICACHE_SSD_TP and HICACHE_SSD_DCP default to 1. Distributed runs also require
+all-rank prefix agreement and inject a hole in the last DCP rank's second page.
 """
 
 import gc
@@ -12,14 +14,17 @@ import hashlib
 import json
 import math
 import os
+import re
 import socket
 import subprocess
 import time
 import unittest
+from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
 
 import requests
+import torch
 from transformers import AutoConfig, AutoTokenizer
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
@@ -45,6 +50,20 @@ class TestHiCacheSsdPressure(CustomTestCase):
     def test_pressure_restore(self):
         backend = os.environ["HICACHE_SSD_BACKEND"]
         self.assertIn(backend, ("file", "mooncake"))
+        tp = int(os.environ.get("HICACHE_SSD_TP", "1"))
+        dcp = int(os.environ.get("HICACHE_SSD_DCP", "1"))
+        self.assertGreaterEqual(dcp, 1)
+        self.assertGreaterEqual(tp, dcp)
+        self.assertEqual(tp % dcp, 0)
+        self.assertGreaterEqual(torch.cuda.device_count(), tp)
+        logical_page = PAGE * dcp
+        self.assertEqual(PREFIX % logical_page, 0)
+        self.assertGreaterEqual(PREFIX // logical_page, 3)
+        # max-total-tokens caps physical rows per rank. Leave space for the
+        # rounded prompt and allocator's extra logical-page decode reserve.
+        # Six distinct prompts still exceed both L1 and ratio-1.5 L2.
+        device_token_cap = max(2048, PREFIX + 3 * logical_page) // dcp
+        self.assertEqual(device_token_cap % PAGE, 0)
         output = Path(os.environ["HICACHE_SSD_OUTPUT_DIR"])
         storage = Path(os.environ["HICACHE_SSD_STORAGE_ROOT"])
         device = os.environ["HICACHE_SSD_BLOCK_DEVICE"]
@@ -83,12 +102,14 @@ class TestHiCacheSsdPressure(CustomTestCase):
             "backend": backend,
             "model": MODEL,
             "revision": REVISION,
-            "tp": 1,
-            "dcp": 1,
+            "tp": tp,
+            "dcp": dcp,
+            "logical_page_size": logical_page,
             "filesystem": filesystem,
             "block_device": device,
             "runner_sha256": hashlib.sha256(source).hexdigest(),
-            "device_token_cap": 2048,
+            "device_token_cap": device_token_cap,
+            "logical_device_token_cap": device_token_cap * dcp,
             "host_to_device_ratio": 1.5,
             "mooncake_dram_bytes": STORE_DRAM if backend == "mooncake" else None,
             "object_bytes": object_bytes,
@@ -138,10 +159,13 @@ class TestHiCacheSsdPressure(CustomTestCase):
             REVISION,
             "--trust-remote-code",
             "--tp-size",
-            "1",
+            str(tp),
+            "--dcp-size",
+            str(dcp),
+            "--dcp-comm-backend",
+            "ag_rs",
             "--attention-backend",
-            "triton",
-            "--enable-deterministic-inference",
+            "triton" if dcp == 1 else "flashinfer",
             "--dtype",
             "bfloat16",
             "--kv-cache-dtype",
@@ -153,7 +177,7 @@ class TestHiCacheSsdPressure(CustomTestCase):
             "--chunked-prefill-size",
             "1024",
             "--max-total-tokens",
-            "2048",
+            str(device_token_cap),
             "--max-running-requests",
             "1",
             "--mem-fraction-static",
@@ -169,6 +193,8 @@ class TestHiCacheSsdPressure(CustomTestCase):
             "--log-level",
             "debug",
         ]
+        if dcp == 1:
+            common.append("--enable-deterministic-inference")
         env = {
             **os.environ,
             "SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE": str(PAGE),
@@ -249,13 +275,32 @@ class TestHiCacheSsdPressure(CustomTestCase):
             (output / f"{name}.prom").write_text(response.text)
 
         tag = "ssd-pressure-smoke"
-        hashes = get_storage_hash_str(cases[0]["ids"][:PREFIX], None, page_size=PAGE)
-        keys = [
-            f"{h}_{MODEL.replace('/', '-')}.bin"
-            if backend == "file"
-            else f"{tag}_{MODEL.replace('/', '-')}_{h}__k"
-            for h in hashes
-        ]
+        hashes = get_storage_hash_str(
+            cases[0]["ids"][:PREFIX], None, page_size=logical_page
+        )
+        model_name = MODEL.replace("/", "-")
+        keys = []
+        for h in hashes:
+            for rank in range(dcp):
+                file_suffix = f"_{model_name}"
+                native_prefix = f"{tag}_{model_name}"
+                native_rank = ""
+                if dcp > 1:
+                    file_suffix += (
+                        f"_tp{tp}_dcp{rank}_{dcp}_page{logical_page}"
+                        "_bfloat16_page_first"
+                    )
+                    native_prefix += (
+                        f"_dcp_v1_tp{tp}_ds{dcp}_pp1_cp0of1"
+                        f"_page{logical_page}_bfloat16_page_first_pp0"
+                    )
+                    native_rank = f"dcp{rank}"
+                keys.append(
+                    f"{h}{file_suffix}.bin"
+                    if backend == "file"
+                    else f"{native_prefix}_{h}_{native_rank}_k"
+                )
+        report["target_keys"] = keys.copy()
         master = donor = None
 
         def exists(key):
@@ -326,6 +371,22 @@ class TestHiCacheSsdPressure(CustomTestCase):
                 report["io"][phase]["read_bytes"], expected // PAGE * object_bytes
             )
             metrics(phase + "-after")
+            if dcp > 1:
+                log_phase = "writer" if phase == "same-engine-replay" else phase
+                matches = re.findall(
+                    r"DCP L3 prefetch: tp_rank=(\d+) tokens=(\d+)",
+                    (output / f"{log_phase}-server.log").read_text(),
+                )
+                by_rank = {
+                    rank: Counter(
+                        int(n) for r, n in matches if int(r) == rank and int(n)
+                    )
+                    for rank in range(tp)
+                }
+                report.setdefault("rank_prefixes", {})[phase] = by_rank
+                save()
+                for rank, counts in by_rank.items():
+                    self.assertEqual(counts, Counter([expected]), rank)
 
         try:
             save()
@@ -475,16 +536,22 @@ class TestHiCacheSsdPressure(CustomTestCase):
 
             # Remove a middle page after both positive disk restores. A fresh
             # process must stop before the hole and recompute the remainder.
+            removed = keys[2 * dcp - 1]
+            report["missing_shard"] = {
+                "key": removed,
+                "dcp_rank": dcp - 1,
+                "expected_prefix": logical_page,
+            }
             if backend == "file":
-                (storage / keys[1]).unlink()
+                (storage / removed).unlink()
             else:
-                self.assertEqual(donor.remove(keys[1], force=True), 0)
-            self.assertFalse(exists(keys[1]))
-            self.assertTrue(all(exists(k) for k in keys if k != keys[1]))
+                self.assertEqual(donor.remove(removed, force=True), 0)
+            self.assertFalse(exists(removed))
+            self.assertTrue(all(exists(k) for k in keys if k != removed))
             # The remaining target prefix is one page; use it for residency checks.
-            keys = keys[:1]
+            keys = keys[:dcp]
             with server("missing-page-reader", extra):
-                restore("missing-page-reader", PAGE)
+                restore("missing-page-reader", logical_page)
             report["status"] = "passed"
         except Exception as error:
             report.update(status="failed", error=repr(error))
