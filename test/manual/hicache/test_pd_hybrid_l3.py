@@ -79,7 +79,7 @@ class TestPdHybridL3(CustomTestCase):
             [
                 {
                     "role": "user",
-                    "content": "Remember the secret access code: 739391.\nINSERT_FILLER_HERE\nWhat is the secret access code? Reply with only the six digits.",
+                    "content": "Remember the secret access code: 739391.\nINSERT_FILLER_HERE\nReply with the secret access code four times separated by single spaces, and nothing else.",
                 }
             ],
             tokenize=False,
@@ -162,7 +162,7 @@ class TestPdHybridL3(CustomTestCase):
             "--hicache-storage-prefetch-policy",
             "wait_complete",
             "--hicache-storage-backend-extra-config",
-            json.dumps({"prefetch_threshold": 1}),
+            json.dumps({"prefetch_threshold": 1, "enable_metadata_cache": False}),
         ]
 
         @contextmanager
@@ -261,6 +261,8 @@ class TestPdHybridL3(CustomTestCase):
             r.raise_for_status()
             result = r.json()
             self.assertEqual(len(result["output_ids"]), count)
+            if "follow" in name:
+                self.assertIn("739391", result["text"])
             lps = result["meta_info"]["output_token_logprobs"]
             self.assertEqual([x[1] for x in lps], result["output_ids"])
             self.assertTrue(all(math.isfinite(x[0]) for x in lps))
@@ -294,7 +296,7 @@ class TestPdHybridL3(CustomTestCase):
                 for i, ids in enumerate(primes):
                     flush()
                     ref = generate(f"reference-prime-{i}", ids, 16)
-                    self.assertIn("739391", ref["text"])
+                    self.assertEqual(ref["text"].strip(), " ".join(["739391"] * 4))
                     prime_refs.append(ref)
                     follow_ids.append(ids + ref["output_ids"][:2])
                     # Retain ordinary radix only on the roles whose persisted
@@ -304,6 +306,11 @@ class TestPdHybridL3(CustomTestCase):
                     follow_refs.append(
                         generate(f"reference-warm-follow-{i}", follow_ids[-1], 14)
                     )
+                    if "decode" in roles:
+                        self.assertEqual(
+                            follow_refs[-1]["meta_info"]["cached_tokens"],
+                            (256, 512, 1024)[i],
+                        )
                     flush()
                     cold_follow_refs.append(
                         generate(f"reference-follow-{i}", follow_ids[-1], 14)
@@ -351,6 +358,25 @@ class TestPdHybridL3(CustomTestCase):
                         self.assertEqual(details["host"], 0)
                         if roles == {"prefill"}:
                             self.assertEqual(details["device"], 0)
+                flush()
+                # One TP shard's state hole must force a common miss even
+                # while all MLA KV shards remain present.
+                victims = [p for p in storage.rglob("*.bin") if "mamba_tp3_" in p.name]
+                self.assertTrue(victims)
+                report["removed_state_files"] = [
+                    dict(
+                        path=str(p.relative_to(storage)),
+                        bytes=p.stat().st_size,
+                        sha256=hashlib.sha256(p.read_bytes()).hexdigest(),
+                    )
+                    for p in victims
+                ]
+                save()
+                for p in victims:
+                    p.unlink()
+                fallback = generate("missing-state-follow-1", follow_ids[1], 14)
+                parity("missing-state-follow-1", cold_follow_refs[1], fallback)
+                self.assertEqual(fallback["meta_info"]["cached_tokens"], 0)
                 for role, url in (("prefill", p_url), ("decode", d_url)):
                     r = requests.get(url + "/metrics", timeout=30)
                     r.raise_for_status()
