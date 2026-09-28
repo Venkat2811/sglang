@@ -13,7 +13,7 @@ registered L3 backend.
 | Pure MLA + DCP + Mooncake DRAM | Enabled; TP8/DCP8 and TP4/DCP2 inference passed | Other explicitly selected layouts/policies and runtime attachment |
 | Pure MLA + DCP + file | Enabled; inherited file inference fixture and CPU contracts exist | Independently recorded file run on this branch; same numerical and fault oracles as Mooncake |
 | File directory on SSD | TP1/DCP1 pressure, physical SSD reads and missing-page fallback passed | Multi-rank file/DCP SSD composition |
-| Mooncake SSD offload | Connector exposes SSD options; store implements tiering | Prove SSD-only replica retrieval, not a hit on a remaining memory replica |
+| Mooncake SSD offload | TP1/DCP1 pressure, SSD-only replica retrieval and missing-page fallback passed | Multi-rank DCP SSD composition and independent owner/master restart recovery |
 | Hybrid KDA + MLA + DCP + L3 | Component contracts implemented; public enablement still guarded | Composed checkpoint capture/publication/restore and real model continuation, for each backend |
 | Live P/D with role-local L3 | Existing P/D fixtures and implementation paths | Explicit cache-off baselines, role-local restores and their composition with live transfer |
 
@@ -150,6 +150,33 @@ disk metadata, runner hash, and the independent mount/device audit.
 
 This is a TP1/DCP1 tiering gate. It complements the multi-rank tests; it does
 not establish DCP shard agreement, hybrid state restore, or live P/D behavior.
+
+### Measured SSD results, 2026-09-28
+
+Both lanes passed on one B300 with the pinned model above, physical NVMe
+storage, kernel 0.4.7, Torch 2.13.0+cu130, and native Mooncake 0.3.13. The
+effective HiCache host pool was 3136 tokens (about 93 MiB). Each lane completed
+21 scored requests; all answer text and token IDs matched, and the largest
+observed output-logprob delta was zero (assertion tolerance remains 0.05).
+
+| Backend | Runtime | Same-engine / fresh-reader storage hits | NVMe bytes per full restore | Missing-page storage hit / NVMe bytes |
+| --- | --- | --- | --- | --- |
+| File | 287.82 s | 1536 / 1536 tokens | 47,775,744 | 64 tokens / 1,990,656 |
+| Mooncake SSD | 258.98 s | 1536 / 1536 tokens | 47,874,048 | 64 tokens / 1,994,752 |
+
+All three restores in each lane reported zero device and host hits. Each target
+contained 24 physical KV pages of 1,990,656 bytes. Mooncake initially reported
+24 complete memory replicas, then 24 complete local-disk-only replicas after
+the six writer prompts. No extra native pressure objects were needed. Exact
+payload hashes survived offload. The larger physical read count includes
+Mooncake's bucket storage overhead.
+
+File runner SHA256: `1ff23bdf568ae8e23bd08464683521c0e4fba9879b6291e39f03caaadb16c196`.
+Mooncake runner SHA256: `bd59be805d39eb0c4463abb417f3e5ba90aa52bc2f319a94b5eb131a56d89406`.
+The latter adds the Mooncake bucket/eviction settings described above; the file
+restore path is unchanged. Production source was identical for both runs.
+This verifies bounded SSD spill/reuse with `write_through` and `wait_complete`;
+it does not qualify every policy, DCP topology, hybrid model or P/D role.
 
 ## Next hybrid and live P/D work
 
