@@ -303,6 +303,12 @@ class TestHybridL3Restore(CustomTestCase):
                     host = cons.host_pool_group.get_pool(PoolName.MAMBA)
                     available = host.available_size()
                     tokens = array("q", range(4 * page))
+                    # Decode advertises this probe before asynchronous IO.
+                    # KV beyond the latest complete state is not restorable.
+                    self.assertEqual(
+                        cons.query_storage_hit_length(cons.root_node_handle(), tokens),
+                        expected_tokens,
+                    )
                     if scenario == "cancel":
                         self._cancel_during_state_read(cons, tokens, host, available)
                     handles = [
