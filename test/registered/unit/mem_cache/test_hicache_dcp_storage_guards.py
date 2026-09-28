@@ -157,27 +157,14 @@ class TestDcpStorageGuards(CustomTestCase):
                         PoolName.DRAFT, controller.extra_host_mem_release_queues
                     )
 
-    def test_mooncake_uses_the_same_startup_and_attach_validation(self):
-        with mock.patch(
-            "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
-        ):
-            args = _args(hicache_storage_backend="mooncake")
-            resolve_hicache_dcp_compatibility(args)
-            validate_hicache_dcp_storage(_args(), storage_backend="mooncake")
-
-    def test_supported_topologies(self):
-        with mock.patch(
-            "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
-        ):
-            for tp, dcp in ((2, 2), (4, 2), (4, 4)):
-                with self.subTest(tp=tp, dcp=dcp):
-                    resolve_hicache_dcp_compatibility(_args(tp_size=tp, dcp_size=dcp))
-            for dtype in ("bf16", "bfloat16"):
-                with self.subTest(kv_cache_dtype=dtype):
-                    resolve_hicache_dcp_compatibility(_args(kv_cache_dtype=dtype))
-
-    def test_inherits_mla_hicache_options(self):
+    def test_startup_and_attach_preserve_supported_options(self):
         cases = (
+            {},
+            dict(hicache_storage_backend="mooncake"),
+            dict(tp_size=2, dcp_size=2),
+            dict(tp_size=4, dcp_size=4),
+            dict(kv_cache_dtype="bf16"),
+            dict(kv_cache_dtype="bfloat16"),
             dict(hicache_mem_layout="layer_first"),
             dict(hicache_mem_layout="page_first_direct", hicache_io_backend="direct"),
             dict(dtype="float16"),
@@ -199,7 +186,11 @@ class TestDcpStorageGuards(CustomTestCase):
         ):
             for options in cases:
                 with self.subTest(options=options):
-                    resolve_hicache_dcp_compatibility(_args(**options))
+                    args = _args(**options)
+                    resolve_hicache_dcp_compatibility(args)
+                    validate_hicache_dcp_storage(
+                        args, storage_backend=args.hicache_storage_backend
+                    )
 
     def test_keeps_existing_dcp_constraints(self):
         with mock.patch(
