@@ -308,6 +308,17 @@ gates below.
 
 ### Kimi DCP4 cold/warm baseline
 
+The composed GPU state test, `test/registered/unit/mem_cache/test_hybrid_l3_restore.py`,
+now passes eight cases in 9.06 seconds: full restore, missing-latest-state
+fallback, duplicate prefetch and cancellation during state IO, each at logical
+pages 128 and 512. It uses the actual checkpoint donation, file backend,
+prefetch completion, radix host insertion, and GPU load-back paths. Exact KV
+and recurrent bytes survive; request state has a separate writable copy from
+the canonical cached checkpoint. Cancellation retains its in-flight destination,
+then releases it without publishing, and a new request generation restores.
+The small GPU fixture exercises shared Mamba/tree semantics; its forward state
+is tagged explicitly, and MLA/DCP model kernels require the separate model gate.
+
 `test_kimi_linear_dcp_baseline.py` passed 56 requests and 39 numerical checks
 in 137.71 seconds on four B300 GPUs. Set `KIMI_DCP_OUTPUT_DIR` to a new
 directory and optionally `KIMI_DCP_MODEL_PATH` to a local snapshot of

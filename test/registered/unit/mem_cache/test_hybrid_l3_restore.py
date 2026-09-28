@@ -1,0 +1,233 @@
+"""Compose checkpoint donation, file L3, radix publication and actual GPU copies.
+
+The small Mamba fixture exercises the shared state/tree protocol with widened
+128/512-token pages. Model-level MLA/DCP kernels are qualified separately.
+No final publication callback or host/device copy is replaced in this test.
+"""
+
+import tempfile
+import threading
+import time
+import unittest
+from array import array
+from pathlib import Path
+from unittest.mock import patch
+
+import test_mamba_checkpoint_publication as publication
+import torch
+from test_unified_radix_cache_unittest import (
+    CacheConfig,
+    UnifiedRadixCacheSuite,
+    build_fixture,
+)
+
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, MatchPrefixParams
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.runtime_context import reset_context
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=35, stage="base-b", runner_config="1-gpu-small")
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires real GPU host transfers")
+class TestHybridL3Restore(CustomTestCase):
+    # Reuse fixture mechanics, without inheriting the unrelated full tree suite.
+    _request = publication.TestMambaCheckpointPublication._request
+    _forward_snapshot = publication.TestMambaCheckpointPublication._forward_snapshot
+    _init_hicache = UnifiedRadixCacheSuite._init_hicache
+    _backup_node = UnifiedRadixCacheSuite._backup_node
+    _path_chain = UnifiedRadixCacheSuite._path_chain
+    _write_path_to_l3 = UnifiedRadixCacheSuite._write_path_to_l3
+    _flush_l3_backups = UnifiedRadixCacheSuite._flush_l3_backups
+    _ongoing_l3_backups = UnifiedRadixCacheSuite._ongoing_l3_backups
+    _run_prefetch_to_completion = UnifiedRadixCacheSuite._run_prefetch_to_completion
+    _load_back_node = UnifiedRadixCacheSuite._load_back_node
+    _get_full_kv_pool = UnifiedRadixCacheSuite._get_full_kv_pool
+    _fill_full_kv = UnifiedRadixCacheSuite._fill_full_kv
+    _snapshot_full_kv = UnifiedRadixCacheSuite._snapshot_full_kv
+
+    def setUp(self):
+        self.addCleanup(reset_context)
+
+    def _fixture(self, directory):
+        with patch(
+            "test_unified_radix_cache_unittest._TREE_CORE_TEST_BACKEND", "python"
+        ):
+            cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=64)
+        self._init_hicache(
+            cache,
+            storage_backend="file",
+            storage_dir=directory,
+            prefetch_threshold=1,
+            storage_extra={"enable_metadata_cache": False},
+        )
+        return cache, allocator, pool
+
+    def _cancel_during_state_read(self, cache, tokens, host, available):
+        backend = cache.cache_controller.storage_backend
+        original = backend.batch_get_v2
+        entered, release = threading.Event(), threading.Event()
+
+        def delayed_read(transfers, *args, **kwargs):
+            if any(t.name == PoolName.MAMBA for t in transfers):
+                entered.set()
+                if not release.wait(10):
+                    raise TimeoutError("Test did not release the paused state read")
+            return original(transfers, *args, **kwargs)
+
+        handle = CacheRequestHandle("reader", 0)
+        with patch.object(backend, "batch_get_v2", side_effect=delayed_read):
+            try:
+                cache.prefetch_from_storage(
+                    handle, cache.root_node_handle(), tokens, None, None
+                )
+                deadline = time.monotonic() + 10
+                while not entered.is_set() and time.monotonic() < deadline:
+                    cache.check_hicache_events()
+                    time.sleep(0.01)
+                self.assertTrue(entered.is_set(), "State IO did not reach the pause")
+                self.assertEqual(host.available_size(), available - 1)
+                cache.release_aborted_request(handle)
+                cache.check_hicache_events()
+                self.assertEqual(
+                    host.available_size(),
+                    available - 1,
+                    "Canceled request freed an in-flight state destination",
+                )
+            finally:
+                release.set()
+            deadline = time.monotonic() + 10
+            while host.available_size() != available and time.monotonic() < deadline:
+                cache.check_hicache_events()
+                time.sleep(0.01)
+            self.assertEqual(host.available_size(), available)
+            match = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+            self.assertEqual(match.host_hit_length, 0)
+            self.assertEqual(len(match.device_indices), 0)
+            self.assertNotIn(handle, cache.ongoing_prefetch)
+
+    def test_fresh_partial_and_duplicate_restore_preserve_checkpoint_bytes(self):
+        for page in (128, 512):
+            for scenario in ("complete", "missing_latest_state", "duplicate", "cancel"):
+                with (
+                    self.subTest(page=page, scenario=scenario),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    self.cfg = CacheConfig(
+                        page_size=page,
+                        components=(ComponentType.FULL, ComponentType.MAMBA),
+                        enable_mamba_extra_buffer=True,
+                        num_layers=2,
+                        full_attention_layer_ids=(0,),
+                        kv_size=page * 16,
+                        max_context_len=page * 8,
+                    )
+                    prod, pa, pp = self._fixture(directory)
+                    oracles = {}
+                    for pages in (2, 4):
+                        tokens = list(range(pages * page + 31))
+                        req = self._request(prod, pa, pp, tokens, f"writer-{pages}")
+                        _, depth, state = self._forward_snapshot(prod, pp, req)
+                        self.assertEqual(depth, pages * page)
+                        indices = pp.req_to_token[req.kv.req_pool_idx, :depth]
+                        self._fill_full_kv(pa, indices, marker=7)
+                        prod.cache_unfinished_req(req)
+                        match = prod.match_prefix(
+                            MatchPrefixParams(key=RadixKey(array("q", tokens[:depth])))
+                        )
+                        leaf = match.last_device_node
+                        oracles[pages] = (
+                            state,
+                            self._snapshot_full_kv(pa, match.device_indices),
+                        )
+                        self._backup_node(prod, leaf)
+                        self._write_path_to_l3(prod, leaf)
+                        self._flush_l3_backups(prod)
+                    if scenario == "missing_latest_state":
+                        backend = prod.cache_controller.storage_backend
+                        terminal = prod.tree_core.get_hash_values(leaf)[-1]
+                        path = Path(directory) / (
+                            backend._get_component_key(terminal, PoolName.MAMBA)
+                            + ".bin"
+                        )
+                        self.assertTrue(path.is_file())
+                        path.unlink()
+                    expected_pages = 2 if scenario == "missing_latest_state" else 4
+                    expected_tokens = expected_pages * page
+                    cons, ca, cp = self._fixture(directory)
+                    host = cons.host_pool_group.get_pool(PoolName.MAMBA)
+                    available = host.available_size()
+                    tokens = array("q", range(4 * page))
+                    if scenario == "cancel":
+                        self._cancel_during_state_read(cons, tokens, host, available)
+                    handles = [
+                        CacheRequestHandle("reader", 1 if scenario == "cancel" else 0)
+                    ]
+                    if scenario == "duplicate":
+                        handles.append(CacheRequestHandle("reader-duplicate", 0))
+                    for handle in handles:
+                        cons.prefetch_from_storage(
+                            handle, cons.root_node_handle(), tokens, None, None
+                        )
+                    for handle in handles:
+                        self._run_prefetch_to_completion(cons, handle)
+                    cons.check_hicache_events()
+                    match = cons.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+                    self.assertEqual(len(match.device_indices), 0)
+                    self.assertEqual(match.host_hit_length, expected_tokens)
+                    self.assertEqual(host.available_size(), available - 1)
+                    state_host = cons.tree_core.get_component_host_value(
+                        match.last_host_node, ComponentType.MAMBA
+                    )
+                    self.assertEqual(len(state_host), 1)
+                    state, (wanted_k, wanted_v) = oracles[expected_pages]
+                    for buf, wanted in zip(host.get_hybrid_pool_buffer(), state):
+                        torch.testing.assert_close(
+                            buf[state_host[0], :, 0], wanted.cpu(), rtol=0, atol=0
+                        )
+                    req = Req(
+                        rid="load",
+                        origin_input_text="",
+                        origin_input_ids=list(tokens),
+                        sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+                    )
+                    self._load_back_node(cons, match.last_host_node, req=req)
+                    loaded = cons.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+                    self.assertEqual(len(loaded.device_indices), expected_tokens)
+                    actual_k, actual_v = self._snapshot_full_kv(
+                        ca, loaded.device_indices
+                    )
+                    torch.testing.assert_close(actual_k, wanted_k, rtol=0, atol=0)
+                    torch.testing.assert_close(actual_v, wanted_v, rtol=0, atol=0)
+                    canonical = cons.tree_core.get_component_device_value(
+                        loaded.last_device_node, ComponentType.MAMBA
+                    )
+                    self.assertNotEqual(int(canonical[0]), int(req.kv.mamba_pool_idx))
+                    buffers = [
+                        cp.mamba_pool.mamba_cache.temporal,
+                        *cp.mamba_pool.mamba_cache.conv,
+                    ]
+                    for buf, wanted in zip(buffers, state):
+                        torch.testing.assert_close(
+                            buf[:, canonical[0]], wanted, rtol=0, atol=0
+                        )
+                        torch.testing.assert_close(
+                            buf[:, req.kv.mamba_pool_idx], wanted, rtol=0, atol=0
+                        )
+                        buf[:, req.kv.mamba_pool_idx] = -9
+                        torch.testing.assert_close(
+                            buf[:, canonical[0]], wanted, rtol=0, atol=0
+                        )
+                    cons.sanity_check()
+                    # Drain/stop while the temporary directory still exists.
+                    cons.cache_controller._stop_storage_threads()
+                    prod.cache_controller._stop_storage_threads()
+
+
+if __name__ == "__main__":
+    unittest.main()
