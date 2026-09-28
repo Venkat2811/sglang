@@ -1250,11 +1250,8 @@ class HybridCacheController(BaseHiCacheController):
     def _reduce_storage_hit_count(
         self, operation, storage_hit_count: int, sync_groups=None
     ) -> int:
-        # Every rank uses the request's full page count, including ranks with a
-        # local miss/cancellation or no sidecar transfer. Choosing a scalar on
-        # ranks without sidecars would mismatch the collective payload shape.
-        # MIN over a 0/1 mask intersects sparse sets;
-        # MIN over their maxima could select a checkpoint absent on another rank.
+        # Misses, cancellations and ranks without sidecars need the same mask shape.
+        # MIN intersects sparse checkpoint sets; MIN of maxima can select a hole.
         num_pages = len(operation.token_ids) // self.page_size
         max_pages = min(num_pages, storage_hit_count // self.page_size)
         mask = torch.zeros(num_pages + 1, dtype=torch.int)

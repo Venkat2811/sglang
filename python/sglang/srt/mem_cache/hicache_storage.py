@@ -18,6 +18,7 @@ from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host import HostKVCache
+    from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +206,21 @@ def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
         name: (rs.index(False) if False in rs else len(rs))
         for name, rs in results.items()
     }
+
+
+def get_mamba_pool_schema_fingerprint(pool: MambaPoolHost) -> str:
+    # Pool layout and tensor schemas are fixed at allocation. Exclude capacity
+    # so a new engine can restore checkpoints into a differently sized cache.
+    schema = [
+        pool.layout,
+        [
+            (str(buf.dtype), list(buf.shape[1:]))
+            for buf in pool.get_hybrid_pool_buffer()
+        ],
+    ]
+    return hashlib.sha256(
+        json.dumps(schema, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 class HiCacheStorage(ABC):
@@ -428,6 +444,7 @@ class HiCacheFile(HiCacheStorage):
         )
         self._state_tp_size = storage_config.tp_size
         self._dcp_size = storage_config.dcp_size
+        self._mamba_schema_fingerprint = None
 
         tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
@@ -460,10 +477,8 @@ class HiCacheFile(HiCacheStorage):
                 f"_{dtype_name}_{storage_config.host_layout}"
             )
 
-        # Keep room for a SHA256 key (including its version tag) and `.bin`
-        # within the common 255-byte filename limit. Preserve ordinary legacy
-        # names; only overlong namespaces need compaction. The stable suffix
-        # must remain intact for metadata scans and LRU ownership filtering.
+        # Reserve 67 bytes for h1_<SHA256> and 4 for .bin within NAME_MAX=255.
+        # Metadata scans and LRU ownership require an intact namespace suffix.
         if len(os.fsencode(self.config_suffix)) > 184:
             self.config_suffix = (
                 "_ns1_" + hashlib.sha256(os.fsencode(self.config_suffix)).hexdigest()
@@ -528,9 +543,12 @@ class HiCacheFile(HiCacheStorage):
         )
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
-        super().register_mem_host_pool_v2(host_pool, host_pool_name)
         if host_pool_name == PoolName.MAMBA and self._state_tp_rank is not None:
+            self._mamba_schema_fingerprint = get_mamba_pool_schema_fingerprint(
+                host_pool
+            )
             self._evictor.add_owned_suffix(self._state_config_suffix)
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
 
     def _get_suffixed_key(self, key: str) -> str:
         suffix = self.config_suffix
@@ -761,28 +779,14 @@ class HiCacheFile(HiCacheStorage):
             return key
         component = f"{key}.{pool_name}"
         if pool_name == PoolName.MAMBA and self._state_tp_rank is not None:
-            pool = getattr(self, "registered_pools", {}).get(pool_name)
-            if pool is None:
+            if self._mamba_schema_fingerprint is None:
                 raise ValueError(f"Unregistered file hybrid pool: {pool_name}")
-            # KDA is TP-sharded even when two TP ranks share an MLA DCP shard.
-            # Exclude capacity, but isolate shapes, dtypes and component order.
-            schema = [
-                pool.layout,
-                [
-                    (str(buf.dtype), list(buf.shape[1:]))
-                    for buf in pool.get_hybrid_pool_buffer()
-                ],
-            ]
-            fingerprint = hashlib.sha256(
-                json.dumps(schema, separators=(",", ":")).encode()
-            ).hexdigest()
             owner = str(self._state_tp_rank)
-            # DCP1 MLA's primary suffix intentionally omits TP topology, but
-            # its recurrent state is still TP-sharded. Never reuse the old,
-            # ambiguous `.mamba` files written by all ranks to one filename.
+            # DCP1 MLA keys omit TP topology, but recurrent state is TP-sharded.
+            # Legacy `.mamba` files alias ranks and cannot be reused safely.
             if self._dcp_size == 1:
                 owner += f"_{self._state_tp_size}"
-            component = f"{key}.mamba_tp{owner}_v1_{fingerprint}"
+            component = f"{key}.mamba_tp{owner}_v1_{self._mamba_schema_fingerprint}"
         return component
 
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:

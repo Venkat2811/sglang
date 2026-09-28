@@ -1,5 +1,4 @@
 import ctypes
-import hashlib
 import json
 import logging
 import os
@@ -21,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    get_mamba_pool_schema_fingerprint,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -435,7 +435,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 model_name = "-".join(storage_config.model_name.split("/"))
                 config_prefix_parts.append(model_name)
             self._dcp_namespace = None
-            if getattr(storage_config, "dcp_size", 1) > 1:
+            if storage_config is not None and storage_config.dcp_size > 1:
                 # Fixed-topology reuse only. Keep shard rank in the object
                 # suffix so equivalent TP replicas share objects, and all
                 # shards of a logical page can share a Mooncake group id.
@@ -634,6 +634,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
 
             self.registered_pools = {}
+            self._mamba_schema_fingerprint = None
 
             self.gb_per_page = None
             self.prefetch_pgs = []
@@ -752,6 +753,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # accessor, or ordinary KV-like host pools used as SWA side pools.
         for buf in self._iter_host_pool_buffers(host_pool):
             super().register_buffer(buf)
+        if host_pool_name == PoolName.MAMBA and self._dcp_namespace is not None:
+            self._mamba_schema_fingerprint = get_mamba_pool_schema_fingerprint(
+                host_pool
+            )
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.config_prefix is None:
@@ -795,21 +800,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         elif pool_name == PoolName.MAMBA:
             state_suffix = self.mha_suffix
             if self._dcp_namespace is not None:
-                # Recurrent state is TP-sharded, independently of MLA's DCP
-                # shards. Equal byte counts can still mean different shapes or
-                # precisions. Exclude only host capacity (the first dimension)
-                # so compatible engines with different cache sizes can reuse it.
-                schema = [
-                    host_pool.layout,
-                    [
-                        (str(buf.dtype), list(buf.shape[1:]))
-                        for buf in host_pool.get_hybrid_pool_buffer()
-                    ],
-                ]
-                fingerprint = hashlib.sha256(
-                    json.dumps(schema, separators=(",", ":")).encode()
-                ).hexdigest()
-                state_suffix = f"{state_suffix}_mamba_v1_{fingerprint}"
+                state_suffix = (
+                    f"{state_suffix}_mamba_v1_{self._mamba_schema_fingerprint}"
+                )
             # Mamba stores one temporal object plus one object per conv state.
             # conv-only models have no ssm state; drop the 0-element temporal
             # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
@@ -1458,7 +1451,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else None
         )
         if pp_rank is not None:
-            if getattr(self, "_dcp_namespace", None) is not None:
+            if self._dcp_namespace is not None:
                 # PP is a structured namespace field for new DCP objects.
                 # Do not rewrite numeric substrings in hashes or shard suffixes.
                 prefix = f"{self.config_prefix}_"
