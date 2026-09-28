@@ -1,0 +1,139 @@
+# L3 backend coverage, SSD verification, and hybrid/P-D gates
+
+Updated 2026-09-28. File and Mooncake are required backends for this feature. Both file-backed SSD and Mooncake SSD offload are mandatory acceptance lanes.
+Storage identity, logical/physical page geometry, rank agreement, checkpoint
+selection and buffer lifetime belong to the shared HiCache contract. Each
+adapter must demonstrate that contract; enabling one does not qualify every
+registered L3 backend.
+
+## Current evidence
+
+| Path | Implemented / available | Verification still required |
+| --- | --- | --- |
+| Pure MLA + DCP + Mooncake DRAM | Enabled; TP8/DCP8 and TP4/DCP2 inference passed | Other explicitly selected layouts/policies and runtime attachment |
+| Pure MLA + DCP + file | Enabled; inherited file inference fixture and CPU contracts exist | Independently recorded file run on this branch; same numerical and fault oracles as Mooncake |
+| File directory on SSD | Normal filesystem-backed L3 | Confirm actual mount, byte round-trip, fresh-reader restore and selected failure cases |
+| Mooncake SSD offload | Connector exposes SSD options; store implements tiering | Prove SSD-only replica retrieval, not a hit on a remaining memory replica |
+| Hybrid KDA + MLA + DCP + L3 | Component contracts implemented; public enablement still guarded | Composed checkpoint capture/publication/restore and real model continuation, for each backend |
+| Live P/D with role-local L3 | Existing P/D fixtures and implementation paths | Explicit cache-off baselines, role-local restores and their composition with live transfer |
+
+The recent 194 passing requests were **Mooncake DRAM** tests. They did not
+exercise the file adapter or SSD. See [the measured results](README-mooncake-mla.md).
+
+## File backend
+
+The branch accepts `--hicache-storage-backend file` under DCP for a supported
+single materialized MLA pool. The path is selected by
+`SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR`; the default is `/tmp/hicache`.
+Point it at a dedicated directory on the intended SSD filesystem. A path name
+or Kubernetes ephemeral volume alone is not evidence of the underlying medium.
+Different nodes can reuse these files only when they access the same backing
+filesystem and compatible namespace.
+
+The existing narrow GPU entry point is:
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+DCP_L3_TOPOLOGIES=8:8,4:2 DCP_L3_SKIP_CONCURRENCY=1 \
+DCP_L3_OUTPUT_DIR=/tmp/file-dcp-results \
+python -m pytest test/manual/hicache/test_dcp_l3.py -q -s
+```
+
+That inherited fixture uses an internally selected temporary storage directory,
+overriding the storage-directory environment variable for its engines. It is
+a file correctness gate, **not an SSD-specific launch recipe**. It currently
+uses one prompt, lacks the pinned revision and paired cold controls of the
+new Mooncake witness, and injects a missing shard only for TP4/DCP2. Bring the
+file witness to the same bounded answer/cold-control contract, expose an owned
+explicit storage root, and add TP8/DCP8 missing-shard evidence before claiming
+equivalent coverage. Reuse shared inference assertions rather than growing
+independent oracles with different tolerances.
+
+Required file cases: fresh reader after writer exit, exact physical page bytes,
+all-rank prefix agreement, TP>DCP equivalent readers, missing middle shard,
+short/truncated object, and write failure without publishing a complete hit.
+Use owned files only. File-backed cache correctness does not establish
+power-loss durability or uncached physical-SSD throughput: filesystem page
+cache can satisfy reads, and atomic rename is not an fsync guarantee.
+
+SGLang documents the file backend as a simple reference implementation and
+explains its node-local/shared-mount scope in the
+[HiCache design](https://docs.sglang.io/docs/advanced_features/hicache_design).
+
+## Native SSD offload
+
+HiCache's hierarchy remains GPU HBM → instance-local host DRAM → L3 backend.
+The L3 backend may use files on SSD, or Mooncake's distributed DRAM and SSD
+tiers. `--hicache-io-backend direct/kernel` controls the host/GPU copy path;
+it is not a switch for direct SSD I/O or GPUDirect Storage.
+
+The [SGLang Mooncake connector documentation](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/mooncake_store/README.md)
+exposes `enable_ssd_offload` and `ssd_offload_path` through backend extra config.
+The [Mooncake deployment guide](https://kvcache-ai.github.io/Mooncake/deployment/mooncake-store-deployment-guide.html)
+describes master `--enable_offload=true`, optional eviction-triggered offload
+and promotion on read. SSD-owning clients/services must initialize their
+FileStorage and use dedicated writable paths on the desired medium. Enabling
+offload only on a zero-contribution inference client does not establish an
+SSD tier for the independent memory donor that owns the objects.
+
+Use deliberately small configured cache pools, not node-wide memory exhaustion. Bound GPU KV and HiCache host capacity so a handful of distinct prompts evict the target from both L1 and L2; independently bound the Mooncake donor DRAM segment so the same working set forces SSD offload. Record effective capacities and tier evidence rather than inferring eviction from request counts. Keep enough host staging capacity for forward progress.
+
+The SSD witness must:
+
+1. Pin the actual wheel/build, enable and verify master and storage-owner
+   offload capabilities, and fail if configuration falls back to memory-only.
+2. Publish known objects and exceed the configured Mooncake DRAM capacity with
+   a bounded working set. Wait for completed disk replicas and memory eviction
+   while preserving the disk replicas and owner. Use explicit memory-replica
+   removal only as a separate diagnostic, not as proof of pressure-triggered
+   offload.
+3. Prove disk residency and retrieve exact bytes; a successful GET alone does
+   not establish which replica served it.
+4. Restore through a fresh inference process and compare against a matched
+   cold reference. Check a missing disk shard/checkpoint and safe fallback.
+
+Cache-spill correctness is separate from recovering the store after its owner
+or master restarts. The first witness keeps the independent SSD owner alive.
+No shared node-wide page-cache flush or destructive device operation is needed.
+
+## Next hybrid and live P/D work
+
+Baseline execution can start in the next GPU session. Feature enablement is
+gated by composed correctness, not by finishing all optional backend sweeps.
+
+1. **Compose the hybrid restore path.** Drive actual KDA checkpoint capture and
+   publication, native storage, common legal boundary selection, radix host
+   insertion, GPU load-back and continued generation. Existing byte-copy and
+   mocked-forward publication tests cover pieces, not this end-to-end path.
+   Prove missing state on one rank falls back to a checkpoint shared by all
+   ranks; never relabel a later active state as an earlier prefix checkpoint.
+2. **Qualify file sidecars separately.** Static inspection shows that file
+   component keys and read/write helpers reuse the primary MLA suffix. In a
+   TP4/DCP2 hybrid layout, TP ranks 0 and 2 share that primary suffix but have
+   different KDA state. Add a failing collision/round-trip test before changing
+   the namespace; include tensor-schema isolation and legal checkpoint sets.
+   The current hybrid DCP guard remains in place during this work.
+3. **Run a small Kimi-Linear baseline and L3 continuation gate.** Use the
+   existing `moonshotai/Kimi-Linear-48B-A3B-Instruct` TP4/DCP4 Blackwell fixture
+   as the source for model/pool/kernel settings. Pin its model revision and
+   first validate the cache-off/L2 controls. Then test a cold writer and fresh
+   L3 reader after the composed contract passes. Preserve the established
+   numerical oracle; do not reuse the small MLA answer tolerance blindly.
+4. **Run a bounded live P4+D4 baseline on one eight-GPU node.** Reuse the
+   existing Kimi-Linear P/D topology and boundary prompts with speculation off.
+   Its full GSM8K/long-context campaign is not needed for the initial smoke.
+   Preserve the native TCP admission settings where applicable and use the
+   current graceful-cleanup fixture pattern.
+5. **Add role-local L3 to live handoff.** Test P-only first, then D-only and
+   both roles, with matched controls. Decode needs the actual decode radix,
+   preallocation and restore path enabled; a transfer-only success is not a
+   decode L3 pass. Cover equal DCP4 roles and P-DCP1→D-DCP4, plus a fresh role,
+   partial prefix and cancellation. Role-local objects remain same-topology;
+   live P→D relayout is a separate contract.
+
+One eight-GPU Blackwell node is sufficient for these initial lanes: sequential
+four-GPU aggregated engines, then simultaneous P4+D4. CPU and one-GPU state
+tests can precede that allocation. Actual Kimi-K3 recipes remain later
+qualification: the reduced P8+D16 shape needs three eight-GPU nodes and the
+supplied full P/D layouts need four. A Kimi-Linear pass is not a Kimi-K3 pass.
+Both SSD lanes are required; the hybrid/P-D baseline can proceed in the same development cycle.

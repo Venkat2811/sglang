@@ -1,5 +1,8 @@
 # Manual Mooncake MLA inference witness
 
+File is also a required L3 backend. See the [backend coverage and next gates](README-l3-backend-coverage.md)
+for the existing file fixture, native SSD offload, and hybrid/live P/D work.
+
 `test_mooncake_mla_inference.py` verifies fixed-topology MLA cache reuse using
 real inference and a private native Mooncake TCP store. It requires the
 Mooncake Python binding, `mooncake_master` on PATH, the source-compatible
