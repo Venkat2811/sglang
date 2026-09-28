@@ -486,3 +486,21 @@ Use new directories for each run. `PD_L3_ROLES` also accepts `decode` and
 `both`; `PD_L3_MODEL_PATH` can select the pinned local snapshot, including
 its chat template. These lanes do not establish cross-layout persisted
 object conversion, hybrid SSD residency or Kimi-K3 support.
+
+
+Decode-side correctness also requires transfer and restore to respect state
+ownership. A deterministic GPU regression reproduces an older local
+checkpoint overwriting already-received live recurrent state. Decode now
+restores canonical cache state without copying it into the active request
+slot. The composed GPU suite passes 3 tests and 10 subtests.
+
+L3 probes are provisional: prefetch can decline for capacity or policy
+reasons. Decode now resolves admission before allocating and advertising
+its prefix, so prefill transfers the omitted rows when L3 cannot register.
+The protocol regression observes allocation, outgoing delta rows and the
+advertised prefix for accepted, declined and failed prefetch. Related tests
+pass 12 tests and 3 subtests. This overlaps
+[closed PR #31885](https://github.com/sgl-project/sglang/pull/31885).
+After a prefix has been advertised, insufficient restore coverage must
+still fail the request; shrinking that promise locally cannot recreate
+rows that prefill has already omitted.
