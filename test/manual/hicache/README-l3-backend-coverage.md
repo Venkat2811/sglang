@@ -189,12 +189,16 @@ gated by composed correctness, not by finishing all optional backend sweeps.
    mocked-forward publication tests cover pieces, not this end-to-end path.
    Prove missing state on one rank falls back to a checkpoint shared by all
    ranks; never relabel a later active state as an earlier prefix checkpoint.
-2. **Qualify file sidecars separately.** Static inspection shows that file
-   component keys and read/write helpers reuse the primary MLA suffix. In a
-   TP4/DCP2 hybrid layout, TP ranks 0 and 2 share that primary suffix but have
-   different KDA state. Add a failing collision/round-trip test before changing
-   the namespace; include tensor-schema isolation and legal checkpoint sets.
-   The current hybrid DCP guard remains in place during this work.
+2. **Compose the tested file sidecar contracts.** CPU regressions reproduced
+   TP4/DCP2 ranks 0 and 2 restoring the same KDA state, equal-byte incompatible
+   schemas hitting, logical MLA v2 indices being rejected, and independent
+   checkpoint maxima selecting an absent state. File KDA keys now include TP
+   ownership and a capacity-independent tensor schema; v2 uses each pool's
+   logical page geometry and returns complete legal checkpoint sets. Tests
+   cover both supported state layouts and preserve unselected destination
+   bytes. Run `test/registered/unit/mem_cache/test_hicache_dcp_storage_identity.py`
+   for these contracts. The current hybrid DCP guard remains in place until
+   composed publication/restore and actual model continuation are qualified.
 3. **Run a small Kimi-Linear baseline and L3 continuation gate.** Use the
    existing `moonshotai/Kimi-Linear-48B-A3B-Instruct` TP4/DCP4 Blackwell fixture
    as the source for model/pool/kernel settings. Pin its model revision and

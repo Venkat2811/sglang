@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import threading
@@ -421,6 +423,9 @@ class HiCacheFile(HiCacheStorage):
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
         self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
+        self._dcp_state_rank = (
+            storage_config.tp_rank if storage_config.dcp_size > 1 else None
+        )
 
         tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
@@ -504,7 +509,7 @@ class HiCacheFile(HiCacheStorage):
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}")
+        return self._get_suffixed_key(self._log_key(component_name, key))
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:
@@ -679,34 +684,63 @@ class HiCacheFile(HiCacheStorage):
         )
 
         hit_count: dict[str, int] = {PoolName.KV: kv_pages} if kv_pages else {}
-        final_pages = kv_pages
+        restorable = list(range(1, kv_pages + 1))
 
         for transfer in pool_transfers or []:
-            if final_pages == 0:
+            if not restorable:
                 break
             name = transfer.name
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
                 boundary = next(
                     (i for i in range(kv_pages) if not has_component(i, name)), kv_pages
                 )
-            else:  # trailing_pages
+                pool_restorable = list(range(1, boundary + 1))
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
                 boundary = 0
+                pool_restorable = []
                 for prefix_len in range(kv_pages, 0, -1):
                     if all(
                         has_component(i, name)
                         for i in range(max(0, prefix_len - trailing), prefix_len)
                     ):
-                        boundary = prefix_len
-                        break
+                        pool_restorable.append(prefix_len)
+                        if boundary == 0:
+                            boundary = prefix_len
+            else:
+                raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
             if boundary:
                 hit_count[name] = boundary
-            final_pages = min(final_pages, boundary)
+            allowed = set(pool_restorable)
+            restorable = [p for p in restorable if p in allowed]
 
-        return PoolTransferResult(final_pages, hit_count)
+        # A recurrent checkpoint can exist at page four but not page three.
+        # Preserve all legal endpoints for the controller's rank intersection.
+        final_pages = restorable[-1] if restorable else 0
+        return PoolTransferResult(final_pages, hit_count, restorable)
 
     def _log_key(self, pool_name: str, key: str) -> str:
-        return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
+        if pool_name == PoolName.KV:
+            return key
+        component = f"{key}.{pool_name}"
+        if pool_name == PoolName.MAMBA and self._dcp_state_rank is not None:
+            pool = getattr(self, "registered_pools", {}).get(pool_name)
+            if pool is None:
+                raise ValueError(f"Unregistered file hybrid pool: {pool_name}")
+            # KDA is TP-sharded even when two TP ranks share an MLA DCP shard.
+            # Exclude capacity, but isolate shapes, dtypes and component order.
+            schema = [
+                pool.layout,
+                [
+                    (str(buf.dtype), list(buf.shape[1:]))
+                    for buf in pool.get_hybrid_pool_buffer()
+                ],
+            ]
+            fingerprint = hashlib.sha256(
+                json.dumps(schema, separators=(",", ":")).encode()
+            ).hexdigest()
+            component = f"{key}.mamba_tp{self._dcp_state_rank}_v1_{fingerprint}"
+        return component
 
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
         """Read one page from storage into host_pool at page_offset."""
@@ -730,7 +764,14 @@ class HiCacheFile(HiCacheStorage):
         for transfer in transfers:
             host_pool = self.registered_pools[transfer.name]
             keys = transfer.keys or []
-            page_size = getattr(host_pool, "page_size", 1) or 1
+            # MLA receives logical DCP indices; recurrent state still uses
+            # independent one-slot indices. Each pool defines that boundary.
+            page_size = (
+                getattr(
+                    host_pool, "logical_page_size", getattr(host_pool, "page_size", 1)
+                )
+                or 1
+            )
             expected = len(keys) * page_size
             host_indices = transfer.host_indices
 

@@ -10,9 +10,16 @@ from dataclasses import replace
 from pathlib import Path
 
 import torch
+from test_mooncake_dcp_storage import _indices, _mamba_pool, _page_segments, _pool
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheFile,
+    HiCacheStorageConfig,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -154,6 +161,123 @@ class TestDcpStorageIdentity(CustomTestCase):
                 )
                 self.assertEqual(mla.is_storage_writer, rank == 0)
                 self.assertTrue(gqa.is_storage_writer)
+
+    def test_file_state_shards_do_not_alias_mla_replicas(self):
+        """TP0 and TP2 share MLA, but must restore different recurrent state."""
+        for layout in ("page_first", "page_first_direct"):
+            expected = {}
+            for rank in (0, 2):
+                state = _mamba_pool(layout=layout)
+                for i, buffer in enumerate(state.get_hybrid_pool_buffer()):
+                    buffer.view(torch.uint8).fill_(17 + rank + i)
+                expected[rank] = state.get_data_page(3).clone()
+                writer = self.backend(make_config(rank))
+                writer.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                transfer = PoolTransfer(
+                    PoolName.MAMBA, host_indices=torch.tensor([3]), keys=["checkpoint"]
+                )
+                self.assertEqual(
+                    writer.batch_set_v2([transfer])[PoolName.MAMBA], [True]
+                )
+
+            for rank in (0, 2):
+                # Cache capacity is not part of a compatible tensor schema.
+                state = _mamba_pool(capacity=16, layout=layout)
+                reader = self.backend(make_config(rank))
+                reader.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                transfer = PoolTransfer(
+                    PoolName.MAMBA, host_indices=torch.tensor([7]), keys=["checkpoint"]
+                )
+                self.assertEqual(
+                    reader.batch_get_v2([transfer])[PoolName.MAMBA], [True]
+                )
+                torch.testing.assert_close(state.get_data_page(7), expected[rank])
+
+    def test_file_state_schema_mismatch_is_a_miss_without_mutation(self):
+        """Equal-sized KDA tensors can have incompatible shapes or precision."""
+        writer = self.backend(make_config())
+        state = _mamba_pool()
+        writer.register_mem_host_pool_v2(state, PoolName.MAMBA)
+        transfer = PoolTransfer(
+            PoolName.MAMBA, host_indices=torch.tensor([3]), keys=["checkpoint"]
+        )
+        self.assertEqual(writer.batch_set_v2([transfer])[PoolName.MAMBA], [True])
+        for changes in (
+            {"temporal_shape": (3, 2)},
+            {"temporal_dtype": torch.bfloat16, "temporal_shape": (2, 6)},
+            {"conv_dtype": torch.float16},
+            {"conv_shapes": ((2, 6), (3, 4))},
+            {"layers": 1, "temporal_shape": (4, 3), "conv_shapes": ((6, 4), (6, 4))},
+            {"layout": "page_first_direct"},
+        ):
+            with self.subTest(changes=changes):
+                reader = self.backend(make_config())
+                target = _mamba_pool(**changes)
+                reader.register_mem_host_pool_v2(target, PoolName.MAMBA)
+                for buffer in target.get_hybrid_pool_buffer():
+                    buffer.view(torch.uint8).fill_(165)
+                before = target.get_data_page(3).clone()
+                self.assertEqual(
+                    reader.batch_get_v2([transfer])[PoolName.MAMBA], [False]
+                )
+                torch.testing.assert_close(target.get_data_page(3), before)
+
+    def test_file_v2_uses_logical_mla_indices_and_physical_page_bytes(self):
+        """DCP v2 must consume logical index runs, then restore unrelated pages."""
+        config = make_config()
+        pool = _pool(config)
+        store = self.backend(config)
+        store.register_mem_host_pool_v2(pool, PoolName.KV)
+        pool.kv_buffer.zero_()
+        for page in (2, 4):
+            for segment in _page_segments(pool, pool.kv_buffer, page):
+                segment.view(torch.uint8).fill_(23 + page)
+        source = _indices(config, (2, 4))
+        keys = ["first", "second"]
+        self.assertEqual(
+            store.batch_set_v2(
+                [PoolTransfer(PoolName.KV, host_indices=source, keys=keys)]
+            )[PoolName.KV],
+            [True, True],
+        )
+        pool.kv_buffer.zero_()
+        target = _indices(config, (7, 9))
+        self.assertEqual(
+            store.batch_get_v2(
+                [PoolTransfer(PoolName.KV, host_indices=target, keys=keys)]
+            )[PoolName.KV],
+            [True, True],
+        )
+        expected = torch.zeros_like(pool.kv_buffer)
+        for source_page, target_page in ((2, 7), (4, 9)):
+            for segment in _page_segments(pool, expected, target_page):
+                segment.view(torch.uint8).fill_(23 + source_page)
+        torch.testing.assert_close(
+            pool.kv_buffer.view(torch.uint8), expected.view(torch.uint8)
+        )
+
+    def test_file_query_preserves_sparse_legal_checkpoints(self):
+        """Taking min of two maxima can select an absent recurrent checkpoint."""
+        store = self.backend(make_config())
+        store.register_mem_host_pool_v2(_mamba_pool(), PoolName.MAMBA)
+        keys = ["a", "b", "c", "d"]
+        for key in keys:
+            self.assertTrue(store.set(key, torch.tensor([1], dtype=torch.uint8)))
+        for name, pages in ((PoolName.MAMBA, (1, 4)), (PoolName.SWA, (1, 3))):
+            for page in pages:
+                self.assertTrue(
+                    store.set(
+                        store._log_key(name, keys[page - 1]),
+                        torch.tensor([2], dtype=torch.uint8),
+                    )
+                )
+        transfers = [
+            PoolTransfer(name, hit_policy=PoolHitPolicy.TRAILING_PAGES)
+            for name in (PoolName.MAMBA, PoolName.SWA)
+        ]
+        result = store.batch_exists_v2(keys, transfers)
+        self.assertEqual(result.kv_hit_pages, 1)
+        self.assertEqual(result.restorable_prefix_pages, [1])
 
     def test_incomplete_or_inconsistent_dcp_identity_is_rejected(self):
         config = make_config()
