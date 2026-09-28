@@ -227,6 +227,7 @@ class DecodeHiCacheTransferMixin:
                 best_match_node=rematch.best_match_node,
                 host_hit_length=rematch.host_hit_length,
                 req=dr.req,
+                restore_request_state=False,
             )
         )
         # The rematch repointed req.last_node to feed init_load_back's device
