@@ -12,7 +12,7 @@ registered L3 backend.
 | --- | --- | --- |
 | Pure MLA + DCP + Mooncake DRAM | Enabled; TP8/DCP8 and TP4/DCP2 inference passed | Other explicitly selected layouts/policies and runtime attachment |
 | Pure MLA + DCP + file | Enabled; inherited file inference fixture and CPU contracts exist | Independently recorded file run on this branch; same numerical and fault oracles as Mooncake |
-| File directory on SSD | Normal filesystem-backed L3 | Confirm actual mount, byte round-trip, fresh-reader restore and selected failure cases |
+| File directory on SSD | TP1/DCP1 pressure, physical SSD reads and missing-page fallback passed | Multi-rank file/DCP SSD composition |
 | Mooncake SSD offload | Connector exposes SSD options; store implements tiering | Prove SSD-only replica retrieval, not a hit on a remaining memory replica |
 | Hybrid KDA + MLA + DCP + L3 | Component contracts implemented; public enablement still guarded | Composed checkpoint capture/publication/restore and real model continuation, for each backend |
 | Live P/D with role-local L3 | Existing P/D fixtures and implementation paths | Explicit cache-off baselines, role-local restores and their composition with live transfer |
@@ -95,6 +95,61 @@ The SSD witness must:
 Cache-spill correctness is separate from recovering the store after its owner
 or master restarts. The first witness keeps the independent SSD owner alive.
 No shared node-wide page-cache flush or destructive device operation is needed.
+
+### Bounded one-GPU SSD inference witness
+
+`test_hicache_ssd_pressure.py` runs the same answer and cache-tier assertions
+against either backend. First independently map the selected filesystem to its
+physical SSD device and corresponding container cgroup `io.stat` entry. Supply
+that device's major:minor ID; do not assume that `/tmp`, an emptyDir, or a path
+containing "ssd" is backed by SSD. The fixture uses Linux `findmnt`, cgroup v2
+I/O accounting, and `posix_fadvise` on its own files.
+
+```sh
+CUDA_VISIBLE_DEVICES=0 \
+HICACHE_SSD_BACKEND=file \
+HICACHE_SSD_OUTPUT_DIR=/path/to/new/file-results \
+HICACHE_SSD_STORAGE_ROOT=/verified/ssd/new-file-cache \
+HICACHE_SSD_BLOCK_DEVICE=259:0 \
+python -m pytest test/manual/hicache/test_hicache_ssd_pressure.py -q -s
+```
+
+For Mooncake, set `HICACHE_SSD_BACKEND=mooncake` and use different new output
+and storage directories. `mooncake_master` and the native Python binding must
+support SSD offload and replica inspection. The fixture starts a private
+master and a 128 MiB memory donor with its own SSD directory. Inference clients
+contribute no store memory. The SSD owner stays alive across engine restarts;
+the test does not claim crash recovery.
+
+The fixture also scales SSD buckets down: one key per bucket, an 8 MiB size
+limit, and a 1 GiB total bucket quota. With native Mooncake 0.3.13, the default
+256 MiB/500-key flush threshold exceeded the entire 128 MiB donor and prevented
+spill: the first pressure attempt exhausted DRAM with no disk replicas. A
+native reproduction confirmed that smaller buckets allowed pressure offload.
+The master starts eviction at 50% occupancy, and writer requests are spaced
+by two seconds to allow the one-second offload heartbeat to make progress.
+Small-pool tests must scale asynchronous batching as well as DRAM capacity.
+
+The pinned DeepSeek-V2-Lite-Chat run uses TP1/DCP1, BF16, deterministic Triton,
+64-token pages, a 2048-token GPU KV cap and HiCache ratio 1.5. Six distinct
+1537-token prompts exceed L1/L2 capacity. Two cache-disabled controls precede
+the writer. Same-engine replay must restore 1536 storage tokens with zero
+host/device hits; a fresh engine must do the same. Removing the second stored
+page must limit another fresh reader to 64 storage tokens. Each response must
+match the expected answer, exact six cold-reference token IDs, and finite
+logprobs within 0.05. These are 21 scored requests per backend.
+
+Mooncake additionally requires complete disk replicas and no memory replicas
+for every restored target page. Eviction pressure can include at most 32
+private 8 MiB native objects; explicit memory-replica deletion cannot qualify
+the pressure test. Target payload sizes and hashes must survive offload. Before
+each restore, only owned files are fsynced and advised out of the OS page cache.
+The selected SSD's cgroup read-byte increase must cover all restored KV bytes.
+Preserve `summary.json`, per-request responses, server arguments/logs, metrics,
+disk metadata, runner hash, and the independent mount/device audit.
+
+This is a TP1/DCP1 tiering gate. It complements the multi-rank tests; it does
+not establish DCP shard agreement, hybrid state restore, or live P/D behavior.
 
 ## Next hybrid and live P/D work
 
