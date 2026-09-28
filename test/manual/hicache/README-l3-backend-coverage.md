@@ -245,8 +245,39 @@ rather than accepting key discovery or an offload log message alone.
 
 ## Next hybrid and live P/D work
 
-Baseline execution can start in the next GPU session. Feature enablement is
-gated by composed correctness, not by finishing all optional backend sweeps.
+### Small live P/D baseline
+
+`test_pd_dcp_baseline.py` launches a monolithic reference, then independent
+prefill/decode engines and a router. `PD_DCP_MODEL=mla` uses the pinned
+DeepSeek-V2-Lite-Chat checkpoint with P2/DCP1 and D2/DCP2 on four GPUs.
+`PD_DCP_MODEL=hybrid` selects pinned Kimi-Linear with P4/EP4 and D4/DCP4 on
+eight GPUs, following the existing Kimi P/D fixture's tokenspeed MLA / FP8 KV
+configuration. Both fit on one eight-GPU node. A local pinned weight snapshot
+can be supplied through `PD_DCP_MODEL_PATH`.
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+MC_FORCE_TCP=1 MOONCAKE_PROTOCOL=tcp \
+PD_DCP_MODEL=mla PD_DCP_OUTPUT_DIR=/path/to/new/pd-results \
+python -m pytest test/manual/hicache/test_pd_dcp_baseline.py -q -s
+```
+
+The MLA TCP lane passed 30 scored requests on four B200s, with exact six-token
+known answers and maximum output-logprob difference 0.031334 against the fixed
+0.05 limit. It covered physical-page, DCP logical-page and 1024-token chunk
+boundaries, repeated requests and a three-request batch. This is live transfer
+evidence with HiCache/L3 disabled. The subsequent runner adds a matched batch
+reference rather than comparing batched and sequential numerical schedules.
+
+The initial automatic RDMA lane failed GPU memory registration with
+`Bad address [14]`. A native 1 MiB CUDA registration probe succeeded with
+`WITH_NVIDIA_PEERMEM=0`, which selects DMA-BUF instead of the default legacy
+peer-memory path. The full RDMA follow-up is pending. Select and record the
+actual transport; a TCP pass does not qualify RDMA. See Mooncake's
+[GPU registration troubleshooting](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/troubleshooting/troubleshooting.md).
+
+Feature enablement still requires the composed hybrid and role-local cache
+gates below.
 
 1. **Compose the hybrid restore path.** Drive actual KDA checkpoint capture and
    publication, native storage, common legal boundary selection, radix host
