@@ -63,6 +63,18 @@ Guidelines:
 - For MHA models with Mooncake and `page_head` layout, HiCache will split head shards based on `tp_lcm_size` to make keys reusable across heterogeneous TP deployments.
 - If all clusters use the same TP size, this option is not needed.
 
+### Decode context parallelism and storage
+
+For MLA models in aggregated serving, `--dcp-size > 1` supports HiCache L3
+through `file` and `mooncake`. Writers and readers must use the same TP, DCP
+and PP sizes, physical page size, KV dtype, host layout and model identity.
+Every DCP shard is required for a hit. `tp_lcm_size` does not convert persisted
+DCP shards between layouts. Additional state pools and P/D serving remain
+rejected with DCP L3 at this stage.
+
+L2 remains host DRAM. Use a file directory on an SSD filesystem for local SSD
+L3. Mooncake SSD offload is configured in the Mooncake store service.
+
 ### Prefetch Policies
 
 ```bash Command
