@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import test_mamba_checkpoint_publication as publication
 import torch
+from parameterized import parameterized
 from test_unified_radix_cache_unittest import (
     CacheConfig,
     UnifiedRadixCacheSuite,
@@ -178,7 +179,8 @@ class TestHybridL3Restore(CustomTestCase):
             self.assertEqual(len(match.device_indices), 0)
             self.assertNotIn(handle, cache.ongoing_prefetch)
 
-    def test_decode_restore_preserves_already_received_live_state(self):
+    @parameterized.expand(["python", "rust"])
+    def test_decode_restore_preserves_already_received_live_state(self, tree_backend):
         """An older L3 checkpoint must not overwrite P's newer live state."""
         with tempfile.TemporaryDirectory() as directory:
             page = 128
@@ -191,7 +193,7 @@ class TestHybridL3Restore(CustomTestCase):
                 kv_size=page * 16,
                 max_context_len=page * 8,
             )
-            writer, wa, wp = self._fixture(directory)
+            writer, wa, wp = self._fixture(directory, tree_backend)
             tokens = list(range(4 * page + 1))
             req = self._request(writer, wa, wp, tokens, "writer")
             _, depth, old_state = self._forward_snapshot(writer, wp, req)
@@ -202,7 +204,7 @@ class TestHybridL3Restore(CustomTestCase):
             self._backup_node(writer, req.last_node)
             self._write_path_to_l3(writer, req.last_node)
             self._flush_l3_backups(writer)
-            reader, ra, rp = self._fixture(directory)
+            reader, ra, rp = self._fixture(directory, tree_backend)
             live = self._request(reader, ra, rp, tokens, "decode")
             reader.prefetch_from_storage(
                 live.cache_request_handle,
@@ -274,7 +276,10 @@ class TestHybridL3Restore(CustomTestCase):
             self._flush_l3_backups(prod)
         return oracles, leaf
 
-    def test_fresh_partial_and_duplicate_restore_preserve_checkpoint_bytes(self):
+    @parameterized.expand(["python", "rust"])
+    def test_fresh_partial_and_duplicate_restore_preserve_checkpoint_bytes(
+        self, tree_backend
+    ):
         for page in (128, 512):
             for scenario in ("complete", "missing_latest_state", "duplicate", "cancel"):
                 with (
@@ -290,7 +295,7 @@ class TestHybridL3Restore(CustomTestCase):
                         kv_size=page * 16,
                         max_context_len=page * 8,
                     )
-                    prod, pa, pp = self._fixture(directory)
+                    prod, pa, pp = self._fixture(directory, tree_backend)
                     oracles, leaf = self._seed_two_checkpoints(prod, pa, pp, page=page)
                     if scenario == "missing_latest_state":
                         backend = prod.cache_controller.storage_backend
@@ -303,7 +308,7 @@ class TestHybridL3Restore(CustomTestCase):
                         path.unlink()
                     expected_pages = 2 if scenario == "missing_latest_state" else 4
                     expected_tokens = expected_pages * page
-                    cons, ca, cp = self._fixture(directory)
+                    cons, ca, cp = self._fixture(directory, tree_backend)
                     host = cons.host_pool_group.get_pool(PoolName.MAMBA)
                     available = host.available_size()
                     tokens = array("q", range(4 * page))
