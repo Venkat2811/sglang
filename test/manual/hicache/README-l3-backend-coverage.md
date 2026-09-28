@@ -269,11 +269,22 @@ boundaries, repeated requests and a three-request batch. This is live transfer
 evidence with HiCache/L3 disabled. The subsequent runner adds a matched batch
 reference rather than comparing batched and sequential numerical schedules.
 
-The initial automatic RDMA lane failed GPU memory registration with
+Kimi P4/EP4 → D4/DCP4 passed on one eight-B300 node over RDMA: 39 scored
+requests and 25 parity checks in 210.10 seconds. All generated IDs matched;
+the largest logprob difference was 0.092502 against the fixed 0.20 limit.
+In addition to boundary prompts, two short needles returned the known code
+739391 over multiple decode tokens. The batch used a matched batched reference.
+Runner SHA256: `aec07962e3ba887ee2914226c7ed8aa5bd2c9d6fac7bad2202705c6ab222dcc7`.
+HiCache/L3 was disabled, so this qualifies the live hybrid transfer baseline.
+
+The initial B200 RDMA lane failed GPU memory registration with
 `Bad address [14]`. A native 1 MiB CUDA registration probe succeeded with
 `WITH_NVIDIA_PEERMEM=0`, which selects DMA-BUF instead of the default legacy
-peer-memory path. The full RDMA follow-up is pending. Select and record the
-actual transport; a TCP pass does not qualify RDMA. See Mooncake's
+peer-memory path. The full follow-up registered successfully but failed live
+transfer with transport retry errors. A separate single-NIC GPU-to-GPU probe
+also failed. This B200 transport issue remains unresolved; the successful
+B300 hybrid lane used DMA-BUF RDMA. Select and record the actual transport;
+a TCP pass does not qualify RDMA. See Mooncake's
 [GPU registration troubleshooting](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/troubleshooting/troubleshooting.md).
 
 Feature enablement still requires the composed hybrid and role-local cache
@@ -331,17 +342,18 @@ restore, or live P/D. The hybrid L3 guard stays enabled.
    bytes. Run `test/registered/unit/mem_cache/test_hicache_dcp_storage_identity.py`
    for these contracts. The current hybrid DCP guard remains in place until
    composed publication/restore and actual model continuation are qualified.
-3. **Run a small Kimi-Linear baseline and L3 continuation gate.** Use the
+3. **Extend the passing Kimi-Linear baseline to L3 continuation.** Use the
    existing `moonshotai/Kimi-Linear-48B-A3B-Instruct` TP4/DCP4 Blackwell fixture
    as the source for model/pool/kernel settings. Pin its model revision and
-   first validate the cache-off/L2 controls. Then test a cold writer and fresh
+   retain the passing cache-off/prefix controls and force L2 load-back.
+   Then test a cold writer and fresh
    L3 reader after the composed contract passes. Preserve the established
    numerical oracle; do not reuse the small MLA answer tolerance blindly.
-4. **Run a bounded live P4+D4 baseline on one eight-GPU node.** Reuse the
-   existing Kimi-Linear P/D topology and boundary prompts with speculation off.
-   Its full GSM8K/long-context campaign is not needed for the initial smoke.
-   Preserve the native TCP admission settings where applicable and use the
-   current graceful-cleanup fixture pattern.
+4. **Retain the passing live P4+D4 baseline.** The bounded one-node RDMA
+   result above establishes hybrid handoff with speculation off. Keep its
+   matched numerical controls when adding cache behavior; the full
+   GSM8K/long-context campaign remains separate. Preserve the native TCP
+   admission settings where applicable and graceful process cleanup.
 5. **Add role-local L3 to live handoff.** Test P-only first, then D-only and
    both roles, with matched controls. Decode needs the actual decode radix,
    preallocation and restore path enabled; a transfer-only success is not a
