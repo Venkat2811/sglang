@@ -469,6 +469,19 @@ class HiCacheFile(HiCacheStorage):
                 "_ns1_" + hashlib.sha256(os.fsencode(self.config_suffix)).hexdigest()
             )
 
+        # Keep state ownership outside the compacted key. A replica of MLA KV
+        # still owns its recurrent state, including during a fresh LRU scan.
+        self._state_config_suffix = self.config_suffix
+        if self._state_tp_rank is not None:
+            owner = f"_mamba_tp{self._state_tp_rank}_{self._state_tp_size}"
+            self._state_config_suffix += owner
+            if len(os.fsencode(self._state_config_suffix)) > 184:
+                self._state_config_suffix = (
+                    "_ns1_"
+                    + hashlib.sha256(os.fsencode(self.config_suffix)).hexdigest()
+                    + owner
+                )
+
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
@@ -514,10 +527,21 @@ class HiCacheFile(HiCacheStorage):
             ),
         )
 
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
+        if host_pool_name == PoolName.MAMBA and self._state_tp_rank is not None:
+            self._evictor.add_owned_suffix(self._state_config_suffix)
+
     def _get_suffixed_key(self, key: str) -> str:
-        if len(os.fsencode(key + self.config_suffix + ".bin")) > 255:
+        suffix = self.config_suffix
+        if (
+            self._state_tp_rank is not None
+            and f".mamba_tp{self._state_tp_rank}_" in key
+        ):
+            suffix = self._state_config_suffix
+        if len(os.fsencode(key + suffix + ".bin")) > 255:
             key = "h1_" + hashlib.sha256(os.fsencode(key)).hexdigest()
-        return key + self.config_suffix
+        return key + suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
@@ -534,7 +558,7 @@ class HiCacheFile(HiCacheStorage):
                 continue
             stem = fn[:-4]
             # Only files belonging to this rank/model.
-            if stem.endswith(self.config_suffix):
+            if stem.endswith((self.config_suffix, self._state_config_suffix)):
                 self.metadata_cache.add(stem)
 
     def get(

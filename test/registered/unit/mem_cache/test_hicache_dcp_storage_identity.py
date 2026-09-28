@@ -230,6 +230,60 @@ class TestDcpStorageIdentity(CustomTestCase):
                 )
                 torch.testing.assert_close(target.get_data_page(3), before)
 
+    def test_bounded_mla_replica_can_write_and_evict_only_its_state(self):
+        """An MLA replica still owns its TP-sharded recurrent checkpoint."""
+        for dcp in (1, 2):
+            for model in ("bounded/model", "模型" * 70):
+                with self.subTest(dcp=dcp, model=model):
+                    state = _mamba_pool()
+                    size = state.get_data_page(3).nbytes
+                    config = make_config(
+                        dcp_size=dcp,
+                        model_name=model,
+                        extra_config=dict(
+                            max_size=size,
+                            min_free_space=0,
+                            eviction_ratio=1.0,
+                            enable_metadata_cache=False,
+                        ),
+                    )
+                    owner = self.backend(config)
+                    self.assertTrue(
+                        owner.set("kv", torch.ones(size, dtype=torch.uint8))
+                    )
+                    replica_config = replace(config, tp_rank=2)
+                    replica = self.backend(replica_config)
+                    replica.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                    self.assertFalse(replica.set("unowned-kv", torch.ones(1)))
+                    for key in ("old", "new"):
+                        transfer = PoolTransfer(
+                            PoolName.MAMBA,
+                            host_indices=torch.tensor([3]),
+                            keys=[key],
+                        )
+                        self.assertEqual(
+                            replica.batch_set_v2([transfer]), {PoolName.MAMBA: [True]}
+                        )
+                    self.assertFalse(
+                        replica.exists(replica._log_key(PoolName.MAMBA, "old"))
+                    )
+                    self.assertTrue(owner.exists("kv"))
+                    # Fresh scans must not adopt another rank's files.
+                    fresh = self.backend(replica_config)
+                    fresh.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                    self.assertTrue(fresh.exists(fresh._log_key(PoolName.MAMBA, "new")))
+                    self.assertTrue(owner.exists("kv"))
+                    self.assertEqual(fresh._evictor._total_bytes, size)
+                    # The primary writer shares one cap across its KV and state,
+                    # without adopting a replica's independently owned state.
+                    owner.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                    self.assertEqual(
+                        owner.batch_set_v2([transfer]), {PoolName.MAMBA: [True]}
+                    )
+                    self.assertFalse(owner.exists("kv"))
+                    self.assertTrue(fresh.exists(fresh._log_key(PoolName.MAMBA, "new")))
+                    self.assertEqual(owner._evictor._total_bytes, size)
+
     def test_long_model_identity_restores_kv_and_state_from_fresh_backend(self):
         """Snapshot paths plus state fingerprints exceeded NAME_MAX in Kimi serving."""
         for model in ("/cache/models--org--model/snapshots/" + "a" * 100, "模型" * 70):
