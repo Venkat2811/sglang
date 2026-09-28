@@ -330,8 +330,9 @@ class HybridCacheController(BaseHiCacheController):
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
         if self.enable_storage and self.storage_config.dcp_size > 1:
-            raise NotImplementedError(
-                "HiCache L3 with DCP requires one materialized MLA host pool."
+            self._validate_dcp_storage_pools(
+                self.mem_pool_host.anchor_entry.host_pool,
+                [*self.mem_pool_host.entries, entry],
             )
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:

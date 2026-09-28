@@ -14,7 +14,7 @@ registered L3 backend.
 | Pure MLA + DCP + file | Enabled; TP8/DCP8 and TP4/DCP2 SSD inference passed | Other explicitly selected layouts/policies and runtime attachment |
 | File directory on SSD | TP1/DCP1, TP8/DCP8 and TP4/DCP2 pressure, physical SSD reads and missing-shard fallback passed | Independent durability/crash recovery qualification |
 | Mooncake SSD offload | TP1/DCP1, TP8/DCP8 and TP4/DCP2 pressure, SSD-only retrieval and missing-shard fallback passed | Independent owner/master restart recovery |
-| Hybrid KDA + MLA + DCP + L3 | Component contracts implemented; public enablement still guarded | Composed checkpoint capture/publication/restore and real model continuation, for each backend |
+| Hybrid KDA + MLA + DCP + L3 | Materialized MLA + Mamba pools enabled; Kimi TP4/DCP4 file and Mooncake DRAM continuation passed | Hybrid SSD pressure, other profiles, speculation and actual K3 |
 | Live P/D with role-local L3 | Existing P/D fixtures and implementation paths | Explicit cache-off baselines, role-local restores and their composition with live transfer |
 
 The earlier 194 passing requests were **Mooncake DRAM** tests. The separate
@@ -24,7 +24,7 @@ SSD results below now exercise both backends. See also
 ## File backend
 
 The branch accepts `--hicache-storage-backend file` under DCP for a supported
-single materialized MLA pool. The path is selected by
+materialized MLA pool, optionally with one independent Mamba state pool. The path is selected by
 `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR`; the default is `/tmp/hicache`.
 Point it at a dedicated directory on the intended SSD filesystem. A path name
 or Kubernetes ephemeral volume alone is not evidence of the underlying medium.
@@ -303,7 +303,7 @@ It owns only its local router; the caller must archive and stop the external
 engines. Tested runner SHA256:
 `5003b0cdab504828137c0a70c2e952cd7cf7cfda1c489766a357bf1e6049e875`.
 
-Feature enablement still requires the composed hybrid and role-local cache
+At that baseline checkpoint, enablement still required the composed hybrid and role-local cache
 gates below.
 
 ### Kimi DCP4 cold/warm baseline
@@ -351,7 +351,8 @@ KL criterion. They are not reported as satisfying the absolute 0.20 bound.
 Runner SHA256: `621d667d85e6bc95e1160cfeb338a8a282c5db48c579bb1db1441c01c4f94076`.
 This qualifies the bounded model/prefix-continuation baseline. Positive hits
 were device-cache hits; it does not establish forced L2 load-back, hybrid L3
-restore, or live P/D. The hybrid L3 guard stays enabled.
+restore, or live P/D. The hybrid L3 guard was still enabled at that checkpoint;
+see the subsequent L3 continuation result below.
 
 1. **Compose the hybrid restore path.** Drive actual KDA checkpoint capture and
    publication, native storage, common legal boundary selection, radix host
@@ -367,8 +368,8 @@ restore, or live P/D. The hybrid L3 guard stays enabled.
    logical page geometry and returns complete legal checkpoint sets. Tests
    cover both supported state layouts and preserve unselected destination
    bytes. Run `test/registered/unit/mem_cache/test_hicache_dcp_storage_identity.py`
-   for these contracts. The current hybrid DCP guard remains in place until
-   composed publication/restore and actual model continuation are qualified.
+   for these contracts. The narrow hybrid DCP capability now admits materialized MLA plus one
+   independent Mamba pool. Extra draft/state compositions remain outside this gate.
 3. **Extend the passing Kimi-Linear baseline to L3 continuation.** Use the
    existing `moonshotai/Kimi-Linear-48B-A3B-Instruct` TP4/DCP4 Blackwell fixture
    as the source for model/pool/kernel settings. Pin its model revision and
@@ -394,3 +395,62 @@ tests can precede that allocation. Actual Kimi-K3 recipes remain later
 qualification: the reduced P8+D16 shape needs three eight-GPU nodes and the
 supplied full P/D layouts need four. A Kimi-Linear pass is not a Kimi-K3 pass.
 Both SSD lanes are required; the hybrid/P-D baseline can proceed in the same development cycle.
+
+
+## Hybrid L3 continuation checkpoint (2026-09-28)
+
+`test_kimi_linear_l3_restore.py` passes with file and native Mooncake DRAM
+for pinned Kimi-Linear-48B-A3B-Instruct revision
+`e1df551a447157d4658b573f9a695d57658590e9`, TP4/DCP4, BF16,
+`cutedsl_mla`, physical page 64/logical page 256, chunk size 1024 and decode graphs up to 8.
+Each backend passed 12 scored requests: matched ordinary-radix cold/warm
+controls, an L3 writer, and a fresh reader after the writer exited.
+The reader restored 256/512/1024 prompt tokens exclusively from storage,
+with identical completion lengths on all four ranks. Output IDs and output
+logprobs matched their paired controls exactly (declared tolerance 0.20).
+These are bounded correctness cases, not broad numerical equivalence.
+
+The writer exposed two file/persistence bugs before acceptance. Long model
+snapshot names plus recurrent schema keys exceeded the filesystem filename
+limit; overlong namespaces/keys now use stable hashes while ordinary primary
+keys stay compatible. DCP1 MLA recurrent objects now also carry TP ownership
+and size, deliberately avoiding ambiguous old state files. Separately, a
+chunked prefill donated a checkpoint but suppressed its write-through; a
+short final chunk did not produce another snapshot to trigger persistence.
+Ordinary write-through now accepts the immutable donated checkpoint.
+The automatic-publication regression fails on Python and Rust trees without
+the fix; the composed GPU suite passes 2 tests and 10 subtests. Related CPU
+identity/controller/publication tests pass 86 tests and 654 subtests; the separate
+file identity/eviction suite passes 44 tests and 32 subtests.
+
+The chunked-prefill problem overlaps upstream
+[issue #33714](https://github.com/sgl-project/sglang/issues/33714),
+[PR #36647](https://github.com/sgl-project/sglang/pull/36647) and
+[PR #39745](https://github.com/sgl-project/sglang/pull/39745). The latter proposes
+a finish-time protected-prefix fallback, whereas this branch persists
+donated checkpoints during ordinary write-through. Reconcile these changes
+before upstreaming; selective write-through still requires independent reuse.
+
+The composed GPU test also covers missing latest state, duplicate insertion
+and cancellation during a real file read. The forward state in that small
+fixture is tagged; the model runner separately exercises real Kimi kernels.
+The native Mooncake run uses an independent 1 GiB TCP donor that survives both
+engines; native reads/hash inventory verify 56 surviving objects. No Mooncake
+source change is needed. This run does not prove hybrid SSD residency,
+live P/D with L3, speculative rollback or Kimi-K3 support.
+
+Example file lane (four Blackwell GPUs):
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+KIMI_L3_OUTPUT_DIR=/tmp/kimi-l3-results \
+KIMI_L3_STORAGE_DIR=/tmp/kimi-l3-files \
+python test/manual/hicache/test_kimi_linear_l3_restore.py
+```
+
+Both directories must be new. Optionally select the pinned local snapshot
+with `KIMI_L3_MODEL_PATH`. For Mooncake, set `KIMI_L3_BACKEND=mooncake`
+and provide `KIMI_L3_EXTRA_CONFIG` for an independently owned persistent
+store; zero-contribution inference clients must not be its only owners.
+Raw failed attempts, successful responses, rank logs and source hashes are
+retained outside this public repository.
