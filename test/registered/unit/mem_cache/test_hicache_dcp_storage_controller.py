@@ -17,8 +17,9 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+from sglang.srt.mem_cache.hicache_storage import HiCacheFile, PoolName
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -332,7 +333,13 @@ class TestDcpStorageController(CustomTestCase):
             elif representation == "scales":
                 cc.storage_host_pool.device_pool.kv_scale_buffer = [torch.zeros(1)]
             else:
-                cc.mem_pool_host = SimpleNamespace(entries=[object(), object()])
+                host = cc.storage_host_pool
+                cc.mem_pool_host = HostPoolGroup(
+                    [
+                        PoolEntry(name, host, host.device_pool, lambda layer: layer)
+                        for name in (PoolName.KV, PoolName.SWA)
+                    ]
+                )
             cc._stop_storage_threads = mock.Mock()
             with (
                 self.subTest(representation=representation),
@@ -353,7 +360,7 @@ class TestDcpStorageController(CustomTestCase):
         cc = HiCacheController.__new__(HiCacheController)
         cc.enable_storage = False
         cc.write_policy = "write_through"
-        cc.storage_host_pool = object()
+        cc.mem_pool_host = cc.storage_host_pool = object()
         cc._stop_storage_threads = mock.Mock()
         cc._start_storage_threads = mock.Mock()
         cc._generate_storage_config = mock.Mock()

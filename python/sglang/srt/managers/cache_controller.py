@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.pool_host import HostKVCache
+    from sglang.srt.mem_cache.pool_host.group import PoolEntry
 
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -518,8 +519,9 @@ class HiCacheController:
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
 
     @staticmethod
-    def _validate_dcp_storage_pools(primary, entries):
-        """Validate every persisted pool before registering or starting IO."""
+    def _validate_dcp_storage_pools(
+        primary: HostKVCache, entries: Optional[List[PoolEntry]]
+    ):
         from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
         from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
@@ -542,12 +544,12 @@ class HiCacheController:
         if len(entries) not in (1, 2):
             raise NotImplementedError(message)
         if len(entries) > 1 and any(
-            getattr(entry, "packed_draft_device_pools", ()) for entry in entries
+            entry.packed_draft_device_pools for entry in entries
         ):
             raise NotImplementedError(message)
         seen = set()
         for entry in entries:
-            name = getattr(entry, "name", None)
+            name = entry.name
             if name in seen:
                 raise NotImplementedError(message)
             seen.add(name)
@@ -583,6 +585,7 @@ class HiCacheController:
             raise RuntimeError("Storage backend already attached.")
         if get_parallel().attn_dcp_size > 1:
             from sglang.srt.arg_groups.hicache_hook import validate_hicache_dcp_storage
+            from sglang.srt.mem_cache.pool_host.group import HostPoolGroup
             from sglang.srt.runtime_context import get_server_args
 
             validate_hicache_dcp_storage(
@@ -591,7 +594,11 @@ class HiCacheController:
             )
             self._validate_dcp_storage_pools(
                 self.storage_host_pool,
-                getattr(getattr(self, "mem_pool_host", None), "entries", None),
+                (
+                    self.mem_pool_host.entries
+                    if isinstance(self.mem_pool_host, HostPoolGroup)
+                    else None
+                ),
             )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
