@@ -251,6 +251,29 @@ class TestHybridL3Restore(CustomTestCase):
             reader.cache_controller._stop_storage_threads()
             writer.cache_controller._stop_storage_threads()
 
+    def _seed_two_checkpoints(self, prod, pa, pp, *, page):
+        oracles = {}
+        for pages in (2, 4):
+            tokens = list(range(pages * page + 31))
+            req = self._request(prod, pa, pp, tokens, f"writer-{pages}")
+            _, depth, state = self._forward_snapshot(prod, pp, req)
+            self.assertEqual(depth, pages * page)
+            indices = pp.req_to_token[req.kv.req_pool_idx, :depth]
+            self._fill_full_kv(pa, indices, marker=7)
+            prod.cache_unfinished_req(req)
+            match = prod.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens[:depth])))
+            )
+            leaf = match.last_device_node
+            oracles[pages] = (
+                state,
+                self._snapshot_full_kv(pa, match.device_indices),
+            )
+            self._backup_node(prod, leaf)
+            self._write_path_to_l3(prod, leaf)
+            self._flush_l3_backups(prod)
+        return oracles, leaf
+
     def test_fresh_partial_and_duplicate_restore_preserve_checkpoint_bytes(self):
         for page in (128, 512):
             for scenario in ("complete", "missing_latest_state", "duplicate", "cancel"):
@@ -268,26 +291,7 @@ class TestHybridL3Restore(CustomTestCase):
                         max_context_len=page * 8,
                     )
                     prod, pa, pp = self._fixture(directory)
-                    oracles = {}
-                    for pages in (2, 4):
-                        tokens = list(range(pages * page + 31))
-                        req = self._request(prod, pa, pp, tokens, f"writer-{pages}")
-                        _, depth, state = self._forward_snapshot(prod, pp, req)
-                        self.assertEqual(depth, pages * page)
-                        indices = pp.req_to_token[req.kv.req_pool_idx, :depth]
-                        self._fill_full_kv(pa, indices, marker=7)
-                        prod.cache_unfinished_req(req)
-                        match = prod.match_prefix(
-                            MatchPrefixParams(key=RadixKey(array("q", tokens[:depth])))
-                        )
-                        leaf = match.last_device_node
-                        oracles[pages] = (
-                            state,
-                            self._snapshot_full_kv(pa, match.device_indices),
-                        )
-                        self._backup_node(prod, leaf)
-                        self._write_path_to_l3(prod, leaf)
-                        self._flush_l3_backups(prod)
+                    oracles, leaf = self._seed_two_checkpoints(prod, pa, pp, page=page)
                     if scenario == "missing_latest_state":
                         backend = prod.cache_controller.storage_backend
                         terminal = prod.tree_core.get_hash_values(leaf)[-1]

@@ -703,6 +703,29 @@ def test_mla_dcp_storage_descriptors_round_trip_on_gpu(layout, backend, dcp):
                 host.destroy()
 
 
+def _copy_kda_descriptors(
+    *, source, target, source_host, target_host, source_slots, buffers
+):
+    src_ptrs, sizes = source.get_page_buffer_meta(torch.tensor(source_host))
+    dst_ptrs, dst_sizes = target.get_page_buffer_meta(torch.tensor(target_host))
+    assert sizes == dst_sizes
+    assert sum(sizes) == len(source_slots) * sum(
+        b[:, 0].numel() * b.element_size() for b in buffers
+    )
+    for src, dst, size in zip(src_ptrs, dst_ptrs, sizes):
+        for host, ptr, slots in (
+            (source, src, source_host),
+            (target, dst, target_host),
+        ):
+            assert any(
+                b[slot].data_ptr() <= ptr
+                and ptr + size <= b[slot].data_ptr() + b[slot].nbytes
+                for b in host.get_hybrid_pool_buffer()
+                for slot in slots
+            )
+        ctypes.memmove(dst, ctypes.string_at(src, size), size)
+
+
 @pytest.mark.parametrize(
     "layout,backend", [("page_first", "kernel"), ("page_first_direct", "direct")]
 )
@@ -783,24 +806,14 @@ def test_kda_storage_descriptors_round_trip_on_gpu(layout, backend, temporal_dty
                 torch.testing.assert_close(
                     actual.view(torch.uint8), wanted.view(torch.uint8), rtol=0, atol=0
                 )
-            src_ptrs, sizes = source.get_page_buffer_meta(torch.tensor(source_host))
-            dst_ptrs, dst_sizes = target.get_page_buffer_meta(torch.tensor(target_host))
-            assert sizes == dst_sizes
-            assert sum(sizes) == len(source_slots) * sum(
-                b[:, 0].numel() * b.element_size() for b in buffers
+            _copy_kda_descriptors(
+                source=source,
+                target=target,
+                source_host=source_host,
+                target_host=target_host,
+                source_slots=source_slots,
+                buffers=buffers,
             )
-            for src, dst, size in zip(src_ptrs, dst_ptrs, sizes):
-                for host, ptr, slots in (
-                    (source, src, source_host),
-                    (target, dst, target_host),
-                ):
-                    assert any(
-                        b[slot].data_ptr() <= ptr
-                        and ptr + size <= b[slot].data_ptr() + b[slot].nbytes
-                        for b in host.get_hybrid_pool_buffer()
-                        for slot in slots
-                    )
-                ctypes.memmove(dst, ctypes.string_at(src, size), size)
             for actual, original in zip(target.get_hybrid_pool_buffer(), originals):
                 wanted = torch.full_like(actual, 3)
                 for src, dst in zip(source_slots, target_host):
