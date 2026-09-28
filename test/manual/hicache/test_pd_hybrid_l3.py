@@ -38,22 +38,38 @@ REVISION = "e1df551a447157d4658b573f9a695d57658590e9"
 
 class TestPdHybridL3(CustomTestCase):
     def test_role_local_continuation(self):
+        self._configure()
+        self._save()
+        try:
+            self._build_cases()
+            self._configure_ports()
+            self._run_references()
+            self._run_writer()
+            self._run_fresh()
+            self.report["status"] = "passed"
+        except Exception as error:
+            self.report.update(status="failed", error=repr(error))
+            raise
+        finally:
+            self._save()
+
+    def _configure(self):
         self.assertGreaterEqual(torch.cuda.device_count(), 8)
         selection = os.environ["PD_L3_ROLES"]
         self.assertIn(selection, ("prefill", "decode", "both"))
-        roles = {"prefill", "decode"} if selection == "both" else {selection}
-        output = Path(os.environ["PD_L3_OUTPUT_DIR"])
-        storage = Path(os.environ["PD_L3_STORAGE_DIR"])
-        output.mkdir(parents=True, exist_ok=False)
-        storage.mkdir(parents=True, exist_ok=False)
-        model = os.environ.get("PD_L3_MODEL_PATH", MODEL)
+        self.roles = {"prefill", "decode"} if selection == "both" else {selection}
+        self.output = Path(os.environ["PD_L3_OUTPUT_DIR"])
+        self.storage = Path(os.environ["PD_L3_STORAGE_DIR"])
+        self.output.mkdir(parents=True, exist_ok=False)
+        self.storage.mkdir(parents=True, exist_ok=False)
+        self.model = os.environ.get("PD_L3_MODEL_PATH", MODEL)
         source = Path(__file__).read_bytes()
-        (output / "runner.py").write_bytes(source)
-        report = dict(
+        (self.output / "runner.py").write_bytes(source)
+        self.report = dict(
             status="running",
             model=MODEL,
             revision=REVISION,
-            roles=sorted(roles),
+            roles=sorted(self.roles),
             requests=0,
             checks=[],
             logprob_atol=0.20,
@@ -67,11 +83,9 @@ class TestPdHybridL3(CustomTestCase):
             },
         )
 
-        def save():
-            (output / "summary.json").write_text(json.dumps(report, indent=2))
-
+    def _build_cases(self):
         tokenizer = AutoTokenizer.from_pretrained(
-            model, revision=REVISION, trust_remote_code=True
+            self.model, revision=REVISION, trust_remote_code=True
         )
         # Preserve the chat framing and known-answer instruction while varying
         # only filler tokens. The marker never enters a request.
@@ -90,7 +104,7 @@ class TestPdHybridL3(CustomTestCase):
         filler = tokenizer.encode(
             "The library keeps records of books. ", add_special_tokens=False
         )
-        primes = []
+        self.primes = []
         for size in (255, 511, 1023):
             # Distinct first pages keep another case's L3 checkpoint from
             # warming this case's writer-control comparison.
@@ -100,13 +114,17 @@ class TestPdHybridL3(CustomTestCase):
             )
             n = size - len(prefix) - len(suffix)
             self.assertGreater(n, 0)
-            primes.append(prefix + (filler * (n // len(filler) + 1))[:n] + suffix)
-        (output / "prime-inputs.json").write_text(json.dumps(primes))
-        ports = []
+            self.primes.append(prefix + (filler * (n // len(filler) + 1))[:n] + suffix)
+        (self.output / "prime-inputs.json").write_text(json.dumps(self.primes))
+
+    def _configure_ports(self):
+        self.ports = []
         for _ in range(6):
-            ports.append(find_available_port(max(ports, default=30999) + 1))
-        p_url, d_url, router_url = [f"http://127.0.0.1:{p}" for p in ports[:3]]
-        common = [
+            self.ports.append(find_available_port(max(self.ports, default=30999) + 1))
+        self.p_url, self.d_url, self.router_url = [
+            f"http://127.0.0.1:{p}" for p in self.ports[:3]
+        ]
+        self.common = [
             "--revision",
             REVISION,
             "--served-model-name",
@@ -145,9 +163,9 @@ class TestPdHybridL3(CustomTestCase):
             "--disaggregation-transfer-backend",
             "mooncake",
             "--disaggregation-bootstrap-port",
-            str(ports[3]),
+            str(self.ports[3]),
         ]
-        cache_args = [
+        self.cache_args = [
             "--enable-hierarchical-cache",
             "--hicache-size",
             "10",
@@ -165,238 +183,243 @@ class TestPdHybridL3(CustomTestCase):
             json.dumps({"prefetch_threshold": 1, "enable_metadata_cache": False}),
         ]
 
-        @contextmanager
-        def pair(phase, cached):
-            with ExitStack() as stack:
-                for role, url in (("prefill", p_url), ("decode", d_url)):
-                    args = common + [
-                        "--disaggregation-mode",
-                        role,
-                        "--nccl-port",
-                        str(ports[4 if role == "prefill" else 5]),
-                    ]
-                    if role == "prefill":
-                        args += ["--ep-size", "4"]
-                    else:
-                        args += [
-                            "--base-gpu-id",
-                            "4",
-                            "--dcp-size",
-                            "4",
-                            "--dcp-comm-backend",
-                            "a2a",
-                            "--dcp-replicate-q-proj",
-                        ]
-                        if role in roles:
-                            args += ["--disaggregation-decode-enable-radix-cache"]
-                    if cached and role in roles:
-                        args += cache_args
-                    env = {
-                        "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
-                        "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": str(storage / role),
-                    }
-                    (output / f"{phase}-{role}-args.json").write_text(json.dumps(args))
-                    log = stack.enter_context(
-                        (output / f"{phase}-{role}.log").open("w")
-                    )
-                    process = popen_launch_pd_server(
-                        model,
-                        url,
-                        timeout=900,
-                        other_args=args,
-                        env=env,
-                        return_stdout_stderr=(log, log),
-                    )
-                    stack.callback(
-                        terminate_and_kill_process_tree, process, wait_timeout=60
-                    )
-                    wait_for_http_ready(url + "/health", timeout=900, process=process)
-                    r = requests.get(url + "/get_server_info", timeout=30)
-                    r.raise_for_status()
-                    (output / f"{phase}-{role}-server-info.json").write_text(r.text)
-                    self.assertEqual(
-                        r.json()["enable_hierarchical_cache"], cached and role in roles
-                    )
-                command = [
-                    sys.executable,
-                    "-m",
-                    "sglang_router.launch_router",
-                    "--pd-disaggregation",
-                    "--mini-lb",
-                    "--prefill",
-                    p_url,
-                    "--decode",
-                    d_url,
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(ports[2]),
+    def _save(self):
+        (self.output / "summary.json").write_text(json.dumps(self.report, indent=2))
+
+    @contextmanager
+    def _pair(self, phase, cached):
+        with ExitStack() as stack:
+            for role, url in (("prefill", self.p_url), ("decode", self.d_url)):
+                args = self.common + [
+                    "--disaggregation-mode",
+                    role,
+                    "--nccl-port",
+                    str(self.ports[4 if role == "prefill" else 5]),
                 ]
-                log = stack.enter_context((output / f"{phase}-router.log").open("w"))
-                router = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
-                stack.callback(terminate_and_kill_process_tree, router, wait_timeout=60)
-                wait_for_http_ready(router_url + "/health", timeout=120, process=router)
-                yield
-
-        def flush(selected=("prefill", "decode")):
-            for role, url in (("prefill", p_url), ("decode", d_url)):
-                if role not in selected:
-                    continue
-                r = requests.post(
-                    url + "/flush_cache", params={"timeout": 30}, timeout=40
+                if role == "prefill":
+                    args += ["--ep-size", "4"]
+                else:
+                    args += [
+                        "--base-gpu-id",
+                        "4",
+                        "--dcp-size",
+                        "4",
+                        "--dcp-comm-backend",
+                        "a2a",
+                        "--dcp-replicate-q-proj",
+                    ]
+                    if role in self.roles:
+                        args += ["--disaggregation-decode-enable-radix-cache"]
+                if cached and role in self.roles:
+                    args += self.cache_args
+                env = {
+                    "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+                    "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": str(self.storage / role),
+                }
+                (self.output / f"{phase}-{role}-args.json").write_text(json.dumps(args))
+                log = stack.enter_context(
+                    (self.output / f"{phase}-{role}.log").open("w")
                 )
+                process = popen_launch_pd_server(
+                    self.model,
+                    url,
+                    timeout=900,
+                    other_args=args,
+                    env=env,
+                    return_stdout_stderr=(log, log),
+                )
+                stack.callback(
+                    terminate_and_kill_process_tree, process, wait_timeout=60
+                )
+                wait_for_http_ready(url + "/health", timeout=900, process=process)
+                r = requests.get(url + "/get_server_info", timeout=30)
                 r.raise_for_status()
-
-        def generate(name, ids, count):
-            payload = dict(
-                input_ids=ids,
-                sampling_params=dict(
-                    temperature=0, max_new_tokens=count, ignore_eos=True
-                ),
-                return_logprob=True,
+                (self.output / f"{phase}-{role}-server-info.json").write_text(r.text)
+                self.assertEqual(
+                    r.json()["enable_hierarchical_cache"], cached and role in self.roles
+                )
+            command = [
+                sys.executable,
+                "-m",
+                "sglang_router.launch_router",
+                "--pd-disaggregation",
+                "--mini-lb",
+                "--prefill",
+                self.p_url,
+                "--decode",
+                self.d_url,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(self.ports[2]),
+            ]
+            log = stack.enter_context((self.output / f"{phase}-router.log").open("w"))
+            router = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+            stack.callback(terminate_and_kill_process_tree, router, wait_timeout=60)
+            wait_for_http_ready(
+                self.router_url + "/health", timeout=120, process=router
             )
-            r = requests.post(router_url + "/generate", json=payload, timeout=240)
-            record = dict(request=payload, status_code=r.status_code, response=r.json())
-            (output / f"{name}.json").write_text(json.dumps(record, indent=2))
+            yield
+
+    def _flush(self, selected=("prefill", "decode")):
+        for role, url in (("prefill", self.p_url), ("decode", self.d_url)):
+            if role not in selected:
+                continue
+            r = requests.post(url + "/flush_cache", params={"timeout": 30}, timeout=40)
             r.raise_for_status()
-            result = r.json()
-            self.assertEqual(len(result["output_ids"]), count)
-            if "follow" in name:
-                self.assertIn("739391", result["text"])
-            lps = result["meta_info"]["output_token_logprobs"]
-            self.assertEqual([x[1] for x in lps], result["output_ids"])
-            self.assertTrue(all(math.isfinite(x[0]) for x in lps))
-            report["requests"] += 1
-            save()
-            return result
 
-        def parity(name, expected, actual):
-            self.assertEqual(actual["output_ids"], expected["output_ids"], name)
-            delta = max(
-                abs(a[0] - b[0])
-                for a, b in zip(
-                    actual["meta_info"]["output_token_logprobs"],
-                    expected["meta_info"]["output_token_logprobs"],
-                )
-            )
-            self.assertLessEqual(delta, 0.20, name)
-            report["checks"].append(
-                dict(
-                    name=name,
-                    max_logprob_delta=delta,
-                    cache_details=actual["meta_info"].get("cached_tokens_details"),
-                )
-            )
-            save()
+    def _generate(self, name, ids, count):
+        payload = dict(
+            input_ids=ids,
+            sampling_params=dict(temperature=0, max_new_tokens=count, ignore_eos=True),
+            return_logprob=True,
+        )
+        r = requests.post(self.router_url + "/generate", json=payload, timeout=240)
+        record = dict(request=payload, status_code=r.status_code, response=r.json())
+        (self.output / f"{name}.json").write_text(json.dumps(record, indent=2))
+        r.raise_for_status()
+        result = r.json()
+        self.assertEqual(len(result["output_ids"]), count)
+        if "follow" in name:
+            self.assertIn("739391", result["text"])
+        lps = result["meta_info"]["output_token_logprobs"]
+        self.assertEqual([x[1] for x in lps], result["output_ids"])
+        self.assertTrue(all(math.isfinite(x[0]) for x in lps))
+        self.report["requests"] += 1
+        self._save()
+        return result
 
-        save()
-        try:
-            with pair("reference", False):
-                prime_refs, follow_refs, cold_follow_refs, follow_ids = [], [], [], []
-                for i, ids in enumerate(primes):
-                    flush()
-                    ref = generate(f"reference-prime-{i}", ids, 16)
-                    self.assertEqual(ref["text"].strip(), " ".join(["739391"] * 4))
-                    prime_refs.append(ref)
-                    follow_ids.append(ids + ref["output_ids"][:2])
-                    # Retain ordinary radix only on the roles whose persisted
-                    # cache is under test. This preserves the same producer
-                    # kernels and prefix boundary as the future L3 reader.
-                    flush({"prefill", "decode"} - roles)
-                    follow_refs.append(
-                        generate(f"reference-warm-follow-{i}", follow_ids[-1], 14)
+    def _parity(self, name, expected, actual):
+        self.assertEqual(actual["output_ids"], expected["output_ids"], name)
+        delta = max(
+            abs(a[0] - b[0])
+            for a, b in zip(
+                actual["meta_info"]["output_token_logprobs"],
+                expected["meta_info"]["output_token_logprobs"],
+            )
+        )
+        self.assertLessEqual(delta, 0.20, name)
+        self.report["checks"].append(
+            dict(
+                name=name,
+                max_logprob_delta=delta,
+                cache_details=actual["meta_info"].get("cached_tokens_details"),
+            )
+        )
+        self._save()
+
+    def _run_references(self):
+        with self._pair("reference", False):
+            (
+                self.prime_refs,
+                self.follow_refs,
+                self.cold_follow_refs,
+                self.follow_ids,
+            ) = [], [], [], []
+            for i, ids in enumerate(self.primes):
+                self._flush()
+                ref = self._generate(f"reference-prime-{i}", ids, 16)
+                self.assertEqual(ref["text"].strip(), " ".join(["739391"] * 4))
+                self.prime_refs.append(ref)
+                self.follow_ids.append(ids + ref["output_ids"][:2])
+                # Retain ordinary radix only on the roles whose persisted
+                # cache is under test. This preserves the same producer
+                # kernels and prefix boundary as the future L3 reader.
+                self._flush({"prefill", "decode"} - self.roles)
+                self.follow_refs.append(
+                    self._generate(
+                        f"reference-warm-follow-{i}", self.follow_ids[-1], 14
                     )
-                    if "decode" in roles:
-                        self.assertEqual(
-                            follow_refs[-1]["meta_info"]["cached_tokens"],
-                            (256, 512, 1024)[i],
-                        )
-                    flush()
-                    cold_follow_refs.append(
-                        generate(f"reference-follow-{i}", follow_ids[-1], 14)
+                )
+                if "decode" in self.roles:
+                    self.assertEqual(
+                        self.follow_refs[-1]["meta_info"]["cached_tokens"],
+                        (256, 512, 1024)[i],
                     )
-            with pair("writer", True):
-                for i, ids in enumerate(primes):
-                    flush()
-                    result = generate(f"writer-prime-{i}", ids, 16)
-                    parity(f"writer-prime-{i}", prime_refs[i], result)
-                flush()
-            inventory = [
+                self._flush()
+                self.cold_follow_refs.append(
+                    self._generate(f"reference-follow-{i}", self.follow_ids[-1], 14)
+                )
+
+    def _run_writer(self):
+        with self._pair("writer", True):
+            for i, ids in enumerate(self.primes):
+                self._flush()
+                result = self._generate(f"writer-prime-{i}", ids, 16)
+                self._parity(f"writer-prime-{i}", self.prime_refs[i], result)
+            self._flush()
+        inventory = [
+            dict(
+                path=str(p.relative_to(self.storage)),
+                bytes=p.stat().st_size,
+                sha256=hashlib.sha256(p.read_bytes()).hexdigest(),
+            )
+            for p in self.storage.rglob("*.bin")
+        ]
+        (self.output / "stored-files.json").write_text(json.dumps(inventory, indent=2))
+        for role in self.roles:
+            self.assertTrue(
+                any(
+                    x["path"].startswith(role + "/") and "mamba_tp" in x["path"]
+                    for x in inventory
+                ),
+                f"No recurrent state stored by {role}",
+            )
+
+    def _run_fresh(self):
+        with self._pair("fresh", True):
+            for i, ids in enumerate(self.follow_ids):
+                self._flush()
+                result = self._generate(f"fresh-follow-{i}", ids, 14)
+                self._parity(f"fresh-follow-{i}", self.follow_refs[i], result)
+                self.report["checks"][-1]["cold_prefill_logprob_delta"] = max(
+                    abs(a[0] - b[0])
+                    for a, b in zip(
+                        result["meta_info"]["output_token_logprobs"],
+                        self.cold_follow_refs[i]["meta_info"]["output_token_logprobs"],
+                    )
+                )
+                self._save()
+                if "prefill" in self.roles:
+                    details = result["meta_info"].get("cached_tokens_details")
+                    self.assertIsNotNone(details)
+                    self.assertGreater(details["storage"], 0)
+                    self.assertEqual(details["host"], 0)
+                    if self.roles == {"prefill"}:
+                        self.assertEqual(details["device"], 0)
+            self._flush()
+            # One TP shard's state hole must force a common miss even
+            # while all MLA KV shards remain present.
+            victims = [p for p in self.storage.rglob("*.bin") if "mamba_tp3_" in p.name]
+            self.assertTrue(victims)
+            self.report["removed_state_files"] = [
                 dict(
-                    path=str(p.relative_to(storage)),
+                    path=str(p.relative_to(self.storage)),
                     bytes=p.stat().st_size,
                     sha256=hashlib.sha256(p.read_bytes()).hexdigest(),
                 )
-                for p in storage.rglob("*.bin")
+                for p in victims
             ]
-            (output / "stored-files.json").write_text(json.dumps(inventory, indent=2))
-            for role in roles:
-                self.assertTrue(
-                    any(
-                        x["path"].startswith(role + "/") and "mamba_tp" in x["path"]
-                        for x in inventory
-                    ),
-                    f"No recurrent state stored by {role}",
+            self._save()
+            for p in victims:
+                p.unlink()
+            fallback = self._generate("missing-state-follow-1", self.follow_ids[1], 14)
+            self._parity("missing-state-follow-1", self.cold_follow_refs[1], fallback)
+            self.assertEqual(fallback["meta_info"]["cached_tokens"], 0)
+            for role, url in (("prefill", self.p_url), ("decode", self.d_url)):
+                r = requests.get(url + "/metrics", timeout=30)
+                r.raise_for_status()
+                (self.output / f"fresh-{role}-metrics.prom").write_text(r.text)
+        if "decode" in self.roles:
+            matches = re.findall(
+                r"DCP L3 prefetch: tp_rank=(\d+) tokens=(\d+)",
+                (self.output / "fresh-decode.log").read_text(),
+            )
+            for rank in range(4):
+                self.assertEqual(
+                    [int(n) for r, n in matches if int(r) == rank and int(n)],
+                    [256, 512, 1024],
                 )
-            with pair("fresh", True):
-                for i, ids in enumerate(follow_ids):
-                    flush()
-                    result = generate(f"fresh-follow-{i}", ids, 14)
-                    parity(f"fresh-follow-{i}", follow_refs[i], result)
-                    report["checks"][-1]["cold_prefill_logprob_delta"] = max(
-                        abs(a[0] - b[0])
-                        for a, b in zip(
-                            result["meta_info"]["output_token_logprobs"],
-                            cold_follow_refs[i]["meta_info"]["output_token_logprobs"],
-                        )
-                    )
-                    save()
-                    if "prefill" in roles:
-                        details = result["meta_info"].get("cached_tokens_details")
-                        self.assertIsNotNone(details)
-                        self.assertGreater(details["storage"], 0)
-                        self.assertEqual(details["host"], 0)
-                        if roles == {"prefill"}:
-                            self.assertEqual(details["device"], 0)
-                flush()
-                # One TP shard's state hole must force a common miss even
-                # while all MLA KV shards remain present.
-                victims = [p for p in storage.rglob("*.bin") if "mamba_tp3_" in p.name]
-                self.assertTrue(victims)
-                report["removed_state_files"] = [
-                    dict(
-                        path=str(p.relative_to(storage)),
-                        bytes=p.stat().st_size,
-                        sha256=hashlib.sha256(p.read_bytes()).hexdigest(),
-                    )
-                    for p in victims
-                ]
-                save()
-                for p in victims:
-                    p.unlink()
-                fallback = generate("missing-state-follow-1", follow_ids[1], 14)
-                parity("missing-state-follow-1", cold_follow_refs[1], fallback)
-                self.assertEqual(fallback["meta_info"]["cached_tokens"], 0)
-                for role, url in (("prefill", p_url), ("decode", d_url)):
-                    r = requests.get(url + "/metrics", timeout=30)
-                    r.raise_for_status()
-                    (output / f"fresh-{role}-metrics.prom").write_text(r.text)
-            if "decode" in roles:
-                matches = re.findall(
-                    r"DCP L3 prefetch: tp_rank=(\d+) tokens=(\d+)",
-                    (output / "fresh-decode.log").read_text(),
-                )
-                for rank in range(4):
-                    self.assertEqual(
-                        [int(n) for r, n in matches if int(r) == rank and int(n)],
-                        [256, 512, 1024],
-                    )
-            report["status"] = "passed"
-        except Exception as error:
-            report.update(status="failed", error=repr(error))
-            raise
-        finally:
-            save()
 
 
 if __name__ == "__main__":
