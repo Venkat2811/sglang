@@ -1,4 +1,4 @@
-"""Bounded P4 -> D4/DCP4 Kimi continuation with role-local file L3.
+"""Bounded P4 -> D4/DCP4 Kimi continuation with role-local file/Mooncake L3.
 
 PD_L3_ROLES=prefill|decode|both, PD_L3_OUTPUT_DIR and PD_L3_STORAGE_DIR
 must select new owned directories. PD_L3_MODEL_PATH may select the pinned
@@ -7,6 +7,7 @@ writer pair exits before the fresh-reader pair starts. Prompts end one token
 before a DCP page so actual decode kernels publish the next checkpoint.
 Ordinary role-local radix reuse supplies the matched continuation control:
 decode-produced FP8 KV can differ from recomputed prefill KV even without L3.
+PD_L3_BACKEND defaults to file; mooncake starts an independent native donor.
 """
 
 import hashlib
@@ -17,11 +18,12 @@ import re
 import subprocess
 import sys
 import unittest
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
 import requests
 import torch
+from native_mooncake_test_store import native_test_store
 from transformers import AutoTokenizer
 
 from sglang.test.test_utils import (
@@ -43,9 +45,15 @@ class TestPdHybridL3(CustomTestCase):
         try:
             self._build_cases()
             self._configure_ports()
-            self._run_references()
-            self._run_writer()
-            self._run_fresh()
+            service = (
+                native_test_store(output=self.output)
+                if self.backend == "mooncake"
+                else nullcontext(None)
+            )
+            with service as self.native:
+                self._run_references()
+                self._run_writer()
+                self._run_fresh()
             self.report["status"] = "passed"
         except Exception as error:
             self.report.update(status="failed", error=repr(error))
@@ -58,6 +66,8 @@ class TestPdHybridL3(CustomTestCase):
         selection = os.environ["PD_L3_ROLES"]
         self.assertIn(selection, ("prefill", "decode", "both"))
         self.roles = {"prefill", "decode"} if selection == "both" else {selection}
+        self.backend = os.environ.get("PD_L3_BACKEND", "file")
+        self.assertIn(self.backend, ("file", "mooncake"))
         self.output = Path(os.environ["PD_L3_OUTPUT_DIR"])
         self.storage = Path(os.environ["PD_L3_STORAGE_DIR"])
         self.output.mkdir(parents=True, exist_ok=False)
@@ -70,6 +80,7 @@ class TestPdHybridL3(CustomTestCase):
             model=MODEL,
             revision=REVISION,
             roles=sorted(self.roles),
+            backend=self.backend,
             requests=0,
             checks=[],
             logprob_atol=0.20,
@@ -176,11 +187,18 @@ class TestPdHybridL3(CustomTestCase):
             "--hicache-io-backend",
             "kernel",
             "--hicache-storage-backend",
-            "file",
+            self.backend,
             "--hicache-storage-prefetch-policy",
             "wait_complete",
+        ]
+
+    def _storage_args(self, role):
+        extra = dict(prefetch_threshold=1, enable_metadata_cache=False)
+        if self.native is not None:
+            extra.update(self.native.config, extra_backend_tag=f"pd-hybrid-{role}")
+        return self.cache_args + [
             "--hicache-storage-backend-extra-config",
-            json.dumps({"prefetch_threshold": 1, "enable_metadata_cache": False}),
+            json.dumps(extra),
         ]
 
     def _save(self):
@@ -211,7 +229,7 @@ class TestPdHybridL3(CustomTestCase):
                     if role in self.roles:
                         args += ["--disaggregation-decode-enable-radix-cache"]
                 if cached and role in self.roles:
-                    args += self.cache_args
+                    args += self._storage_args(role)
                 env = {
                     "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
                     "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": str(self.storage / role),
@@ -348,7 +366,24 @@ class TestPdHybridL3(CustomTestCase):
                 result = self._generate(f"writer-prime-{i}", ids, 16)
                 self._parity(f"writer-prime-{i}", self.prime_refs[i], result)
             self._flush()
-        inventory = [
+        inventory = self._inventory()
+        (self.output / "stored-objects.json").write_text(
+            json.dumps(inventory, indent=2)
+        )
+        for role in self.roles:
+            role_prefix = role + "/" if self.backend == "file" else f"pd-hybrid-{role}_"
+            self.assertTrue(
+                any(
+                    x["path"].startswith(role_prefix) and self._is_state(x["path"])
+                    for x in inventory
+                ),
+                f"No recurrent state stored by {role}",
+            )
+
+    def _inventory(self):
+        if self.native is not None:
+            return self.native.inventory()
+        return [
             dict(
                 path=str(p.relative_to(self.storage)),
                 bytes=p.stat().st_size,
@@ -356,15 +391,29 @@ class TestPdHybridL3(CustomTestCase):
             )
             for p in self.storage.rglob("*.bin")
         ]
-        (self.output / "stored-files.json").write_text(json.dumps(inventory, indent=2))
-        for role in self.roles:
-            self.assertTrue(
-                any(
-                    x["path"].startswith(role + "/") and "mamba_tp" in x["path"]
-                    for x in inventory
-                ),
-                f"No recurrent state stored by {role}",
+
+    def _is_state(self, key, rank=None):
+        if self.backend == "file":
+            return ("mamba_tp" if rank is None else f"mamba_tp{rank}_") in key
+        rank_pattern = r"\d+" if rank is None else str(rank)
+        return (
+            re.search(
+                rf"_{rank_pattern}_(?:mamba_v1_[a-f0-9]+_)?(?:temporal|conv_\d+)$",
+                key,
             )
+            is not None
+        )
+
+    def _remove_state_shard(self):
+        victims = [x for x in self._inventory() if self._is_state(x["path"], rank=3)]
+        self.assertTrue(victims)
+        self.report["removed_state_objects"] = victims
+        self._save()
+        for record in victims:
+            if self.native is None:
+                (self.storage / record["path"]).unlink()
+            else:
+                self.native.remove(record["path"])
 
     def _run_fresh(self):
         with self._pair("fresh", True):
@@ -390,19 +439,7 @@ class TestPdHybridL3(CustomTestCase):
             self._flush()
             # One TP shard's state hole must force a common miss even
             # while all MLA KV shards remain present.
-            victims = [p for p in self.storage.rglob("*.bin") if "mamba_tp3_" in p.name]
-            self.assertTrue(victims)
-            self.report["removed_state_files"] = [
-                dict(
-                    path=str(p.relative_to(self.storage)),
-                    bytes=p.stat().st_size,
-                    sha256=hashlib.sha256(p.read_bytes()).hexdigest(),
-                )
-                for p in victims
-            ]
-            self._save()
-            for p in victims:
-                p.unlink()
+            self._remove_state_shard()
             fallback = self._generate("missing-state-follow-1", self.follow_ids[1], 14)
             self._parity("missing-state-follow-1", self.cold_follow_refs[1], fallback)
             self.assertEqual(fallback["meta_info"]["cached_tokens"], 0)
