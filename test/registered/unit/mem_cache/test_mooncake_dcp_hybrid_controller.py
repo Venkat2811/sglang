@@ -1,4 +1,4 @@
-"""Four-rank MLA/KDA checkpoint contracts while hybrid DCP remains gated.
+"""Four-rank MLA/KDA checkpoint contracts using real host pools.
 
 The fixture assembles real host pools below the public capability guard. Workers,
 collectives, abort handling and the all-or-nothing acceptance check are real.
@@ -92,228 +92,266 @@ def _state_tag(rank, component, boundary):
     return 17 * rank + 5 * component + boundary
 
 
+class _HybridCase:
+    """One distributed checkpoint scenario with owned host-pool allocations."""
+
+    def __init__(self, *, rank, objects, case, address):
+        self.rank, self.case, self.address = rank, case, address
+        self.objects = objects
+        self.cc = _make_controller(
+            self.rank, self.objects, "hybrid-" + self.case, self.address
+        )
+        self.kv, self.state = self.cc.storage_host_pool, _mamba_pool()
+        self.cc.mem_pool_host = HostPoolGroup(
+            [
+                *self.cc.mem_pool_host.entries,
+                PoolEntry(
+                    PoolName.MAMBA,
+                    self.state,
+                    self.state.device_pool,
+                    lambda layer: layer,
+                ),
+            ]
+        )
+        self.cc.extra_host_mem_release_queues = {PoolName.MAMBA: Queue()}
+        self.cc.storage_backend.register_mem_host_pool_v2(self.state, PoolName.MAMBA)
+        self.cache = _cache(self.cc)
+        self.cache.tree_core = SimpleNamespace(page_size=128)
+        self.cache.storage_existence_cache = StorageExistenceCache()
+        self.tokens = list(range(512))
+        self.hashes = get_storage_hash_str(self.tokens, None, page_size=128)
+        self.client = _FaultClient(
+            self.cc.storage_backend.store, self.rank, self.hashes
+        )
+        self.cc.storage_backend.store = self.client
+        self.legal = _state_sets(self.case)
+        self.boundaries = sorted(self.legal[self.rank])
+        self.kv_source = self.kv.alloc(512)
+        self.kv.kv_buffer.fill_(self.rank % 2 + 1)
+        self.kv_oracle = self.kv.kv_buffer.clone()
+        # Recurrent slots are independent of token pages and DCP divisibility.
+        self.state_guard = self.state.alloc(3)
+        self.state_source = self.state.alloc(len(self.boundaries))
+        for component, buffer in enumerate(self.state.get_hybrid_pool_buffer()):
+            for slot, boundary in zip(self.state_source.tolist(), self.boundaries):
+                buffer[slot].view(torch.uint8).fill_(
+                    _state_tag(self.rank, component, boundary)
+                )
+        self.client.own(self.kv, self.kv_source)
+        if self.address is None:
+            _own_mamba(self.client.client, self.state, self.state_source.tolist())
+        self.outgoing = (
+            [
+                PoolTransfer(
+                    PoolName.MAMBA,
+                    host_indices=self.state_source,
+                    keys=[self.hashes[p - 1] for p in self.boundaries],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ]
+            if self.boundaries
+            else None
+        )
+        # Retain seed allocations so restore cannot accidentally reuse them.
+        self.cache.dec_host_lock_ref = lambda node, indices: None
+
+    def _backup(self):
+        ident = self.cc.write_storage(
+            self.kv_source, self.tokens, self.hashes, extra_pools=self.outgoing
+        )
+        self.cache.ongoing_backup[ident] = (0, self.kv_source)
+        _backup_done(
+            self.cc, self.cache, 512 if self.rank < 2 or self.boundaries else 0
+        )
+        assert sum(key.endswith("_k") for key in self.client.put_keys) == (
+            4 if self.rank < 2 else 0
+        )
+        assert sum(not key.endswith("_k") for key in self.client.put_keys) == 3 * len(
+            self.boundaries
+        )
+        dist.barrier()
+
+    def _remove_state_component(self):
+        keys, _ = self.cc.storage_backend._get_hybrid_page_component_keys(
+            [self.hashes[3]], self.incoming
+        )
+        self.client.remove(self.cc.storage_backend._tag_keys(keys)[1])
+
+    def _query(self):
+        self.incoming = PoolTransfer(
+            PoolName.MAMBA,
+            keys=["__placeholder__"],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        if self.case == "missing_component" and self.rank == 1:
+            self._remove_state_component()
+        dist.barrier()
+        candidates = [set(pages) for pages in self.legal]
+        if self.case == "missing_component":
+            candidates[1].remove(4)
+        self.expected = max(set.intersection(*candidates), default=0)
+        if self.case in ("query_cancelled", "query_failure"):
+            self.expected = 0
+        self.op = PrefetchOperation(
+            CacheRequestHandle(self.case, 0),
+            self.tokens,
+            pool_transfers=[self.incoming],
+        )
+        if self.case == "kv_only_rank" and self.rank == 3:
+            # A rank needing no state still joins the checkpoint collective.
+            self.op.pool_transfers = None
+        if self.case == "query_cancelled" and self.rank == 1:
+            self.op.mark_terminate()
+        if self.case == "query_failure":
+            self.client.mode = "lookup_exception"
+        self.cc.prefetch_queue.put(self.op)
+        assert self.cc.prefetch_hit_queue.get(timeout=10) is self.op
+        assert self.op.storage_hit_count == self.expected * 128, (
+            self.case,
+            self.rank,
+            self.op.storage_hit_count,
+            self.expected * 128,
+        )
+        assert self.op.hash_value == self.hashes[: self.expected]
+        self.published = []
+
+    def _prepare_restore(self):
+        if self.case == "evicted_state" and self.rank == 1:
+            self._remove_state_component()
+        dist.barrier()
+        self.op.host_indices = self.kv.alloc(self.expected * 128)
+        self.incoming.host_indices = self.state.alloc(1)
+        self.client.own(self.kv, self.op.host_indices)
+        if self.address is None:
+            _own_mamba(
+                self.client.client, self.state, self.incoming.host_indices.tolist()
+            )
+        for buffer in self.state.get_hybrid_pool_buffer():
+            buffer.view(torch.uint8).fill_(165)
+        self.state_before = [
+            b.view(torch.uint8).clone() for b in self.state.get_hybrid_pool_buffer()
+        ]
+        self.cache.ongoing_prefetch[self.op.handle] = _OngoingPrefetch(
+            0,
+            RadixKey(self.tokens),
+            self.op.host_indices,
+            self.op,
+            None,
+            {PoolName.MAMBA: [self.incoming]},
+        )
+        self.cc.prefetch_tokens_occupied = len(self.tokens)
+
+    def _publish(self, operation):
+        if not self.cache._check_hybrid_prefetch_result(
+            self.op.handle,
+            operation,
+            operation.completed_tokens,
+            operation.hash_value,
+            operation.host_indices,
+            0,
+            None,
+            RadixKey(self.tokens),
+        ):
+            return
+        assert self.incoming.keys == [self.hashes[self.expected - 1]]
+        for page, dst in enumerate((self.op.host_indices[::128] // 128).tolist()):
+            for actual, reference in zip(
+                _page_segments(self.kv, self.kv.kv_buffer, dst),
+                _page_segments(self.kv, self.kv_oracle, page),
+            ):
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        for component, (buffer, oracle) in enumerate(
+            zip(self.state.get_hybrid_pool_buffer(), self.state_before)
+        ):
+            oracle[self.incoming.host_indices] = _state_tag(
+                self.rank, component, self.expected
+            )
+            torch.testing.assert_close(buffer.view(torch.uint8), oracle, rtol=0, atol=0)
+        self.published.append(operation.completed_tokens)
+        self.cc.append_host_mem_release(operation.host_indices, [self.incoming])
+        del self.cache.ongoing_prefetch[operation.handle]
+
+    def _restore(self):
+        self.cache._handle_prefetch_result = self._publish
+        if self.case == "cancel_inflight":
+            self.client.mode = self.case
+        self.cc.prefetch_buffer.put(self.op)
+        if self.case == "cancel_inflight":
+            if self.rank == 1:
+                assert self.client.entered.wait(10)
+            dist.barrier()
+            before_available = self.state.available_size()
+            self.cache.release_aborted_request(self.op.handle)
+            _drain(self.cache)
+            assert self.kv.slot_used[self.op.host_indices].all()
+            assert self.state.available_size() == before_available, (
+                "state released before IO completion"
+            )
+            dist.barrier()
+            self.client.release.set()
+        acks = []
+        while True:
+            ack = self.cc.ack_prefetch_queue.get(timeout=10)
+            acks.append(ack)
+            if ack.completed_req:
+                break
+        assert len(acks) == self.expected + 2, (
+            "KV progress, state result and final ACK must all arrive"
+        )
+        for ack in acks:
+            self.cc.ack_prefetch_queue.put(ack)
+        _drain(self.cache, len(acks))
+        assert self.published == (
+            []
+            if self.case in ("evicted_state", "cancel_inflight")
+            else [self.expected * 128]
+        )
+        assert not self.cache.ongoing_prefetch
+
+    def _finish(self):
+        self.kv.free(self.kv_source)
+        self.state.free(self.state_source)
+        self.state.free(self.state_guard)
+        assert int(self.kv.slot_used.sum()) == 0
+        assert self.state.available_size() == self.state.size
+        free = torch.cat([self.state.free_slots, *self.state.release_slots])
+        assert free.unique().numel() == self.state.size, "duplicate state release"
+        assert (
+            self.cc.prefetch_thread.is_alive()
+            and self.cc.prefetch_io_aux_thread.is_alive()
+        )
+        return dict(
+            case=self.case,
+            rank=self.rank,
+            tokens=self.published[0] if self.published else 0,
+            lookup=self.expected * 128,
+            remaining_slots=0,
+        )
+
+    def _close(self):
+        self.client.release.set()
+        HiCacheController._stop_storage_threads(self.cc)
+        self.cc._destroy_sync_groups(self.cc.prefetch_hits_sync_groups)
+        self.cc._destroy_sync_groups(self.cc.prefetch_completion_sync_groups)
+        if self.address is not None:
+            self.client.client.close()
+
+    def run(self):
+        with mock.patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 1):
+            HiCacheController._start_storage_threads(self.cc)
+            try:
+                self._backup()
+                self._query()
+                if self.expected and self.case != "kv_only_rank":
+                    self._prepare_restore()
+                    self._restore()
+                return self._finish()
+            finally:
+                self._close()
+
+
 def _run_case(rank, directory, objects, case, address):
-    cc = _make_controller(rank, objects, "hybrid-" + case, address)
-    kv, state = cc.storage_host_pool, _mamba_pool()
-    cc.mem_pool_host = HostPoolGroup(
-        [
-            *cc.mem_pool_host.entries,
-            PoolEntry(PoolName.MAMBA, state, state.device_pool, lambda layer: layer),
-        ]
-    )
-    cc.extra_host_mem_release_queues = {PoolName.MAMBA: Queue()}
-    cc.storage_backend.register_mem_host_pool_v2(state, PoolName.MAMBA)
-    cache = _cache(cc)
-    cache.tree_core = SimpleNamespace(page_size=128)
-    cache.storage_existence_cache = StorageExistenceCache()
-    tokens = list(range(512))
-    hashes = get_storage_hash_str(tokens, None, page_size=128)
-    client = _FaultClient(cc.storage_backend.store, rank, hashes)
-    cc.storage_backend.store = client
-    legal = _state_sets(case)
-    boundaries = sorted(legal[rank])
-    kv_source = kv.alloc(512)
-    kv.kv_buffer.fill_(rank % 2 + 1)
-    kv_oracle = kv.kv_buffer.clone()
-    # State slots are neither logical token pages nor divisible by DCP.
-    state_guard = state.alloc(3)
-    state_source = state.alloc(len(boundaries))
-    for component, buffer in enumerate(state.get_hybrid_pool_buffer()):
-        for slot, boundary in zip(state_source.tolist(), boundaries):
-            buffer[slot].view(torch.uint8).fill_(_state_tag(rank, component, boundary))
-    client.own(kv, kv_source)
-    if address is None:
-        _own_mamba(client.client, state, state_source.tolist())
-    outgoing = (
-        [
-            PoolTransfer(
-                PoolName.MAMBA,
-                host_indices=state_source,
-                keys=[hashes[p - 1] for p in boundaries],
-                hit_policy=PoolHitPolicy.TRAILING_PAGES,
-            )
-        ]
-        if boundaries
-        else None
-    )
-    # The fixture keeps a separate reference to the seed allocations through
-    # restore, so a destination cannot accidentally reuse a source slot.
-    cache.dec_host_lock_ref = lambda node, indices: None
-
-    with mock.patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 1):
-        HiCacheController._start_storage_threads(cc)
-        try:
-            ident = cc.write_storage(kv_source, tokens, hashes, extra_pools=outgoing)
-            cache.ongoing_backup[ident] = (0, kv_source)
-            _backup_done(cc, cache, 512 if rank < 2 or boundaries else 0)
-            assert sum(key.endswith("_k") for key in client.put_keys) == (
-                4 if rank < 2 else 0
-            )
-            assert sum(not key.endswith("_k") for key in client.put_keys) == 3 * len(
-                boundaries
-            )
-            dist.barrier()
-            incoming = PoolTransfer(
-                PoolName.MAMBA,
-                keys=["__placeholder__"],
-                hit_policy=PoolHitPolicy.TRAILING_PAGES,
-            )
-
-            def remove_state_component():
-                keys, _ = cc.storage_backend._get_hybrid_page_component_keys(
-                    [hashes[3]], incoming
-                )
-                client.remove(cc.storage_backend._tag_keys(keys)[1])
-
-            if case == "missing_component" and rank == 1:
-                remove_state_component()
-            dist.barrier()
-            candidates = [set(pages) for pages in legal]
-            if case == "missing_component":
-                candidates[1].remove(4)
-            expected = max(set.intersection(*candidates), default=0)
-            if case in ("query_cancelled", "query_failure"):
-                expected = 0
-            op = PrefetchOperation(
-                CacheRequestHandle(case, 0), tokens, pool_transfers=[incoming]
-            )
-            if case == "kv_only_rank" and rank == 3:
-                # A rank/stage with no needed state still participates in the
-                # same query collective as ranks with sparse checkpoints.
-                op.pool_transfers = None
-            if case == "query_cancelled" and rank == 1:
-                op.mark_terminate()
-            if case == "query_failure":
-                client.mode = "lookup_exception"
-            cc.prefetch_queue.put(op)
-            assert cc.prefetch_hit_queue.get(timeout=10) is op
-            assert op.storage_hit_count == expected * 128, (
-                case,
-                rank,
-                op.storage_hit_count,
-                expected * 128,
-            )
-            assert op.hash_value == hashes[:expected]
-            published = []
-            if expected and case != "kv_only_rank":
-                if case == "evicted_state" and rank == 1:
-                    remove_state_component()
-                dist.barrier()
-                op.host_indices = kv.alloc(expected * 128)
-                incoming.host_indices = state.alloc(1)
-                client.own(kv, op.host_indices)
-                if address is None:
-                    _own_mamba(client.client, state, incoming.host_indices.tolist())
-                for buffer in state.get_hybrid_pool_buffer():
-                    buffer.view(torch.uint8).fill_(165)
-                state_before = [
-                    b.view(torch.uint8).clone() for b in state.get_hybrid_pool_buffer()
-                ]
-                cache.ongoing_prefetch[op.handle] = _OngoingPrefetch(
-                    0,
-                    RadixKey(tokens),
-                    op.host_indices,
-                    op,
-                    None,
-                    {PoolName.MAMBA: [incoming]},
-                )
-                cc.prefetch_tokens_occupied = len(tokens)
-
-                def publish(operation):
-                    if not cache._check_hybrid_prefetch_result(
-                        op.handle,
-                        operation,
-                        operation.completed_tokens,
-                        operation.hash_value,
-                        operation.host_indices,
-                        0,
-                        None,
-                        RadixKey(tokens),
-                    ):
-                        return
-                    assert incoming.keys == [hashes[expected - 1]]
-                    for page, dst in enumerate(
-                        (op.host_indices[::128] // 128).tolist()
-                    ):
-                        for actual, reference in zip(
-                            _page_segments(kv, kv.kv_buffer, dst),
-                            _page_segments(kv, kv_oracle, page),
-                        ):
-                            torch.testing.assert_close(
-                                actual, reference, rtol=0, atol=0
-                            )
-                    for component, (buffer, oracle) in enumerate(
-                        zip(state.get_hybrid_pool_buffer(), state_before)
-                    ):
-                        oracle[incoming.host_indices] = _state_tag(
-                            rank, component, expected
-                        )
-                        torch.testing.assert_close(
-                            buffer.view(torch.uint8), oracle, rtol=0, atol=0
-                        )
-                    published.append(operation.completed_tokens)
-                    cc.append_host_mem_release(operation.host_indices, [incoming])
-                    del cache.ongoing_prefetch[operation.handle]
-
-                cache._handle_prefetch_result = publish
-                if case == "cancel_inflight":
-                    client.mode = case
-                cc.prefetch_buffer.put(op)
-                if case == "cancel_inflight":
-                    if rank == 1:
-                        assert client.entered.wait(10)
-                    dist.barrier()
-                    before_available = state.available_size()
-                    cache.release_aborted_request(op.handle)
-                    _drain(cache)
-                    assert kv.slot_used[op.host_indices].all()
-                    assert state.available_size() == before_available, (
-                        "state released before IO completion"
-                    )
-                    dist.barrier()
-                    client.release.set()
-                acks = []
-                while True:
-                    ack = cc.ack_prefetch_queue.get(timeout=10)
-                    acks.append(ack)
-                    if ack.completed_req:
-                        break
-                assert len(acks) == expected + 2, (
-                    "KV progress, state result and final ACK must all arrive"
-                )
-                for ack in acks:
-                    cc.ack_prefetch_queue.put(ack)
-                _drain(cache, len(acks))
-                assert published == (
-                    []
-                    if case in ("evicted_state", "cancel_inflight")
-                    else [expected * 128]
-                )
-                assert not cache.ongoing_prefetch
-            kv.free(kv_source)
-            state.free(state_source)
-            state.free(state_guard)
-            assert int(kv.slot_used.sum()) == 0
-            assert state.available_size() == state.size
-            free = torch.cat([state.free_slots, *state.release_slots])
-            assert free.unique().numel() == state.size, "duplicate state release"
-            assert (
-                cc.prefetch_thread.is_alive() and cc.prefetch_io_aux_thread.is_alive()
-            )
-            return dict(
-                case=case,
-                rank=rank,
-                tokens=published[0] if published else 0,
-                lookup=expected * 128,
-                remaining_slots=0,
-            )
-        finally:
-            client.release.set()
-            HiCacheController._stop_storage_threads(cc)
-            cc._destroy_sync_groups(cc.prefetch_hits_sync_groups)
-            cc._destroy_sync_groups(cc.prefetch_completion_sync_groups)
-            if address is not None:
-                client.client.close()
+    return _HybridCase(rank=rank, objects=objects, case=case, address=address).run()
 
 
 def _worker(rank, directory, objects, cases=CASES, address=None):

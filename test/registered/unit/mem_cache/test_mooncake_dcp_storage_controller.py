@@ -311,6 +311,33 @@ def _restore(cc, cache, client, case, tokens, source, expected_lookup, expected_
     )
 
 
+def _exercise_backup_failure(*, cc, cache, client, case, source, hashes, rank):
+    pool = cc.storage_host_pool
+    backup_tokens = list(range(384, 768))
+    backup_hashes = get_storage_hash_str(backup_tokens, None, page_size=128)
+    client.hashes = backup_hashes
+    indices = pool.alloc(384)
+    _copy_source(pool, source, indices)
+    client.own(pool, indices)
+    _backup(cc, cache, indices, backup_tokens, backup_hashes)
+    if case == "backup_delayed" and rank == 1:
+        assert client.entered.wait(10)
+        assert cc.ack_backup_queue.empty()
+        assert pool.slot_used[indices].all()
+        client.release.set()
+    expected = 0 if rank >= 2 else 128 if rank == 1 and case.startswith("put_") else 384
+    _backup_done(cc, cache, expected)
+    client.mode = None
+    # A later backup on the same worker must still finish.
+    indices = pool.alloc(384)
+    _copy_source(pool, source, indices)
+    client.own(pool, indices)
+    _backup(cc, cache, indices, backup_tokens, backup_hashes)
+    _backup_done(cc, cache, 384 if rank < 2 else 0)
+    client.hashes = hashes
+    dist.barrier()
+
+
 def _worker(rank, directory, objects, cases=CASES, address=None):
     torch.set_num_threads(1)
     dist.init_process_group(
@@ -352,37 +379,15 @@ def _worker(rank, directory, objects, cases=CASES, address=None):
                     dist.barrier()
                     client.mode = case
                     if case.startswith("put_") or case == "backup_delayed":
-                        backup_tokens = list(range(384, 768))
-                        backup_hashes = get_storage_hash_str(
-                            backup_tokens, None, page_size=128
+                        _exercise_backup_failure(
+                            cc=cc,
+                            cache=cache,
+                            client=client,
+                            case=case,
+                            source=source,
+                            hashes=hashes,
+                            rank=rank,
                         )
-                        client.hashes = backup_hashes
-                        indices = pool.alloc(384)
-                        _copy_source(pool, source, indices)
-                        client.own(pool, indices)
-                        _backup(cc, cache, indices, backup_tokens, backup_hashes)
-                        if case == "backup_delayed" and rank == 1:
-                            assert client.entered.wait(10)
-                            assert cc.ack_backup_queue.empty()
-                            assert pool.slot_used[indices].all()
-                            client.release.set()
-                        expected = (
-                            0
-                            if rank >= 2
-                            else 128
-                            if rank == 1 and case.startswith("put_")
-                            else 384
-                        )
-                        _backup_done(cc, cache, expected)
-                        client.mode = None
-                        # A later backup on the same worker must still finish.
-                        indices = pool.alloc(384)
-                        _copy_source(pool, source, indices)
-                        client.own(pool, indices)
-                        _backup(cc, cache, indices, backup_tokens, backup_hashes)
-                        _backup_done(cc, cache, 384 if rank < 2 else 0)
-                        client.hashes = hashes
-                        dist.barrier()
                     if case == "missing" and rank == 1:
                         client.remove(
                             f"{cc.storage_backend.config_prefix}_{hashes[1]}_{cc.storage_backend.mla_suffix}_k"
