@@ -54,9 +54,9 @@ class TestHybridL3Restore(CustomTestCase):
     def setUp(self):
         self.addCleanup(reset_context)
 
-    def _fixture(self, directory):
+    def _fixture(self, directory, tree_backend="python"):
         with patch(
-            "test_unified_radix_cache_unittest._TREE_CORE_TEST_BACKEND", "python"
+            "test_unified_radix_cache_unittest._TREE_CORE_TEST_BACKEND", tree_backend
         ):
             cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=64)
         self._init_hicache(
@@ -67,6 +67,68 @@ class TestHybridL3Restore(CustomTestCase):
             storage_extra={"enable_metadata_cache": False},
         )
         return cache, allocator, pool
+
+    def test_chunk_checkpoint_reaches_storage_without_a_later_snapshot(self):
+        """A short final chunk cannot re-donate the preceding chunk's state."""
+        for backend in ("python", "rust"):
+            with (
+                self.subTest(backend=backend),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                page = 128
+                self.cfg = CacheConfig(
+                    page_size=page,
+                    components=(ComponentType.FULL, ComponentType.MAMBA),
+                    enable_mamba_extra_buffer=True,
+                    num_layers=2,
+                    full_attention_layer_ids=(0,),
+                    kv_size=page * 16,
+                    max_context_len=page * 8,
+                )
+                cache, allocator, pool = self._fixture(directory, backend)
+                cache.write_through_threshold = 1
+                tokens = list(range(4 * page + 1))
+                req = self._request(cache, allocator, pool, tokens, "chunked")
+                req.set_extend_range(0, 4 * page)
+                _, depth, expected = self._forward_snapshot(cache, pool, req)
+                self.assertEqual(depth, 4 * page)
+                self._fill_full_kv(
+                    allocator, pool.req_to_token[req.kv.req_pool_idx, :depth], marker=7
+                )
+                cache.cache_unfinished_req(req, chunked=True)
+                self.assertIsNone(req.kv.mamba_last_track_seqlen)
+                # No explicit backup_node/write_storage calls: drive the real
+                # write-through completion path used by the scheduler.
+                cache.writing_check(write_back=True)
+                self._flush_l3_backups(cache)
+                reader, _, _ = self._fixture(directory, backend)
+                handle = CacheRequestHandle("reader", 0)
+                reader.prefetch_from_storage(
+                    handle,
+                    reader.root_node_handle(),
+                    array("q", tokens[:depth]),
+                    None,
+                    None,
+                )
+                self._run_prefetch_to_completion(reader, handle)
+                match = reader.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens[:depth])))
+                )
+                self.assertEqual(match.host_hit_length, depth)
+                slot = reader.tree_core.get_component_host_value(
+                    match.last_host_node, ComponentType.MAMBA
+                )[0]
+                for actual, wanted in zip(
+                    reader.host_pool_group.get_pool(
+                        PoolName.MAMBA
+                    ).get_hybrid_pool_buffer(),
+                    expected,
+                ):
+                    torch.testing.assert_close(
+                        actual[slot, :, 0], wanted.cpu(), rtol=0, atol=0
+                    )
+                reader.cache_controller._stop_storage_threads()
+                cache.cache_controller._stop_storage_threads()
 
     def _cancel_during_state_read(self, cache, tokens, host, available):
         backend = cache.cache_controller.storage_backend

@@ -1229,6 +1229,17 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_params.key = radix_key
         insert_params.value = values
+        if (
+            chunked
+            and insert_params.mamba_value is not None
+            and self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_through"
+        ):
+            # This chunk donates an immutable recurrent checkpoint, not a
+            # partial live state. A short final chunk may never produce another
+            # snapshot, so it cannot trigger a later backup of this node.
+            # Selective write-through still requires an independent reuse.
+            insert_params.chunked = False
         result = self.insert(insert_params)
 
         if result.rotation_tail_declined:
