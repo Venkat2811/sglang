@@ -279,6 +279,42 @@ actual transport; a TCP pass does not qualify RDMA. See Mooncake's
 Feature enablement still requires the composed hybrid and role-local cache
 gates below.
 
+### Kimi DCP4 cold/warm baseline
+
+`test_kimi_linear_dcp_baseline.py` passed 56 requests and 39 numerical checks
+in 137.71 seconds on four B300 GPUs. Set `KIMI_DCP_OUTPUT_DIR` to a new
+directory and optionally `KIMI_DCP_MODEL_PATH` to a local snapshot of
+`moonshotai/Kimi-Linear-48B-A3B-Instruct` revision
+`e1df551a447157d4658b573f9a695d57658590e9`.
+
+The BF16/cutedsl MLA baseline follows the registered DCP4 HiCache fixture:
+64-token physical pages, 256-token logical pages, a2a and replicated Q
+projection. It covers 63/64/65, 255/256/257 and 1023/1024/1025-token prompts,
+two short known-answer needles, multi-turn continuation, forced prefill replay
+and a three-request batch. The candidate enables a 10 GiB HiCache host pool;
+the reference has HiCache disabled. No `max-total-tokens` override is used.
+
+Controls must match the work being compared. Append the reference's first
+generated token to make a terminal KDA checkpoint reusable: prefix matching
+leaves one input token for logits. Compare that warm request against a cold
+request with the same extended input. Seed the same checkpoint-producing
+sequence for the multi-turn reference, and compare batches against batches.
+The initial witnesses violated these requirements; all failed attempts and
+the isolating diagnostics are retained.
+
+All generated IDs matched. The largest absolute logprob difference in the
+matched cache comparisons was 0.109716, below the predeclared 0.20 bound.
+Multi-turn HiCache and ordinary radix reuse matched exactly. Cold full prefill
+versus warm recurrent-state reuse had a 0.271841 maximum logprob difference
+even with HiCache disabled; its KL was 0.008006. Forced replay KL was 0.008390.
+Those different numerical schedules use the registered Kimi fixture's 0.01
+KL criterion. They are not reported as satisfying the absolute 0.20 bound.
+
+Runner SHA256: `621d667d85e6bc95e1160cfeb338a8a282c5db48c579bb1db1441c01c4f94076`.
+This qualifies the bounded model/prefix-continuation baseline. Positive hits
+were device-cache hits; it does not establish forced L2 load-back, hybrid L3
+restore, or live P/D. The hybrid L3 guard stays enabled.
+
 1. **Compose the hybrid restore path.** Drive actual KDA checkpoint capture and
    publication, native storage, common legal boundary selection, radix host
    insertion, GPU load-back and continued generation. Existing byte-copy and
