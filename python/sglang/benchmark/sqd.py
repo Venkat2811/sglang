@@ -8,6 +8,7 @@ generation on pool 0 before each split run. See test/manual/sqd/README.md.
 import argparse
 import dataclasses
 import json
+import math
 import multiprocessing
 import os
 import time
@@ -258,6 +259,7 @@ def worker(role, tp_rank, config, server_args, port_args):
             )
         group.barrier()
     print(f"SQD_WORKER_DONE role={role} rank={tp_rank}", flush=True)
+    transport.close()
     destroy_model_parallel()
     destroy_distributed_environment()
 
@@ -273,7 +275,11 @@ def compare_results(config):
             torch.isfinite(actual["logits"]).all()
             and torch.isfinite(reference["logits"]).all()
         )
-        error = float((actual["logits"] - reference["logits"]).abs().max())
+        error = (
+            float((actual["logits"] - reference["logits"]).abs().max())
+            if finite
+            else None
+        )
         ids_equal = torch.equal(reference["ids"], actual["ids"])
         comparisons.append(
             {
@@ -296,6 +302,7 @@ def compare_results(config):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
+    parser.add_argument("--revision", help="Pin a Hugging Face model revision")
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--dcp-size", type=int, default=1)
     parser.add_argument("--output-tokens", type=int, default=32)
@@ -310,6 +317,10 @@ def main():
         parser.error("DCP must divide TP")
     if config.output_tokens < 2:
         parser.error("At least two output tokens are required to exercise split decode")
+    if config.context_length <= config.output_tokens or config.timeout <= 0:
+        parser.error("Context must exceed output length, and timeout must be positive")
+    if not math.isfinite(config.logit_atol) or config.logit_atol < 0:
+        parser.error("Logit tolerance must be finite and nonnegative")
     if torch.cuda.device_count() < 2 * config.tp_size:
         parser.error("Requires two disjoint GPU groups, each of --tp-size GPUs")
     config.output_dir.mkdir(parents=True, exist_ok=False)
@@ -324,9 +335,17 @@ def main():
             ],
         ]
     )
+    if not config.cases or any(
+        not isinstance(batch, list)
+        or not batch
+        or any(not isinstance(prompt, str) or not prompt.strip() for prompt in batch)
+        for batch in config.cases
+    ):
+        parser.error("Cases must be a nonempty list of nonempty prompt batches")
     max_batch = max(map(len, config.cases))
     args = ServerArgs(
         model_path=config.model_path,
+        revision=config.revision,
         trust_remote_code=True,
         tp_size=config.tp_size,
         dcp_size=config.dcp_size,
@@ -349,6 +368,7 @@ def main():
         json.dumps(
             {
                 "model": config.model_path,
+                "revision": config.revision,
                 "tp_per_pool": config.tp_size,
                 "dcp_per_pool": config.dcp_size,
                 "output_tokens": config.output_tokens,

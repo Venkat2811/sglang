@@ -33,6 +33,10 @@ class PairedTransport:
             self.comm.recv(tensor, self.peer)
         return tensor
 
+    def close(self):
+        torch.cuda.synchronize(self.comm.device)
+        self.comm.nccl.ncclCommDestroy(self.comm.comm)
+
 
 class RemoteMLAAttention(nn.Module):
     """Replaces an MLA module on the KDA/FFN pool; holds no local weights."""
@@ -107,5 +111,5 @@ def transfer_recurrent_state(runner, batch, transport, sender):
         else:
             received = transport.recv(torch.empty_like(tensor[:, indices]))
             tensor[:, indices] = received
-    # Keep temporary transfer buffers alive until all queued copies complete.
+    # Complete the handoff before either pool advances the request.
     torch.cuda.synchronize()

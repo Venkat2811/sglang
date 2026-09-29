@@ -97,6 +97,7 @@ class TestSplitExecution(unittest.TestCase):
             tensor[:, 1] = 17
         send = MemoryTransport()
         transfer_recurrent_state(source, batch([4, 1]), send, sender=True)
+        self.assertEqual(len(send.sent), len(src_cache.conv) + 1)
         transfer_recurrent_state(
             target, batch([2, 5]), MemoryTransport(send.sent), sender=False
         )
@@ -105,6 +106,11 @@ class TestSplitExecution(unittest.TestCase):
             self.assertTrue((tensor[:, 2] == 42).all())
             self.assertTrue((tensor[:, 5] == 17).all())
             self.assertTrue((tensor[:, [0, 1, 3, 4]] == -1).all())
+        incompatible = MemoryTransport()
+        incompatible.group.all_gather_obj = lambda schema: [schema, []]
+        with self.assertRaises(ValueError):
+            transfer_recurrent_state(source, batch([4, 1]), incompatible, sender=True)
+        self.assertEqual(incompatible.sent, [])
 
 
 if __name__ == "__main__":

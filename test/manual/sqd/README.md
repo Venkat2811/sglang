@@ -25,6 +25,7 @@ python test/manual/sqd/test_contract.py
 python test/manual/sqd/test_execution.py
 python -m sglang.benchmark.sqd \
   --model-path moonshotai/Kimi-Linear-48B-A3B-Instruct \
+  --revision e1df551a447157d4658b573f9a695d57658590e9 \
   --tp-size 1 --dcp-size 1 --output-tokens 32 \
   --output-dir /tmp/sqd-tp1-dcp1
 ```
