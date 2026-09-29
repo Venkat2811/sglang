@@ -801,7 +801,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             state_suffix = self.mha_suffix
             if self._dcp_namespace is not None:
                 state_suffix = (
-                    f"{state_suffix}_mamba_v1_{self._mamba_schema_fingerprint}"
+                    f"{self.local_rank}_mamba_v1_{self._mamba_schema_fingerprint}"
                 )
             # Mamba stores one temporal object plus one object per conv state.
             # conv-only models have no ssm state; drop the 0-element temporal
@@ -957,12 +957,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         for transfer in transfers:
             host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
             keys = transfer.keys
-            page_size = (
-                getattr(
-                    host_pool, "logical_page_size", getattr(host_pool, "page_size", 1)
-                )
-                or 1
-            )
+            page_size = host_pool.logical_page_size
             host_indices = transfer.host_indices
             assert len(keys) > 0
             assert len(host_indices) == len(keys) * page_size
@@ -1082,9 +1077,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
-        page_size = getattr(
-            self.mem_pool_host, "logical_page_size", self.mem_pool_host.page_size
-        )
+        page_size = self.mem_pool_host.logical_page_size
         assert len(host_indices) == len(keys) * page_size
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)

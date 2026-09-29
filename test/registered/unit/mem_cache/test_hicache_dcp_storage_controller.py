@@ -3,7 +3,6 @@
 Run: python test/registered/unit/mem_cache/test_hicache_dcp_storage_controller.py -v
 """
 
-import json
 import tempfile
 import threading
 import unittest
@@ -18,7 +17,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, PoolName
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, MLATokenToKVPoolFP4
 from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -265,7 +264,6 @@ class TestDcpStorageController(CustomTestCase):
                     "remaining_slots": int(pool.slot_used.sum()),
                 }
             )
-        print("DCP_BACKUP_REPORT=" + json.dumps(report))
 
     def test_eviction_is_owned_by_both_shard_writers(self):
         controllers = [_controller(rank) for rank in range(4)]
@@ -339,7 +337,9 @@ class TestDcpStorageController(CustomTestCase):
             elif representation == "split":
                 cc.storage_host_pool.layout = "page_first_kv_split"
             elif representation == "scales":
-                cc.storage_host_pool.device_pool.kv_scale_buffer = [torch.zeros(1)]
+                cc.storage_host_pool.device_pool = MLATokenToKVPoolFP4.__new__(
+                    MLATokenToKVPoolFP4
+                )
             elif representation == "packed_primary":
                 cc.storage_host_pool.mtp_draft_device_pools = (
                     cc.storage_host_pool.device_pool,

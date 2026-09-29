@@ -813,12 +813,7 @@ class HiCacheFile(HiCacheStorage):
             keys = transfer.keys or []
             # MLA receives logical DCP indices; recurrent state still uses
             # independent one-slot indices. Each pool defines that boundary.
-            page_size = (
-                getattr(
-                    host_pool, "logical_page_size", getattr(host_pool, "page_size", 1)
-                )
-                or 1
-            )
+            page_size = host_pool.logical_page_size
             expected = len(keys) * page_size
             host_indices = transfer.host_indices
 
