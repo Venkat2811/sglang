@@ -1343,13 +1343,19 @@ def fast_mla_decode_plan(
     q_data_type: torch.dtype,
     kv_data_type: torch.dtype,
 ) -> None:
-    """A faster version of BatchMLAPagedAttentionWrapper::plan,
-    for skipping the stream synchronization in original plan function during
-    cuda graph replaying.
-    """
+    """Plan from host metadata, waiting only for staging memory to become reusable."""
     self._causal = causal
     self._page_size = page_size
     self._sm_scale = sm_scale
+
+    # FlashInfer rewrites a pinned host workspace before copying the plan to
+    # the GPU. A queued replay must finish that copy before we reuse its source.
+    stream = torch.cuda.current_stream(self.device)
+    plan_copy_done = getattr(self, "_sglang_plan_copy_done", None)
+    if plan_copy_done is None:
+        plan_copy_done = self._sglang_plan_copy_done = torch.cuda.Event()
+        plan_copy_done.record(stream)
+    plan_copy_done.synchronize()
 
     try:
         # Standard version with just the required arguments (no use_profiler)
@@ -1366,6 +1372,7 @@ def fast_mla_decode_plan(
         )
     except Exception as e:
         raise RuntimeError(f"Error in alternate MLA plan: {e}")
+    plan_copy_done.record(stream)
 
 
 def fast_mla_prefill_plan(
