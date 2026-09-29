@@ -120,3 +120,69 @@ python -m sglang.benchmark.sqd \
 For the other layouts, change TP/DCP and use a new output directory. The
 TP1/TP2 observations above preceded the validation/teardown changes; the pinned
 revision is the later runtime exercised by both TP4 layouts.
+
+## Warm performance comparison
+
+`benchmark.py` reuses the prototype operators without copying logits to the
+CPU inside the timed loop. Run the correctness checks above first. It measures
+prefill (including the first output token), recurrent-state handoff, and decode
+separately. Two warmups precede five measured repetitions of each fixed batch.
+The parent waits for every worker's CUDA work before stopping the timer.
+
+Use the same image, model revision and dependencies as above, plus
+`nvidia-ml-py` for the whole-GPU NVML energy counter. All GPUs in `--budget-gpus`
+are measured, including idle ones; there is no idle-power subtraction. Host
+CPU energy is excluded. The timing/energy window includes host barrier overhead
+and small counter-read skew, so use sufficiently long decode runs. Do not draw
+energy conclusions from millisecond-scale handoff measurements.
+
+Create identical inputs for the split and full-model runs:
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+cases = [
+    ["Explain why the sky looks blue in a few sentences."],
+    ["The secret code is BLUEBIRD.\n"
+     + "The library holds books about mountains, rivers, astronomy and music.\n" * 600
+     + "Explain the subject matter and name the secret code." for _ in range(4)],
+    ["Explain how a rainbow forms in a few sentences.\n"
+     + "Clouds and sunlight create changing weather.\n" * 120 for _ in range(8)],
+]
+Path("/tmp/perf-cases.json").write_text(json.dumps(cases))
+Path("/tmp/perf-replicas.json").write_text(json.dumps(cases[1:]))
+PY
+MODEL=moonshotai/Kimi-Linear-48B-A3B-Instruct
+COMMON=(--model-path "$MODEL" --revision e1df551a447157d4658b573f9a695d57658590e9
+        --budget-gpus 8 --output-tokens 128 --warmup 2 --repeat 5)
+python test/manual/sqd/benchmark.py "${COMMON[@]}" --mode full \
+  --tp-size 4 --dcp-size 4 --cases /tmp/perf-cases.json --output-dir /tmp/full4
+python test/manual/sqd/benchmark.py "${COMMON[@]}" --mode split \
+  --tp-size 4 --dcp-size 4 --cases /tmp/perf-cases.json --output-dir /tmp/split4
+python test/manual/sqd/benchmark.py "${COMMON[@]}" --mode full \
+  --tp-size 8 --dcp-size 8 --cases /tmp/perf-cases.json --output-dir /tmp/full8
+python test/manual/sqd/benchmark.py "${COMMON[@]}" --mode replicas \
+  --tp-size 4 --dcp-size 4 --cases /tmp/perf-replicas.json --output-dir /tmp/replicas4
+```
+
+The TP4 full-model control isolates split overhead; four of its budgeted GPUs
+are idle. The TP8 control uses the entire GPU budget. Two TP4 replicas divide
+the same total request batch between them, providing a further throughput
+control. Compare against the strongest measured baseline, and repeat in reverse
+order if a result could be explained by drift. All modes use the same eager
+backends and precision. These controls do not establish production HTTP,
+continuous-batching, conventional P/D or graph-enabled performance.
+
+`measurements.json` retains every warmup and measured sample. For 128 output
+steps, decode covers 127 steps: TPOT is decode time / 127, and throughput is
+batch size times 127 / decode time. Report medians and ranges across measured
+repetitions, not service-latency percentiles. Generation continues past EOS,
+so this is fixed-work decode throughput, not useful-response goodput.
+
+Per-trial JSON records greedy IDs, prompt lengths and finite final logits;
+final-trial `.pt` files retain final logits. Compare these after timing against
+the same-layout full-model control; TP8 and replica batching may introduce
+numerical differences. A speed measurement alone is not a correctness result.
+The prototype still allocates full pools on both roles, so these runs cannot
+establish a KV-capacity advantage or a heterogeneous-hardware speedup.
