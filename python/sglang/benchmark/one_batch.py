@@ -311,7 +311,7 @@ class BenchArgs:
         return cls(**result)
 
 
-def load_model(server_args, port_args, gpu_id, tp_rank):
+def load_model(server_args, port_args, gpu_id, tp_rank, *, before_capture=None):
     cfg = resolving_view(server_args)
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
@@ -354,6 +354,8 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
             )
 
             initialize_mamba_selective_state_update_backend(server_args)
+        if before_capture is not None:
+            before_capture(model_runner)
         model_runner.init_cuda_graphs()
         if get_model().is_startup_weight_load_overlap:
             model_runner.finalize_startup_weight_load()

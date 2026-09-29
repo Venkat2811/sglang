@@ -1,7 +1,7 @@
 """Warm fixed-batch SQD timing with matched full-model controls and GPU energy.
 
-This measures model execution, not an HTTP serving system. SQD is eager;
-native controls can also require CUDA graph replay. Run the separate
+This measures model execution, not an HTTP serving system. Both SQD and
+native controls can require CUDA graph replay. Run the separate
 correctness runner first. See README.md for comparison boundaries.
 """
 
@@ -51,7 +51,9 @@ def graph_forward(runner, batch):
     fb = ForwardBatch.init_new(batch, runner, return_hidden_states_before_norm=False)
     output = runner.forward(fb)
     if fb.forward_mode.is_decode() and not output.can_run_graph:
-        raise AssertionError("Native graph control fell back to eager decode")
+        raise AssertionError("Required CUDA graph replay fell back to eager decode")
+    if fb.forward_mode.is_decode():
+        runner.sqd_graph_replays += 1
     return output.logits_output.next_token_logits
 
 
@@ -61,17 +63,19 @@ def run_worker(role, rank, config, args, ports, barrier):
     torch.cuda.set_device(gpu)
     publish(args, role="scheduler", ranks=SpawnRanks(world_rank=rank, gpu_id=gpu))
     configure_logger(args, prefix=f" PERF{role} TP{rank}")
-    wrapped, tokenizer = load_model(args, ports, gpu, rank)
-    runner = wrapped.torch_runner
-    model = runner.model
-    if type(model).__name__ != "KimiLinearForCausalLM":
-        raise ValueError("This benchmark supports Kimi-Linear only")
-    model_forward = graph_forward if config.decode_graphs else forward
-    layer_ids = tuple(
-        i for i in range(len(model.model.layers)) if not model.config.is_kda_layer(i)
-    )
-    transport = service = None
-    if config.mode == "split":
+    transport = service = model = group = None
+    layer_ids = ()
+
+    def prepare_split(runner):
+        nonlocal transport, service, model, group, layer_ids
+        model = runner.model
+        if type(model).__name__ != "KimiLinearForCausalLM":
+            raise ValueError("This benchmark supports Kimi-Linear only")
+        layer_ids = tuple(
+            i
+            for i in range(len(model.model.layers))
+            if not model.config.is_kda_layer(i)
+        )
         group = StatelessProcessGroup.create(
             "127.0.0.1", config.pair_port + rank, role, 2
         )
@@ -84,10 +88,28 @@ def run_worker(role, rank, config, args, ports, barrier):
                 model.config.hidden_size,
                 next(model.parameters()).dtype,
             )
+            runner.model = service
         else:
             for i in layer_ids:
                 model.model.layers[i].self_attn = RemoteMLAAttention(transport)
             torch.cuda.empty_cache()
+
+    # Both peers capture the same batch sizes and NCCL send/receive sequence.
+    # Restore the full model for each prefill; its decode graph keeps the service.
+    wrapped, tokenizer = load_model(
+        args,
+        ports,
+        gpu,
+        rank,
+        before_capture=prepare_split if config.mode == "split" else None,
+    )
+    runner = wrapped.torch_runner
+    runner.sqd_graph_replays = 0
+    if model is None:
+        model = runner.model
+    if type(model).__name__ != "KimiLinearForCausalLM":
+        raise ValueError("This benchmark supports Kimi-Linear only")
+    model_forward = graph_forward if config.decode_graphs else forward
 
     for case, prompts in enumerate(config.cases):
         indices = list(range(len(prompts)))
@@ -142,8 +164,11 @@ def run_worker(role, rank, config, args, ports, barrier):
                     if not service:
                         next_ids = logits.argmax(dim=-1)
                         generated.append(next_ids)
-            if service and service.calls - calls_before != len(layer_ids) * (
-                config.output_tokens - 1
+            if (
+                service
+                and not config.decode_graphs
+                and service.calls - calls_before
+                != len(layer_ids) * (config.output_tokens - 1)
             ):
                 raise AssertionError("Not every MLA layer ran remotely")
             if rank == 0 and not service:
@@ -155,9 +180,14 @@ def run_worker(role, rank, config, args, ports, barrier):
                     "prompt_lengths": list(map(len, tokens)),
                     "ids": torch.stack(generated).cpu().tolist(),
                     "finite_final_logits": bool(torch.isfinite(logits).all()),
-                    "decode_sent_bytes": transport.sent_bytes - bytes_before
-                    if transport
-                    else 0,
+                    # Python counters do not execute during graph replay.
+                    "decode_sent_bytes": (
+                        None
+                        if transport and config.decode_graphs
+                        else transport.sent_bytes - bytes_before
+                        if transport
+                        else 0
+                    ),
                 }
                 stem = f"case-{case}-trial-{trial}-role-{role}"
                 (config.output_dir / f"{stem}.json").write_text(
@@ -170,6 +200,13 @@ def run_worker(role, rank, config, args, ports, barrier):
                     )
                 if not record["finite_final_logits"]:
                     raise AssertionError("Nonfinite logits")
+    (config.output_dir / f"rank-{role}-{rank}.json").write_text(
+        json.dumps({"decode_graph_replays": runner.sqd_graph_replays}) + "\n"
+    )
+    if config.decode_graphs:
+        # Captured NCCL operations retain the communicator until graph release.
+        torch.cuda.synchronize()
+        runner.decode_cuda_graph_runner.backend.cleanup()
     if transport:
         transport.close()
     destroy_model_parallel()
@@ -192,7 +229,7 @@ def main():
     parser.add_argument(
         "--decode-graphs",
         action="store_true",
-        help="Use and require native CUDA graph replay in full/replica controls",
+        help="Use and require CUDA graph replay on every decode step and pool",
     )
     parser.add_argument("--tp-size", type=int, required=True)
     parser.add_argument("--dcp-size", type=int, required=True)
@@ -216,8 +253,6 @@ def main():
         help="Maximum seconds waiting for any phase, including model load",
     )
     config = parser.parse_args()
-    if config.decode_graphs and config.mode == "split":
-        parser.error("The SQD prototype does not support CUDA graph capture")
     pools = 1 if config.mode == "full" else 2
     if config.tp_size < 1 or config.dcp_size < 1 or config.tp_size % config.dcp_size:
         parser.error("DCP must divide TP")
@@ -253,7 +288,11 @@ def main():
     if config.mode == "replicas":
         max_batch = (max_batch + 1) // 2
     capture_bs = sorted(
-        {len(batch[role::pools]) for batch in config.cases for role in range(pools)}
+        {
+            len(batch[role::pools]) if config.mode == "replicas" else len(batch)
+            for batch in config.cases
+            for role in range(pools)
+        }
     )
     args = ServerArgs(
         model_path=config.model_path,
@@ -363,8 +402,9 @@ def main():
                         json.dumps(records, indent=2) + "\n"
                     )
                     print(json.dumps(record), flush=True)
+        deadline = time.monotonic() + 60
         for child in children:
-            child.join(timeout=60)
+            child.join(timeout=max(0, deadline - time.monotonic()))
         if any(child.exitcode != 0 for child in children):
             raise RuntimeError("Benchmark worker failed or did not exit")
     finally:
