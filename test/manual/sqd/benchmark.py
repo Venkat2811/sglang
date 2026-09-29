@@ -1,7 +1,8 @@
 """Warm fixed-batch SQD timing with matched full-model controls and GPU energy.
 
-This measures eager model execution, not an HTTP serving system. Run the
-separate correctness runner first. See README.md for comparison boundaries.
+This measures model execution, not an HTTP serving system. SQD is eager;
+native controls can also require CUDA graph replay. Run the separate
+correctness runner first. See README.md for comparison boundaries.
 """
 
 import argparse
@@ -28,6 +29,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.distributed.utils import StatelessProcessGroup
 from sglang.srt.entrypoints.engine import _set_envs_and_config
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import SpawnRanks, publish
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger
@@ -45,6 +47,14 @@ def phase(barrier):
     barrier.wait()
 
 
+def graph_forward(runner, batch):
+    fb = ForwardBatch.init_new(batch, runner, return_hidden_states_before_norm=False)
+    output = runner.forward(fb)
+    if fb.forward_mode.is_decode() and not output.can_run_graph:
+        raise AssertionError("Native graph control fell back to eager decode")
+    return output.logits_output.next_token_logits
+
+
 @torch.no_grad()
 def run_worker(role, rank, config, args, ports, barrier):
     gpu = role * config.tp_size + rank
@@ -56,6 +66,7 @@ def run_worker(role, rank, config, args, ports, barrier):
     model = runner.model
     if type(model).__name__ != "KimiLinearForCausalLM":
         raise ValueError("This benchmark supports Kimi-Linear only")
+    model_forward = graph_forward if config.decode_graphs else forward
     layer_ids = tuple(
         i for i in range(len(model.model.layers)) if not model.config.is_kda_layer(i)
     )
@@ -103,7 +114,7 @@ def run_worker(role, rank, config, args, ports, barrier):
             generated = []
             with phase(barrier):
                 if config.mode != "split" or role == 0:
-                    logits = forward(runner, batch)
+                    logits = model_forward(runner, batch)
                     next_ids = logits.argmax(dim=-1)
             if transport:
                 with phase(barrier):
@@ -127,7 +138,7 @@ def run_worker(role, rank, config, args, ports, barrier):
                         else:
                             next_ids = transport.recv(torch.empty_like(next_ids))
                     advance(batch, next_ids)
-                    logits = forward(runner, batch)
+                    logits = model_forward(runner, batch)
                     if not service:
                         next_ids = logits.argmax(dim=-1)
                         generated.append(next_ids)
@@ -178,6 +189,11 @@ def main():
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--revision")
     parser.add_argument("--mode", choices=["full", "split", "replicas"], required=True)
+    parser.add_argument(
+        "--decode-graphs",
+        action="store_true",
+        help="Use and require native CUDA graph replay in full/replica controls",
+    )
     parser.add_argument("--tp-size", type=int, required=True)
     parser.add_argument("--dcp-size", type=int, required=True)
     parser.add_argument(
@@ -200,6 +216,8 @@ def main():
         help="Maximum seconds waiting for any phase, including model load",
     )
     config = parser.parse_args()
+    if config.decode_graphs and config.mode == "split":
+        parser.error("The SQD prototype does not support CUDA graph capture")
     pools = 1 if config.mode == "full" else 2
     if config.tp_size < 1 or config.dcp_size < 1 or config.tp_size % config.dcp_size:
         parser.error("DCP must divide TP")
@@ -234,6 +252,9 @@ def main():
     max_batch = max(map(len, config.cases))
     if config.mode == "replicas":
         max_batch = (max_batch + 1) // 2
+    capture_bs = sorted(
+        {len(batch[role::pools]) for batch in config.cases for role in range(pools)}
+    )
     args = ServerArgs(
         model_path=config.model_path,
         revision=config.revision,
@@ -247,7 +268,17 @@ def main():
         mem_fraction_static=0.7,
         disable_overlap_schedule=True,
         disable_radix_cache=True,
-        disable_cuda_graph=True,
+        disable_cuda_graph=not config.decode_graphs,
+        cuda_graph_config={
+            "prefill": {"backend": "disabled"},
+            "decode": {
+                "backend": "full",
+                "max_bs": max_batch,
+                "bs": capture_bs,
+            },
+        }
+        if config.decode_graphs
+        else None,
         attention_backend="flashinfer",
         linear_attn_backend="triton",
         random_seed=42,
