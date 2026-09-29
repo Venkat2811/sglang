@@ -116,7 +116,14 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         override.install()
         self.addCleanup(override.restore)
-        for admission in ("accepted", "declined", "error"):
+        for admission in (
+            "accepted",
+            "declined",
+            "error",
+            "state_full",
+            "state_reclaim",
+            "state_pending",
+        ):
             with self.subTest(admission=admission):
                 req = SimpleNamespace(
                     rid="prefetch-admission",
@@ -125,7 +132,12 @@ class TestDecodeQueueCleanup(CustomTestCase):
                     output_ids=[],
                     finished_reason=None,
                     sampling_params=SimpleNamespace(max_new_tokens=1),
-                    kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=0),
+                    kv=SimpleNamespace(
+                        req_pool_idx=0,
+                        cache_protected_len=0,
+                        holds_mamba=False,
+                        mamba_ping_pong_track_buffer=None,
+                    ),
                     extra_key=None,
                     cache_salt=None,
                 )
@@ -184,6 +196,32 @@ class TestDecodeQueueCleanup(CustomTestCase):
                     ),
                     has_ongoing_prefetch=lambda _: admission == "accepted",
                 )
+                queue.transfer_queue = SimpleNamespace(queue=[])
+                state_free = [1]
+                if admission.startswith("state_"):
+                    queue.req_to_token_pool.mamba_allocator = SimpleNamespace(
+                        available_size=lambda: state_free[0]
+                    )
+                    queue.req_to_token_pool.enable_mamba_extra_buffer = False
+                    queue.tree_cache.supports_mamba = lambda: True
+
+                    def evict(params):
+                        if admission == "state_reclaim":
+                            state_free[0] += params.mamba_num
+
+                    queue.tree_cache.evict_for_alloc = evict
+                    queue.tree_cache.has_ongoing_prefetch = lambda _: True
+                    if admission == "state_pending":
+                        state_free[0] = 2
+                        queue.transfer_queue.queue = [
+                            SimpleNamespace(
+                                prefix_match=DecodePrefixMatch(
+                                    torch.tensor([]), 2, 0, 0
+                                ),
+                                hicache_restore_status=HiCacheRestoreResult.PENDING,
+                                hicache_restored_node=None,
+                            )
+                        ]
                 allocated_prefix = []
                 sent = []
 
@@ -197,13 +235,22 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 queue._pre_alloc = allocate
                 queue._send_kv_metadata = send
                 admitted, failed = queue.pop_preallocated()
-                expected = 6 if admission == "accepted" else 4
+                expected = {
+                    "accepted": 6,
+                    "declined": 4,
+                    "error": 4,
+                    "state_full": 2,
+                    "state_reclaim": 6,
+                    "state_pending": 2,
+                }[admission]
                 self.assertEqual(admitted, [dr])
                 self.assertEqual(failed, [])
                 self.assertEqual(allocated_prefix, [expected])
                 self.assertEqual(sent, [(list(range(10 + expected, 18)), expected)])
                 self.assertEqual(req.kv.cache_protected_len, expected)
                 self.assertEqual(pm.decode_prefix_len, expected)
+                if expected == 2:
+                    queue.tree_cache.prefetch_from_storage.assert_not_called()
 
     def test_mamba_preallocation_reserves_tracking_slots_before_prefix_match(self):
         # (free, extra buffer, lazy, overlap slots, holds state, holds buffer,
@@ -261,6 +308,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
                     enable_priority_scheduling=False,
                     enable_hisparse=False,
                     enable_lora=False,
+                    enable_decode_hicache=False,
                 )
                 queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
                     available_size=lambda: 1
@@ -327,6 +375,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue.req_to_token_pool = SimpleNamespace(mamba_allocator=None)
 
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []
@@ -386,6 +435,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue.req_to_token_pool = SimpleNamespace(mamba_allocator=None)
 
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []

@@ -1228,6 +1228,28 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for decode_req, prefill_dp_rank in resolved:
             decode_req.kv_receiver.init(prefill_dp_rank)
 
+    def _mamba_preallocation_fits(self, req: Req, reserved_states: int) -> bool:
+        pool = self.req_to_token_pool
+        allocator = getattr(pool, "mamba_allocator", None)
+        if allocator is None:
+            return True
+        needed = reserved_states + int(not req.kv.holds_mamba)
+        if (
+            pool.enable_mamba_extra_buffer
+            and req.kv.mamba_ping_pong_track_buffer is None
+        ):
+            needed += (
+                1
+                if pool.enable_mamba_extra_buffer_lazy
+                else pool.mamba_ping_pong_track_buffer_size
+            )
+        shortfall = needed - allocator.available_size()
+        if shortfall > 0 and self.tree_cache.supports_mamba():
+            self.tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=0, mamba_num=shortfall)
+            )
+        return allocator.available_size() >= needed
+
     def pop_preallocated(
         self,
         rids_to_check: Optional[List[str]] = None,
@@ -1277,6 +1299,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 retractable_tokens=retractable_tokens, count_retracted=True
             )
         reserved_restore_tokens = self._hicache_pending_restore_tokens()
+        reserved_restore_states = 0
+        if (
+            getattr(self.req_to_token_pool, "mamba_allocator", None) is not None
+            and self.scheduler.enable_decode_hicache
+        ):
+            reserved_restore_states = sum(
+                dr.prefix_match.needs_local_restore
+                for dr in self.transfer_queue.queue
+                if dr.prefix_match is not None
+                and dr.hicache_restore_status == HiCacheRestoreResult.PENDING
+                and dr.hicache_restored_node is None
+            )
         full_allocatable_tokens -= reserved_restore_tokens
         # Sort by priority before any index-based bookkeeping so that both the
         # abort-scan loop and the preallocation loop operate on the same order.
@@ -1375,29 +1409,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            # Reserve running state and tracking buffers before prefix matching
-            # can COW a cached Mamba state. A nonempty pool alone is insufficient.
-            mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
-            if mamba_allocator is not None:
-                pool = self.req_to_token_pool
-                kv = decode_req.req.kv
-                needed = int(not kv.holds_mamba)
-                if (
-                    pool.enable_mamba_extra_buffer
-                    and kv.mamba_ping_pong_track_buffer is None
-                ):
-                    needed += (
-                        1
-                        if pool.enable_mamba_extra_buffer_lazy
-                        else pool.mamba_ping_pong_track_buffer_size
-                    )
-                shortfall = needed - mamba_allocator.available_size()
-                if shortfall > 0 and self.tree_cache.supports_mamba():
-                    self.tree_cache.evict_for_alloc(
-                        EvictParams(num_tokens=0, mamba_num=shortfall)
-                    )
-                if mamba_allocator.available_size() < needed:
-                    break
+            if not self._mamba_preallocation_fits(
+                decode_req.req, reserved_restore_states
+            ):
+                break
 
             if hisparse_req_budget <= 0:
                 break
@@ -1413,6 +1428,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if use_decode_radix_cache:
                 # Match prefix against decode's radix cache.
                 prefix_match = self._match_prefix_and_lock(decode_req.req)
+                # A hybrid restore materializes one canonical checkpoint in
+                # addition to the request's live state received from prefill.
+                # If it cannot fit, promise only the device-resident prefix.
+                if (
+                    prefix_match.needs_local_restore
+                    and not self._mamba_preallocation_fits(
+                        decode_req.req, reserved_restore_states + 1
+                    )
+                ):
+                    prefix_match.l2_host_hit_length = 0
+                    prefix_match.l3_storage_hit_length = 0
                 prefix_indices = prefix_match.prefix_indices
                 # prefix_len: tokens already on device (L1 hit).
                 # total_prefix_len: full prefix promised to prefill
@@ -1548,6 +1574,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # This accounts for page rounding and newly locked evictable cache.
             if prefix_match is not None:
                 reserved_restore_tokens += prefix_match.restore_token_count
+                reserved_restore_states += int(prefix_match.needs_local_restore)
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens,
                 count_retracted=True,
