@@ -156,9 +156,12 @@ class KimiMoE(nn.Module):
             and get_is_capture_mode()
         ):
             current_stream = torch.cuda.current_stream()
+            # Routed experts may overwrite their input in place. Finish the
+            # shared-input copy before allowing that side stream to proceed.
+            shared_input = hidden_states.clone()
             self.alt_stream.wait_stream(current_stream)
 
-            shared_output = self.shared_experts(hidden_states.clone())
+            shared_output = self.shared_experts(shared_input)
 
             with torch.cuda.stream(self.alt_stream):
                 router_logits, _ = self.gate(hidden_states)
