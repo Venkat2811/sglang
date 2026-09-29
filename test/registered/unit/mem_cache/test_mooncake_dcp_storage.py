@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from test_hicache_file_state import _mamba_pool
 
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -20,7 +21,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -223,40 +223,6 @@ def _io(store, config, pages, api, write):
     return method([PoolTransfer(PoolName.KV, host_indices=indices, keys=KEYS)])[
         PoolName.KV
     ]
-
-
-def _mamba_pool(
-    *,
-    capacity=8,
-    layers=2,
-    layout="page_first",
-    temporal_dtype=torch.float32,
-    temporal_shape=(2, 3),
-    conv_dtype=torch.bfloat16,
-    conv_shapes=((3, 4), (3, 4)),
-):
-    device = SimpleNamespace(
-        size=capacity,
-        device="cpu",
-        num_mamba_layers=layers,
-        mamba_cache=SimpleNamespace(
-            temporal=torch.empty(
-                (layers, capacity, *temporal_shape), dtype=temporal_dtype
-            ),
-            conv=[
-                torch.empty((layers, capacity, *shape), dtype=conv_dtype)
-                for shape in conv_shapes
-            ],
-        ),
-    )
-    return MambaPoolHost(
-        device,
-        host_to_device_ratio=2,
-        host_size=0,
-        pin_memory=False,
-        device="cpu",
-        layout=layout,
-    )
 
 
 def _own_mamba(client, pool, slots):

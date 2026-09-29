@@ -164,162 +164,89 @@ class TestDcpStorageIdentity(CustomTestCase):
 
     def test_file_state_shards_do_not_alias_mla_replicas(self):
         """TP0 and TP2 share MLA, but must restore different recurrent state."""
-        for dcp in (1, 2):
-            with self.subTest(dcp=dcp):
-                for layout in ("page_first", "page_first_direct"):
-                    expected = {}
-                    for rank in (0, 2):
-                        state = _mamba_pool(layout=layout)
-                        for i, buffer in enumerate(state.get_hybrid_pool_buffer()):
-                            buffer.view(torch.uint8).fill_(17 + rank + i)
-                        expected[rank] = state.get_data_page(3).clone()
-                        writer = self.backend(make_config(rank, dcp_size=dcp))
-                        writer.register_mem_host_pool_v2(state, PoolName.MAMBA)
-                        transfer = PoolTransfer(
-                            PoolName.MAMBA,
-                            host_indices=torch.tensor([3]),
-                            keys=["checkpoint"],
-                        )
-                        self.assertEqual(
-                            writer.batch_set_v2([transfer])[PoolName.MAMBA], [True]
-                        )
-
-                    for rank in (0, 2):
-                        # Cache capacity is not part of a compatible tensor schema.
-                        state = _mamba_pool(capacity=16, layout=layout)
-                        reader = self.backend(make_config(rank, dcp_size=dcp))
-                        reader.register_mem_host_pool_v2(state, PoolName.MAMBA)
-                        transfer = PoolTransfer(
-                            PoolName.MAMBA,
-                            host_indices=torch.tensor([7]),
-                            keys=["checkpoint"],
-                        )
-                        self.assertEqual(
-                            reader.batch_get_v2([transfer])[PoolName.MAMBA], [True]
-                        )
-                        torch.testing.assert_close(
-                            state.get_data_page(7), expected[rank]
-                        )
-
-    def test_file_state_schema_mismatch_is_a_miss_without_mutation(self):
-        """Equal-sized KDA tensors can have incompatible shapes or precision."""
-        writer = self.backend(make_config())
-        state = _mamba_pool()
-        writer.register_mem_host_pool_v2(state, PoolName.MAMBA)
-        transfer = PoolTransfer(
-            PoolName.MAMBA, host_indices=torch.tensor([3]), keys=["checkpoint"]
-        )
-        self.assertEqual(writer.batch_set_v2([transfer])[PoolName.MAMBA], [True])
-        reader = self.backend(make_config())
-        for changes in (
-            {"temporal_shape": (3, 2)},
-            {"temporal_dtype": torch.bfloat16, "temporal_shape": (2, 6)},
-            {"conv_dtype": torch.float16},
-            {"conv_shapes": ((2, 6), (3, 4))},
-            {"layers": 1, "temporal_shape": (4, 3), "conv_shapes": ((6, 4), (6, 4))},
-            {"layout": "page_first_direct"},
-        ):
-            with self.subTest(changes=changes):
-                target = _mamba_pool(**changes)
-                reader.register_mem_host_pool_v2(target, PoolName.MAMBA)
-                for buffer in target.get_hybrid_pool_buffer():
-                    buffer.view(torch.uint8).fill_(165)
-                before = target.get_data_page(3).clone()
+        for layout in ("page_first", "page_first_direct"):
+            expected = {}
+            for rank in (0, 2):
+                state = _mamba_pool(layout=layout)
+                for i, buffer in enumerate(state.get_hybrid_pool_buffer()):
+                    buffer.view(torch.uint8).fill_(17 + rank + i)
+                expected[rank] = state.get_data_page(3).clone()
+                writer = self.backend(make_config(rank, dcp_size=2))
+                writer.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                transfer = PoolTransfer(
+                    PoolName.MAMBA,
+                    host_indices=torch.tensor([3]),
+                    keys=["checkpoint"],
+                )
                 self.assertEqual(
-                    reader.batch_get_v2([transfer])[PoolName.MAMBA], [False]
+                    writer.batch_set_v2([transfer])[PoolName.MAMBA], [True]
                 )
-                torch.testing.assert_close(target.get_data_page(3), before)
 
-    def test_file_state_registration_preserves_v1_objects(self):
-        """Replacing a pool must preserve compatible files and reject stale schemas."""
-        backend = self.backend(make_config(tp_rank=2))
-        source = _mamba_pool()
-        backend.register_mem_host_pool_v2(source, PoolName.MAMBA)
-        for buf in source.get_hybrid_pool_buffer():
-            buf.view(torch.uint8).fill_(37)
-        expected = source.get_data_page(3).clone()
-        transfer = PoolTransfer(
-            PoolName.MAMBA, host_indices=torch.tensor([3]), keys=["checkpoint"]
-        )
-        self.assertEqual(backend.batch_set_v2([transfer])[PoolName.MAMBA], [True])
-        self.assertEqual(
-            [p.name for p in Path(self.directory).glob("*.bin")],
-            [
-                "checkpoint.mamba_tp2_v1_"
-                "8bdd9a3cc60b2b24ade8e664a2a7c00d308e05e1266716c2d7740755939d9384"
-                "_test-model_tp4_dcp0_2_page128_bfloat16_page_first_mamba_tp2_4.bin"
-            ],
-        )
-        for changes, hit in (
-            ({"temporal_shape": (3, 2)}, False),
-            ({"capacity": 16}, True),
-        ):
-            with self.subTest(changes=changes):
-                target = _mamba_pool(**changes)
-                backend.register_mem_host_pool_v2(target, PoolName.MAMBA)
-                for buf in target.get_hybrid_pool_buffer():
-                    buf.view(torch.uint8).fill_(165)
-                before = target.get_data_page(3).clone()
+            for rank in (0, 2):
+                # Cache capacity is not part of a compatible tensor schema.
+                state = _mamba_pool(capacity=16, layout=layout)
+                reader = self.backend(make_config(rank, dcp_size=2))
+                reader.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                transfer = PoolTransfer(
+                    PoolName.MAMBA,
+                    host_indices=torch.tensor([7]),
+                    keys=["checkpoint"],
+                )
                 self.assertEqual(
-                    backend.batch_get_v2([transfer])[PoolName.MAMBA], [hit]
+                    reader.batch_get_v2([transfer])[PoolName.MAMBA], [True]
                 )
-                torch.testing.assert_close(
-                    target.get_data_page(3), expected if hit else before, rtol=0, atol=0
-                )
+                torch.testing.assert_close(state.get_data_page(7), expected[rank])
 
     def test_bounded_mla_replica_can_write_and_evict_only_its_state(self):
         """An MLA replica still owns its TP-sharded recurrent checkpoint."""
-        for dcp in (1, 2):
-            for model in ("bounded/model", "模型" * 70):
-                with self.subTest(dcp=dcp, model=model):
-                    state = _mamba_pool()
-                    size = state.get_data_page(3).nbytes
-                    config = make_config(
-                        dcp_size=dcp,
-                        model_name=model,
-                        extra_config=dict(
-                            max_size=size,
-                            min_free_space=0,
-                            eviction_ratio=1.0,
-                            enable_metadata_cache=False,
-                        ),
+        for model in ("bounded/model", "模型" * 70):
+            with self.subTest(model=model):
+                state = _mamba_pool()
+                size = state.get_data_page(3).nbytes
+                config = make_config(
+                    dcp_size=2,
+                    model_name=model,
+                    extra_config=dict(
+                        max_size=size,
+                        min_free_space=0,
+                        eviction_ratio=1.0,
+                        enable_metadata_cache=False,
+                    ),
+                )
+                owner = self.backend(config)
+                self.assertTrue(owner.set("kv", torch.ones(size, dtype=torch.uint8)))
+                replica_config = replace(config, tp_rank=2)
+                replica = self.backend(replica_config)
+                replica.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                self.assertFalse(replica.set("unowned-kv", torch.ones(1)))
+                for key in ("old", "new"):
+                    transfer = PoolTransfer(
+                        PoolName.MAMBA,
+                        host_indices=torch.tensor([3]),
+                        keys=[key],
                     )
-                    owner = self.backend(config)
-                    self.assertTrue(
-                        owner.set("kv", torch.ones(size, dtype=torch.uint8))
-                    )
-                    replica_config = replace(config, tp_rank=2)
-                    replica = self.backend(replica_config)
-                    replica.register_mem_host_pool_v2(state, PoolName.MAMBA)
-                    self.assertFalse(replica.set("unowned-kv", torch.ones(1)))
-                    for key in ("old", "new"):
-                        transfer = PoolTransfer(
-                            PoolName.MAMBA,
-                            host_indices=torch.tensor([3]),
-                            keys=[key],
-                        )
-                        self.assertEqual(
-                            replica.batch_set_v2([transfer]), {PoolName.MAMBA: [True]}
-                        )
-                    self.assertFalse(
-                        replica.exists(replica._log_key(PoolName.MAMBA, "old"))
-                    )
-                    self.assertTrue(owner.exists("kv"))
-                    # Fresh scans must not adopt another rank's files.
-                    fresh = self.backend(replica_config)
-                    fresh.register_mem_host_pool_v2(state, PoolName.MAMBA)
-                    self.assertTrue(fresh.exists(fresh._log_key(PoolName.MAMBA, "new")))
-                    self.assertTrue(owner.exists("kv"))
-                    self.assertEqual(fresh._evictor._total_bytes, size)
-                    # The primary writer shares one cap across its KV and state,
-                    # without adopting a replica's independently owned state.
-                    owner.register_mem_host_pool_v2(state, PoolName.MAMBA)
                     self.assertEqual(
-                        owner.batch_set_v2([transfer]), {PoolName.MAMBA: [True]}
+                        replica.batch_set_v2([transfer]), {PoolName.MAMBA: [True]}
                     )
-                    self.assertFalse(owner.exists("kv"))
-                    self.assertTrue(fresh.exists(fresh._log_key(PoolName.MAMBA, "new")))
-                    self.assertEqual(owner._evictor._total_bytes, size)
+                self.assertFalse(
+                    replica.exists(replica._log_key(PoolName.MAMBA, "old"))
+                )
+                self.assertTrue(owner.exists("kv"))
+                # Fresh scans must not adopt another rank's files.
+                fresh = self.backend(replica_config)
+                fresh.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                self.assertTrue(fresh.exists(fresh._log_key(PoolName.MAMBA, "new")))
+                self.assertTrue(owner.exists("kv"))
+                self.assertEqual(fresh._evictor._total_bytes, size)
+                # The primary writer shares one cap across its KV and state,
+                # without adopting a replica's independently owned state.
+                owner.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                self.assertEqual(
+                    owner.batch_set_v2([transfer]), {PoolName.MAMBA: [True]}
+                )
+                self.assertFalse(owner.exists("kv"))
+                self.assertTrue(fresh.exists(fresh._log_key(PoolName.MAMBA, "new")))
+                self.assertEqual(owner._evictor._total_bytes, size)
 
     def test_long_model_identity_restores_kv_and_state_from_fresh_backend(self):
         """Snapshot paths plus state fingerprints exceeded NAME_MAX in Kimi serving."""
