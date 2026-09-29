@@ -195,3 +195,33 @@ the same-layout full-model control; TP8 and replica batching may introduce
 numerical differences. A speed measurement alone is not a correctness result.
 The prototype still allocates full pools on both roles, so these runs cannot
 establish a KV-capacity advantage or a heterogeneous-hardware speedup.
+
+Measured latency, throughput, energy and their qualification limits are in
+[PERFORMANCE.md](PERFORMANCE.md). No repeatable gain is established.
+
+### Native CUDA graph control
+
+The pinned graph controls have unresolved graph/eager logit differences under
+identical prefixes. Treat their timings as provisional until that discrepancy
+is isolated; graph replay and coherent text alone are insufficient validation.
+
+Also measure native decode with graphs before describing an eager SQD result
+as an improvement over optimized SGLang. The graph control requires replay on
+every decode step and fails on eager fallback. SQD graph capture is unsupported
+and explicitly rejected. With the same `COMMON` array and cases from above:
+
+```bash
+git fetch --depth 1 origin b41c578785ab035d284ed7ba52e34ed60cea63af
+git checkout --detach FETCH_HEAD
+python test/manual/sqd/benchmark.py "${COMMON[@]}" --mode full --decode-graphs \
+  --tp-size 4 --dcp-size 4 --cases /tmp/perf-cases.json --output-dir /tmp/full4-graphs
+python test/manual/sqd/benchmark.py "${COMMON[@]}" --mode full --decode-graphs \
+  --tp-size 8 --dcp-size 8 --cases /tmp/perf-cases.json --output-dir /tmp/full8-graphs
+python test/manual/sqd/benchmark.py "${COMMON[@]}" --mode replicas --decode-graphs \
+  --tp-size 4 --dcp-size 4 --cases /tmp/perf-replicas.json --output-dir /tmp/replicas4-graphs
+```
+
+Prefill remains eager. These are model-runner controls with the same greedy
+argmax, not a fully tuned HTTP server. Short graph-enabled decode intervals can
+make energy readings coarse; preserve their ranges and avoid precise energy
+claims from them.
