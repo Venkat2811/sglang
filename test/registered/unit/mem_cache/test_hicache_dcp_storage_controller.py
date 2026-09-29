@@ -324,7 +324,14 @@ class TestDcpStorageController(CustomTestCase):
         self.assertEqual(len(set(keys)), 2)
 
     def test_runtime_attach_rejects_incomplete_file_payloads(self):
-        for representation in ("dummy", "split", "scales", "extra_pool"):
+        for representation in (
+            "dummy",
+            "split",
+            "scales",
+            "packed_primary",
+            "packed_entry",
+            "extra_pool",
+        ):
             cc = _controller(0, dtype=torch.float16)
             if representation == "dummy":
                 cc.storage_host_pool.kv_buffer = None
@@ -332,6 +339,24 @@ class TestDcpStorageController(CustomTestCase):
                 cc.storage_host_pool.layout = "page_first_kv_split"
             elif representation == "scales":
                 cc.storage_host_pool.device_pool.kv_scale_buffer = [torch.zeros(1)]
+            elif representation == "packed_primary":
+                cc.storage_host_pool.mtp_draft_device_pools = (
+                    cc.storage_host_pool.device_pool,
+                )
+            elif representation == "packed_entry":
+                host = cc.storage_host_pool
+                cc.mem_pool_host = HostPoolGroup(
+                    [
+                        PoolEntry(
+                            PoolName.KV,
+                            host,
+                            host.device_pool,
+                            lambda layer: layer,
+                            is_primary_index_anchor=True,
+                            packed_draft_device_pools=(host.device_pool,),
+                        )
+                    ]
+                )
             else:
                 host = cc.storage_host_pool
                 cc.mem_pool_host = HostPoolGroup(
