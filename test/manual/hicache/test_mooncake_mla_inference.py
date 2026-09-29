@@ -32,6 +32,7 @@ from pathlib import Path
 
 import requests
 import torch
+from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoTokenizer
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
@@ -147,11 +148,17 @@ class TestMooncakeMlaInference(CustomTestCase):
         def save():
             report_path.write_text(json.dumps(report, indent=2))
 
+        # Pin tokenizer fixups to the same revision, even in an empty HF cache.
+        tokenizer_path = snapshot_download(
+            MODEL, revision=REVISION, allow_patterns=["*.json", "*.py", "*.model"]
+        )
         port = find_available_port(31000)
         url = f"http://127.0.0.1:{port}"
         common = [
             "--revision",
             REVISION,
+            "--tokenizer-path",
+            tokenizer_path,
             "--trust-remote-code",
             "--host",
             "127.0.0.1",

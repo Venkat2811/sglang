@@ -25,6 +25,7 @@ from pathlib import Path
 
 import requests
 import torch
+from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoTokenizer
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
@@ -76,6 +77,10 @@ class TestHiCacheSsdPressure(CustomTestCase):
             text=True,
         )
         self.assertNotIn("tmpfs", filesystem)
+        # Pin tokenizer fixups to the same revision, even in an empty HF cache.
+        tokenizer_path = snapshot_download(
+            MODEL, revision=REVISION, allow_patterns=["*.json", "*.py", "*.model"]
+        )
         tokenizer = AutoTokenizer.from_pretrained(MODEL, revision=REVISION)
         config = AutoConfig.from_pretrained(MODEL, revision=REVISION)
         object_bytes = (
@@ -165,6 +170,8 @@ class TestHiCacheSsdPressure(CustomTestCase):
         common = [
             "--revision",
             REVISION,
+            "--tokenizer-path",
+            tokenizer_path,
             "--trust-remote-code",
             "--tp-size",
             str(tp),
