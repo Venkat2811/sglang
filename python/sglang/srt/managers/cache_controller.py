@@ -639,11 +639,14 @@ class HiCacheController:
                 # to this fraction, and the tree's write flush gate yields
                 # to live fetch demand (the write fraction is a floor).
                 self.prefetch_capacity_limit = int(
-                    HICACHE_LOAD_POOL_USAGE_FRACTION * self.mem_pool_host.size
+                    HICACHE_LOAD_POOL_USAGE_FRACTION * self.mem_pool_host.logical_size
                 )
             else:
                 # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
-                self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
+                # Budgets count logical slots, like prefetch occupancy and the allocator.
+                self.prefetch_capacity_limit = int(
+                    0.5 * self.mem_pool_host.logical_size
+                )
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
@@ -1266,7 +1269,7 @@ class HiCacheController:
             # state mutates only at scheduler-thread lockstep points, so this
             # stays TP-deterministic. Write staging is the write budget's
             # usage; charging it here would park hits behind its storage drain.
-            used = self.mem_pool_host.size - self.mem_pool_host.available_size()
+            used = self.mem_pool_host.logical_size - self.mem_pool_host.available_size()
             if self.host_write_staged_tokens_fn is not None:
                 used -= self.host_write_staged_tokens_fn()
             return max(0, used) >= self.prefetch_capacity_limit

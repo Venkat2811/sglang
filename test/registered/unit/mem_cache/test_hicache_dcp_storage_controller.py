@@ -58,6 +58,7 @@ def _controller(
     dtype=torch.bfloat16,
     parallel=None,
     storage_factory=None,
+    host_to_device_ratio=2,
 ):
     # GPU allocation and process-group creation are outside this component test.
     device = SimpleNamespace(
@@ -78,7 +79,7 @@ def _controller(
     )
     host = MLATokenToKVPoolHost(
         device,
-        host_to_device_ratio=2,
+        host_to_device_ratio=host_to_device_ratio,
         host_size=0,
         page_size=64 * dcp_size,
         layout="page_first",
@@ -380,6 +381,43 @@ class TestDcpStorageController(CustomTestCase):
             ):
                 cc.attach_storage_backend("file")
             cc._stop_storage_threads.assert_not_called()
+
+    def test_prefetch_budget_counts_logical_dcp_slots(self):
+        # Prefetch occupancy and the host allocator count widened logical slots.
+        for dcp_size in (1, 4):
+            for mode in ("cache", "buffer_only"):
+                cc = _controller(0, dcp_size=dcp_size, host_to_device_ratio=6)
+                cc.host_memory_mode = mode
+                cc.host_write_staged_tokens_fn = None
+                cc._stop_storage_threads = mock.Mock()
+                cc._start_storage_threads = mock.Mock()
+                cc._create_sync_groups = mock.Mock(return_value=[])
+                with (
+                    self.subTest(dcp_size=dcp_size, mode=mode),
+                    mock.patch(
+                        "sglang.srt.managers.cache_controller.get_parallel",
+                        return_value=_parallel(0, dcp_size),
+                    ),
+                    mock.patch(
+                        "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
+                        return_value=False,
+                    ),
+                    mock.patch("sglang.srt.runtime_context.get_server_args"),
+                    mock.patch(
+                        "sglang.srt.arg_groups.hicache_hook.validate_hicache_dcp_storage"
+                    ),
+                ):
+                    cc.attach_storage_backend("file")
+                    host = cc.mem_pool_host
+                    pages = host.logical_size // host.logical_page_size
+                    if mode == "cache":
+                        cc.prefetch_tokens_occupied = host.logical_size // 4
+                        self.assertFalse(cc.prefetch_rate_limited())
+                    else:
+                        # 23 of 25 pages (92%) exceeds the 90% load share.
+                        self.assertEqual(pages, 25)
+                        host.alloc(23 * host.logical_page_size)
+                        self.assertTrue(cc.prefetch_rate_limited())
 
     def test_runtime_attach_rejects_unsupported_pool_before_side_effects(self):
         cc = HiCacheController.__new__(HiCacheController)

@@ -173,13 +173,12 @@ class TestDcpStorageGuards(CustomTestCase):
             dict(hicache_write_policy="write_through_selective"),
             dict(hicache_storage_prefetch_policy="best_effort"),
             dict(hicache_storage_prefetch_policy="timeout"),
-            dict(hicache_host_memory_mode="buffer_only"),
             dict(pp_size=2),
             dict(dp_size=2),
             dict(attn_cp_size=2),
             dict(dp_size=2, enable_dp_attention=True),
-            dict(speculative_algorithm="DSPARK"),
             dict(disaggregation_mode="prefill"),
+            dict(disaggregation_mode="decode"),
         )
         with mock.patch(
             "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
@@ -200,12 +199,120 @@ class TestDcpStorageGuards(CustomTestCase):
                 dict(enable_hisparse=True),
                 dict(enable_lmcache=True),
                 dict(speculative_algorithm="EAGLE"),
+                dict(speculative_algorithm="DSPARK"),
+                # Buffer-mode staging budgets count physical host rows.
+                dict(hicache_host_memory_mode="buffer_only"),
             ):
                 with (
                     self.subTest(options=options),
                     self.assertRaises(NotImplementedError),
                 ):
                     resolve_hicache_dcp_compatibility(_args(**options))
+
+    def test_dspark_without_storage_keeps_dcp_host_cache_support(self):
+        with mock.patch(
+            "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
+        ):
+            resolve_hicache_dcp_compatibility(
+                _args(speculative_algorithm="DSPARK", hicache_storage_backend=None)
+            )
+
+    def test_decode_offload_cannot_bypass_guard_without_hicache(self):
+        with (
+            mock.patch(
+                "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
+            ),
+            self.assertRaisesRegex(NotImplementedError, "decode offload"),
+        ):
+            resolve_hicache_dcp_compatibility(
+                _args(
+                    enable_hierarchical_cache=False,
+                    disaggregation_mode="decode",
+                    disaggregation_decode_enable_offload_kvcache=True,
+                )
+            )
+
+    def test_decode_runtime_uses_effective_prefetch_policy(self):
+        for attached in (False, True):
+            for startup, current, requested, accepted in (
+                ("wait_complete", "wait_complete", "best_effort", False),
+                ("wait_complete", "wait_complete", "timeout", False),
+                ("wait_complete", "timeout", None, False),
+                ("timeout", "timeout", "wait_complete", True),
+                ("timeout", "wait_complete", None, True),
+            ):
+                controller = SimpleNamespace(
+                    storage_backend_type="file",
+                    write_policy="write_back",
+                    attach_storage_backend=mock.Mock(),
+                    mem_pool_host=SimpleNamespace(entries=[]),
+                )
+                cache = SimpleNamespace(
+                    cache_controller=controller,
+                    enable_storage=attached,
+                    prefetch_stop_policy=current,
+                    write_through_threshold=2,
+                    is_write_back=True,
+                    sliding_window_size=None,
+                    _enable_metrics_flag=False,
+                    extra_metric_labels=None,
+                )
+                attachment = StorageAttachment(cache)
+                with (
+                    self.subTest(
+                        attached=attached, current=current, requested=requested
+                    ),
+                    mock.patch(
+                        "sglang.srt.runtime_context.get_parallel",
+                        return_value=SimpleNamespace(attn_dcp_size=2),
+                    ),
+                    mock.patch(
+                        "sglang.srt.runtime_context.get_server_args",
+                        return_value=_args(
+                            disaggregation_mode="decode",
+                            hicache_storage_prefetch_policy=startup,
+                        ),
+                    ),
+                    mock.patch(
+                        "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                        return_value=True,
+                    ),
+                    mock.patch.object(attachment, "apply_runtime_config"),
+                ):
+                    ok, reason = attachment.attach(
+                        "file",
+                        hicache_storage_prefetch_policy=requested,
+                        hicache_write_policy="write_through",
+                    )
+                    self.assertEqual(ok, accepted, reason)
+                    if accepted:
+                        self.assertEqual(cache.prefetch_stop_policy, "wait_complete")
+                    else:
+                        self.assertIn("wait_complete", reason)
+                        self.assertEqual(cache.prefetch_stop_policy, current)
+                        self.assertEqual(controller.write_policy, "write_back")
+                        self.assertEqual(cache.write_through_threshold, 2)
+                        self.assertTrue(cache.is_write_back)
+                        controller.attach_storage_backend.assert_not_called()
+
+    def test_decode_storage_keeps_promised_prefetches_complete(self):
+        # Decode promises the probed L3 span to prefill before the read runs;
+        # early-stopping policies turn a short read into an aborted request.
+        with mock.patch(
+            "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
+        ):
+            for options in (
+                dict(hicache_storage_prefetch_policy="best_effort"),
+                dict(hicache_storage_prefetch_policy="timeout"),
+                dict(disaggregation_decode_enable_offload_kvcache=True),
+            ):
+                with (
+                    self.subTest(options=options),
+                    self.assertRaises(NotImplementedError),
+                ):
+                    validate_hicache_dcp_storage(
+                        _args(disaggregation_mode="decode", **options)
+                    )
 
     def test_runtime_rejection_has_no_side_effects(self):
         for attached in (False, True):
@@ -251,12 +358,24 @@ class TestDcpStorageGuards(CustomTestCase):
                 self.assertTrue(cache.is_write_back)
                 self.assertEqual(cache.enable_storage, attached)
 
-    def test_runtime_policy_updates_use_existing_validation(self):
+    def test_rejected_pool_attach_restores_policies(self):
+        def reject(**_):
+            raise NotImplementedError(
+                "HiCache L3 with DCP requires one materialized MLA host pool."
+            )
+
         cache = SimpleNamespace(
-            cache_controller=SimpleNamespace(storage_backend_type="file"),
-            enable_storage=True,
+            cache_controller=SimpleNamespace(
+                write_policy="write_back",
+                attach_storage_backend=reject,
+                mem_pool_host=SimpleNamespace(entries=None),
+            ),
+            enable_storage=False,
+            prefetch_stop_policy="timeout",
+            write_through_threshold=2,
+            is_write_back=True,
+            sliding_window_size=None,
         )
-        attachment = StorageAttachment(cache)
         with (
             mock.patch(
                 "sglang.srt.runtime_context.get_parallel",
@@ -269,34 +388,17 @@ class TestDcpStorageGuards(CustomTestCase):
                 "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
             ),
         ):
-            for write in ("write_back", "write_through", "write_through_selective"):
-                for prefetch in ("best_effort", "timeout", "wait_complete"):
-                    with self.subTest(write=write, prefetch=prefetch):
-                        ok, reason = attachment.attach(
-                            "file",
-                            hicache_write_policy=write,
-                            hicache_storage_prefetch_policy=prefetch,
-                        )
-                        self.assertTrue(ok, reason)
-                        self.assertEqual(cache.prefetch_stop_policy, prefetch)
-                        self.assertEqual(cache.cache_controller.write_policy, write)
-                        self.assertEqual(cache.is_write_back, write == "write_back")
-                        self.assertEqual(
-                            cache.write_through_threshold,
-                            1 if write == "write_through" else 2,
-                        )
-            ok, _ = attachment.attach(
+            ok, reason = StorageAttachment(cache).attach(
                 "file",
-                hicache_storage_prefetch_policy="best_effort",
-                hicache_write_policy="invalid",
+                hicache_storage_prefetch_policy="wait_complete",
+                hicache_write_policy="write_through",
             )
-            self.assertFalse(ok)
-            self.assertEqual(cache.prefetch_stop_policy, "wait_complete")
-            self.assertEqual(
-                cache.cache_controller.write_policy, "write_through_selective"
-            )
-            self.assertEqual(cache.write_through_threshold, 2)
-            self.assertFalse(cache.is_write_back)
+        self.assertFalse(ok)
+        self.assertIn("one materialized MLA host pool", reason)
+        self.assertEqual(cache.prefetch_stop_policy, "timeout")
+        self.assertEqual(cache.cache_controller.write_policy, "write_back")
+        self.assertEqual(cache.write_through_threshold, 2)
+        self.assertTrue(cache.is_write_back)
 
 
 if __name__ == "__main__":
