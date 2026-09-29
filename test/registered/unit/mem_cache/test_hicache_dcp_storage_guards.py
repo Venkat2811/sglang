@@ -388,17 +388,23 @@ class TestDcpStorageGuards(CustomTestCase):
                 "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
             ),
         ):
-            ok, reason = StorageAttachment(cache).attach(
-                "file",
-                hicache_storage_prefetch_policy="wait_complete",
-                hicache_write_policy="write_through",
-            )
-        self.assertFalse(ok)
-        self.assertIn("one materialized MLA host pool", reason)
-        self.assertEqual(cache.prefetch_stop_policy, "timeout")
-        self.assertEqual(cache.cache_controller.write_policy, "write_back")
-        self.assertEqual(cache.write_through_threshold, 2)
-        self.assertTrue(cache.is_write_back)
+            for config, error in (
+                (None, "one materialized MLA host pool"),
+                ("{", "Failed to parse"),
+            ):
+                with self.subTest(config=config):
+                    ok, reason = StorageAttachment(cache).attach(
+                        "file",
+                        storage_backend_extra_config_json=config,
+                        hicache_storage_prefetch_policy="wait_complete",
+                        hicache_write_policy="write_through",
+                    )
+                    self.assertFalse(ok)
+                    self.assertIn(error, reason)
+                    self.assertEqual(cache.prefetch_stop_policy, "timeout")
+                    self.assertEqual(cache.cache_controller.write_policy, "write_back")
+                    self.assertEqual(cache.write_through_threshold, 2)
+                    self.assertTrue(cache.is_write_back)
 
 
 if __name__ == "__main__":

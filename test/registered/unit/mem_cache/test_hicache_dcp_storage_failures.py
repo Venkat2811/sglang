@@ -31,6 +31,19 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
+CASES = (
+    "healthy",
+    "missing",
+    "evicted_after_lookup",
+    "short_read_after_lookup",
+    "backup_delayed",
+    "best_effort",
+    "timeout",
+    "best_effort_partial",
+    "timeout_partial",
+    "timeout_not_expired",
+)
+
 
 def _drain(cache, prefetch=0, backup=0):
     cache._drain_storage_control_queues_impl(
@@ -151,6 +164,17 @@ def _run_failure_case(*, rank, directory, case):
         if rank == 1 and case == "missing":
             bad_path.unlink()
         dist.barrier()
+        partial = case.endswith("_partial")
+        entered, release = threading.Event(), threading.Event()
+        original_get = cc.page_get_func
+
+        def controlled_read(operation, keys, *args):
+            if partial and rank == 1 and keys == [hashes[1]]:
+                entered.set()
+                assert release.wait(10)
+            return original_get(operation, keys, *args)
+
+        cc.page_get_func = controlled_read
         # One page per batch checks every ACK when a shard disappears
         # after lookup, including batches after the first missing page.
         with mock.patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 1):
@@ -164,21 +188,43 @@ def _run_failure_case(*, rank, directory, case):
                 assert op.storage_hit_count == expected_lookup
                 if case == "evicted_after_lookup" and rank == 1:
                     bad_path.unlink()
+                if case == "short_read_after_lookup" and rank == 1:
+                    bad_path.write_bytes(b"truncated")
                 dist.barrier()
                 op.host_indices = pool.alloc(op.storage_hit_count)
                 cache.ongoing_prefetch[op.handle] = SimpleNamespace(operation=op)
+                cache.prefetch_stop_policy = (
+                    "best_effort"
+                    if case.startswith("best_effort")
+                    else "timeout"
+                    if case.startswith("timeout")
+                    else "wait_complete"
+                )
+                cache.pp_rank = 0
+                # Only one rank's deadline expires; all ranks must stop together.
+                cache.prefetch_timeout_base = (
+                    0 if rank == 1 and case != "timeout_not_expired" else 3600
+                )
+                cache.prefetch_timeout_per_page = 0
+                cache._all_reduce = lambda tensor, reduce_op: dist.all_reduce(
+                    tensor, op=reduce_op
+                )
                 if case in ("best_effort", "timeout"):
-                    cache.prefetch_stop_policy = case
-                    cache.pp_rank = 0
-                    cache.prefetch_timeout_base = 0
-                    cache.prefetch_timeout_per_page = 0
-                    cache._all_reduce = lambda tensor, reduce_op: dist.all_reduce(
-                        tensor, op=reduce_op
-                    )
                     assert cache._can_terminate_prefetch(op)
                     cc.terminate_prefetch(op)
+                elif not partial:
+                    assert not cache._can_terminate_prefetch(op)
                 cc.prefetch_buffer.put(op)
                 acks = []
+                if partial:
+                    first = cc.ack_prefetch_queue.get(timeout=20)
+                    assert first.completed_tokens == 128
+                    acks.append(first)
+                    if rank == 1:
+                        assert entered.wait(10)
+                    assert cache._can_terminate_prefetch(op)
+                    cc.terminate_prefetch(op)
+                    release.set()
                 while True:
                     ack = cc.ack_prefetch_queue.get(timeout=20)
                     acks.append(ack)
@@ -187,7 +233,13 @@ def _run_failure_case(*, rank, directory, case):
                 for ack in acks:
                     cc.ack_prefetch_queue.put(ack)
                 _drain(cache, prefetch=len(acks))
-                expected = 128 if case in ("missing", "evicted_after_lookup") else 384
+                expected = (
+                    128
+                    if partial
+                    or case
+                    in ("missing", "evicted_after_lookup", "short_read_after_lookup")
+                    else 384
+                )
                 if case in ("best_effort", "timeout"):
                     expected = 0
                 assert op.completed_tokens == expected, (
@@ -197,6 +249,7 @@ def _run_failure_case(*, rank, directory, case):
                 )
                 assert len(acks) == expected_lookup // 128 + 1
                 assert int(pool.slot_used.sum()) == 0
+                assert cc.prefetch_io_aux_thread.is_alive()
 
                 # A delayed shard writer must retain its host allocation
                 # until its write finishes, while replicas can acknowledge.
@@ -212,6 +265,7 @@ def _run_failure_case(*, rank, directory, case):
                     )
                 )
             finally:
+                release.set()
                 HiCacheController._stop_storage_threads(cc)
                 cc._destroy_sync_groups(cc.prefetch_hits_sync_groups)
                 cc._destroy_sync_groups(cc.prefetch_completion_sync_groups)
@@ -229,16 +283,8 @@ def _worker(rank, directory):
         timeout=timedelta(seconds=30),
     )
     reports = []
-    cases = (
-        "healthy",
-        "missing",
-        "evicted_after_lookup",
-        "backup_delayed",
-        "best_effort",
-        "timeout",
-    )
     try:
-        for case in cases:
+        for case in CASES:
             reports.append(_run_failure_case(rank=rank, directory=directory, case=case))
         Path(directory, f"rank-{rank}.json").write_text(json.dumps(reports))
     finally:
@@ -262,12 +308,11 @@ class TestDcpStorageFailures(CustomTestCase):
                 json.loads(Path(directory, f"rank-{rank}.json").read_text())
                 for rank in range(4)
             ]
-            self.assertTrue(all(len(rank) == 6 for rank in reports))
-            for case_index in range(6):
+            self.assertTrue(all(len(rank) == len(CASES) for rank in reports))
+            for case_index in range(len(CASES)):
                 rows = [rank[case_index] for rank in reports]
                 self.assertEqual(len({row["tokens"] for row in rows}), 1)
                 self.assertTrue(all(row["remaining_slots"] == 0 for row in rows))
-                print("DCP_FAILURE_REPORT=" + json.dumps(rows))
 
 
 if __name__ == "__main__":

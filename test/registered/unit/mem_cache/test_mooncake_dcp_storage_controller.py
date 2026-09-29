@@ -466,7 +466,6 @@ def run_workers(directory, objects, cases=CASES, address=None, worker=_worker):
     for rows in zip(*reports):
         assert len({row["tokens"] for row in rows}) == 1, rows
         assert all(row["remaining_slots"] == 0 for row in rows)
-        print("MOONCAKE_CONTROLLER_REPORT=" + json.dumps(rows), flush=True)
     return reports
 
 
