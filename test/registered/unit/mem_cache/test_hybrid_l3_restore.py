@@ -14,7 +14,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import test_mamba_checkpoint_publication as publication
 import torch
 from parameterized import parameterized
 from test_unified_radix_cache_unittest import (
@@ -27,8 +26,12 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCacheTransferMixin,
     DecodePrefixMatch,
 )
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, MatchPrefixParams
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    DecLockRefParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
@@ -43,8 +46,6 @@ register_cuda_ci(est_time=35, stage="base-b", runner_config="1-gpu-small")
 @unittest.skipUnless(torch.cuda.is_available(), "requires real GPU host transfers")
 class TestHybridL3Restore(CustomTestCase):
     # Reuse fixture mechanics, without inheriting the unrelated full tree suite.
-    _request = publication.TestMambaCheckpointPublication._request
-    _forward_snapshot = publication.TestMambaCheckpointPublication._forward_snapshot
     _init_hicache = UnifiedRadixCacheSuite._init_hicache
     _backup_node = UnifiedRadixCacheSuite._backup_node
     _path_chain = UnifiedRadixCacheSuite._path_chain
@@ -59,6 +60,51 @@ class TestHybridL3Restore(CustomTestCase):
 
     def setUp(self):
         self.addCleanup(reset_context)
+
+    def _request(self, cache, allocator, pool, tokens, rid):
+        req = Req(
+            rid=rid,
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=32),
+        )
+        pool.alloc([req])
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(tokens))
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = len(tokens)
+        req.last_node = cache.root_node_handle()
+        req.lock_receipt = DecLockRefParams()
+        indices = allocator.alloc(len(tokens))
+        self.assertIsNotNone(indices)
+        pool.write((req.kv.req_pool_idx, slice(0, len(tokens))), indices)
+        return req
+
+    def _forward_snapshot(self, cache, pool, req):
+        batch = ScheduleBatch(reqs=[req])
+        batch.tree_cache = cache
+        batch.req_to_token_pool = pool
+        batch.model_config = SimpleNamespace(
+            hf_text_config=SimpleNamespace(mamba_chunk_size=64)
+        )
+        with patch(
+            "sglang.srt.managers.schedule_batch.get_parallel",
+            return_value=SimpleNamespace(dcp_enabled=True),
+        ):
+            entry = batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
+        self.assertTrue(entry.track_mask)
+        depth = req.kv.mamba_last_track_seqlen
+        # Independent prefix-dependent byte oracle at the forward boundary.
+        signature = sum(req.origin_input_ids[:depth]) % 16000
+        expected = []
+        for component, buffer in enumerate(
+            (pool.mamba_pool.mamba_cache.temporal, *pool.mamba_pool.mamba_cache.conv)
+        ):
+            value = buffer[:, entry.track_index]
+            words = torch.arange(value.numel(), dtype=torch.int32).reshape(value.shape)
+            value.copy_(words + signature + component * 31)
+            expected.append(value.clone())
+        return entry.track_index, depth, expected
 
     def _fixture(self, directory, tree_backend="python"):
         with patch(
