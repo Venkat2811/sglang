@@ -529,7 +529,11 @@ class HiCacheController:
             "HiCache L3 with DCP requires one materialized MLA host pool "
             "and at most one materialized Mamba state pool."
         )
-        if not isinstance(primary, MLATokenToKVPoolHost) or primary.kv_buffer is None:
+        if (
+            not isinstance(primary, MLATokenToKVPoolHost)
+            or primary.kv_buffer is None
+            or primary.mtp_draft_device_pools
+        ):
             raise NotImplementedError(message)
         if primary.layout not in ("layer_first", "page_first", "page_first_direct"):
             raise NotImplementedError(
@@ -543,9 +547,7 @@ class HiCacheController:
             return
         if len(entries) not in (1, 2):
             raise NotImplementedError(message)
-        if len(entries) > 1 and any(
-            entry.packed_draft_device_pools for entry in entries
-        ):
+        if any(entry.packed_draft_device_pools for entry in entries):
             raise NotImplementedError(message)
         seen = set()
         for entry in entries:
