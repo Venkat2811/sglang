@@ -6,10 +6,10 @@ second pool receives request-owned KDA state and runs KDA, FFNs and sampling.
 Each MLA decode layer executes on the first pool through paired NCCL calls.
 The second pool's MLA modules are replaced, so they cannot silently run locally.
 
-Both pools use the same TP/DCP layout and a fixed batch in eager mode. The
-runner does not implement an HTTP service, dynamic admission, cancellation,
-speculation, CUDA graphs, cross-layout transfer, multi-node launch or Kimi-K3
-AttnRes. These are later integration steps, not supported configurations.
+Both pools use the same TP/DCP layout and a fixed batch. The correctness
+runner is eager; the timing harness also supports coordinated decode graphs.
+The runner does not implement an HTTP service, dynamic admission, cancellation,
+speculation, cross-layout transfer, multi-node launch or Kimi-K3 AttnRes. These are later integration steps, not supported configurations.
 It allocates normal SGLang pools on both sides; unused decoder KV allocation
 has not been removed. Do not use this prototype to claim memory savings.
 
@@ -142,6 +142,7 @@ Create identical inputs for the split and full-model runs:
 git fetch --depth 1 origin 2fafcbbaf48203bf8d1c6d7a2c148929dcbba6a2
 git checkout --detach FETCH_HEAD
 python -m pip install 'nvidia-ml-py==13.610.43'
+export OMP_NUM_THREADS=4 NCCL_DMABUF_ENABLE=1 NCCL_IB_DISABLE=1
 python - <<'PY'
 import json
 from pathlib import Path
@@ -199,29 +200,106 @@ establish a KV-capacity advantage or a heterogeneous-hardware speedup.
 Measured latency, throughput, energy and their qualification limits are in
 [PERFORMANCE.md](PERFORMANCE.md). No repeatable gain is established.
 
-### Native CUDA graph control
+### Coordinated decode graphs
 
-The pinned graph controls have unresolved graph/eager logit differences under
-identical prefixes. Treat their timings as provisional until that discrepancy
-is isolated; graph replay and coherent text alone are insufficient validation.
-
-Also measure native decode with graphs before describing an eager SQD result
-as an improvement over optimized SGLang. The graph control requires replay on
-every decode step and fails on eager fallback. SQD graph capture is unsupported
-and explicitly rejected. With the same `COMMON` array and cases from above:
+Use the graph implementation and its two stream-lifetime fixes together:
 
 ```bash
-git fetch --depth 1 origin b41c578785ab035d284ed7ba52e34ed60cea63af
+git fetch --depth 1 origin f8e9773f2fa471fa4bfa5f4566f32994961e0e0a
 git checkout --detach FETCH_HEAD
+python -m pip install 'parameterized==0.9.0'
+python test/registered/attention/unittests/mla/test_flashinfer_plan_lifetime.py
+python test/registered/moe/test_kimi_linear_stream_order.py
 python test/manual/sqd/benchmark.py "${COMMON[@]}" --mode full --decode-graphs \
   --tp-size 4 --dcp-size 4 --cases /tmp/perf-cases.json --output-dir /tmp/full4-graphs
-python test/manual/sqd/benchmark.py "${COMMON[@]}" --mode full --decode-graphs \
-  --tp-size 8 --dcp-size 8 --cases /tmp/perf-cases.json --output-dir /tmp/full8-graphs
+python test/manual/sqd/benchmark.py "${COMMON[@]}" --mode split --decode-graphs \
+  --tp-size 4 --dcp-size 4 --cases /tmp/perf-cases.json --output-dir /tmp/split4-graphs
 python test/manual/sqd/benchmark.py "${COMMON[@]}" --mode replicas --decode-graphs \
   --tp-size 4 --dcp-size 4 --cases /tmp/perf-replicas.json --output-dir /tmp/replicas4-graphs
 ```
 
-Prefill remains eager. These are model-runner controls with the same greedy
-argmax, not a fully tuned HTTP server. Short graph-enabled decode intervals can
-make energy readings coarse; preserve their ranges and avoid precise energy
-claims from them.
+Replay is required on every decode step of every pool; eager fallback fails.
+`rank-*.json` records replay counts. Captured calls do not increment Python
+transport counters, so `decode_sent_bytes` is unavailable for split graphs.
+Graphs are released before NCCL communicators at shutdown. Prefill remains
+eager. Compare generated IDs and saved logits against the same-layout native
+control after timing; successful replay alone does not establish correctness.
+
+These are model-runner measurements with greedy argmax and disabled radix
+caching. They do not qualify HTTP serving, Rust TreeCore, speculation or
+heterogeneous layouts. Short decode intervals make NVML energy readings
+coarse; retain all samples and avoid precise energy claims from them.
+
+### Bounded longer-context check
+
+At the graph revision above, generate B1/32K, B4/32K and B1/128K inputs,
+retaining the original short B1 control. These are repetitive retrieval and
+explanation prompts, not a representative quality benchmark.
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+unit = ("A library lends books and records each return. Readers can reserve "
+        "a title and receive a notice when it is available. ")
+def prompt(n, topic):
+    return ("The project code is BLUEBIRD. Read these notes.\n" + unit * n
+            + "\nThe project code is BLUEBIRD. State that code, then explain "
+            + topic + " in several paragraphs, at least 250 words.")
+topics = ["book lending", "library membership", "book reservations", "a library catalog"]
+cases = json.loads(Path("/tmp/perf-cases.json").read_text())[:1] + [
+    [prompt(1422, topics[0])],
+    [prompt(1422, topic) for topic in topics],
+    [prompt(5696, "how libraries serve a community")],
+]
+Path("/tmp/bounded-cases.json").write_text(json.dumps(cases))
+Path("/tmp/bounded-replicas.json").write_text(json.dumps([cases[2]]))
+PY
+BOUNDED=(--model-path "$MODEL" --revision e1df551a447157d4658b573f9a695d57658590e9
+         --budget-gpus 4 --context-length 147456 --output-tokens 128
+         --warmup 2 --repeat 3 --decode-graphs)
+python test/manual/sqd/benchmark.py "${BOUNDED[@]}" --mode full \
+  --tp-size 2 --dcp-size 2 --cases /tmp/bounded-cases.json --output-dir /tmp/bounded-full2
+python test/manual/sqd/benchmark.py "${BOUNDED[@]}" --mode split \
+  --tp-size 2 --dcp-size 2 --cases /tmp/bounded-cases.json --output-dir /tmp/bounded-split2
+python test/manual/sqd/benchmark.py "${BOUNDED[@]}" --mode full \
+  --tp-size 4 --dcp-size 4 --cases /tmp/bounded-cases.json --output-dir /tmp/bounded-full4
+python test/manual/sqd/benchmark.py "${BOUNDED[@]}" --mode replicas \
+  --tp-size 2 --dcp-size 2 --cases /tmp/bounded-replicas.json --output-dir /tmp/bounded-replicas2
+```
+
+The pinned tokenizer produces 29, 32752, 32752–32753 and 131059 input
+tokens respectively. Compare the matched TP2 outputs after timing:
+
+```bash
+python - /tmp/bounded-full2 /tmp/bounded-split2 <<'PY'
+import json
+import sys
+from pathlib import Path
+import torch
+native, split = map(Path, sys.argv[1:])
+count = len(json.loads((native / "launch.json").read_text())["cases"])
+for case in range(count):
+    ref = json.loads(next(native.glob(f"case-{case}-trial-2-role-*.json")).read_text())
+    for folder in (native, split):
+        for path in folder.glob(f"case-{case}-trial-*-role-*.json"):
+            result = json.loads(path.read_text())
+            assert result["finite_final_logits"] and result["ids"] == ref["ids"], path
+        scores = torch.load(next(folder.glob(f"case-{case}-role-*-final.pt")),
+                            map_location="cpu", weights_only=True)
+        assert torch.isfinite(scores).all()
+        if folder == native:
+            expected = scores
+        else:
+            error = (scores.float() - expected.float()).abs().max().item()
+            assert error <= 0.05, error
+            print(f"case {case}: all trial IDs equal; final logit max error {error}")
+PY
+```
+
+This checks every generated ID and the saved final full-vocabulary logits;
+it does not compare every intermediate logit. Different TP or replica batch
+layouts are performance controls, not exact-output references. An eager
+control uses the same arguments without `--decode-graphs` and a fresh output
+directory. Keep warmups, failed attempts and independent-launch results
+separate from measured-trial aggregates.
