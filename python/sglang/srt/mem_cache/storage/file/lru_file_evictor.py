@@ -330,9 +330,10 @@ class LRUFileEvictor:
                 st = os.stat(fp)
             except OSError:
                 continue
-            if stem not in self._lru:
-                entries.append((st.st_mtime, stem, st.st_size))
+            entries.append((st.st_mtime, stem, st.st_size))
         entries.sort(key=lambda e: e[0])  # oldest first
+        self._lru.clear()
+        self._total_bytes = 0
         for _, stem, size in entries:
             self._lru[stem] = size
             self._total_bytes += size

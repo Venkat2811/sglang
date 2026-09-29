@@ -522,6 +522,7 @@ class HiCacheController:
     def _validate_dcp_storage_pools(
         primary: HostKVCache, entries: Optional[List[PoolEntry]]
     ):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolFP4
         from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
         from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
@@ -539,7 +540,7 @@ class HiCacheController:
             raise NotImplementedError(
                 "HiCache L3 with DCP requires a generic MLA storage-page layout."
             )
-        if getattr(primary.device_pool, "kv_scale_buffer", None) is not None:
+        if isinstance(primary.device_pool, MLATokenToKVPoolFP4):
             raise NotImplementedError(
                 "HiCache L3 with DCP cannot store separate KV scale buffers."
             )

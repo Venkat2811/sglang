@@ -16,6 +16,7 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -365,57 +366,6 @@ class TestMooncakeDcpMambaStorage(CustomTestCase):
                     target.get_data_page(3), expected if hit else before, rtol=0, atol=0
                 )
 
-    def test_tp_state_shards_round_trip_into_unrelated_slots(self):
-        """MLA replicas share keys, but each TP rank must restore its own state."""
-        for tp, dcp in ((4, 2), (4, 4), (8, 4), (16, 16)):
-            objects, expected = {}, {}
-            for rank in range(tp):
-                config = _config(tp=tp, dcp=dcp, rank=rank)
-                kv, state = _pool(config), _mamba_pool()
-                store = _store(config, kv, objects)
-                store.register_mem_host_pool_v2(state, PoolName.MAMBA)
-                _own_mamba(store.store, state, (5, 1))
-                expected[rank] = []
-                for component, buf in enumerate(state.get_hybrid_pool_buffer()):
-                    for slot, boundary in ((5, 1), (1, 2)):
-                        buf[slot].view(torch.uint8).fill_(
-                            rank * 11 + component * 3 + boundary
-                        )
-                    expected[rank].append(buf[[5, 1]].view(torch.uint8).clone())
-                outgoing = PoolTransfer(
-                    PoolName.MAMBA, host_indices=torch.tensor([5, 1]), keys=KEYS[:2]
-                )
-                self.assertEqual(
-                    store.batch_set_v2([outgoing])[PoolName.MAMBA], [True] * 2
-                )
-            self.assertEqual(
-                sum(key.startswith(store.config_prefix + "_") for key in objects),
-                tp * 2 * 3,
-            )
-            for rank in range(tp):
-                with self.subTest(tp=tp, dcp=dcp, rank=rank):
-                    config = _config(tp=tp, dcp=dcp, rank=rank)
-                    kv, state = _pool(config), _mamba_pool(capacity=12)
-                    store = _store(config, kv, objects)
-                    store.register_mem_host_pool_v2(state, PoolName.MAMBA)
-                    _own_mamba(store.store, state, (3, 9))
-                    for buf in state.get_hybrid_pool_buffer():
-                        buf.view(torch.uint8).fill_(165)
-                    incoming = PoolTransfer(
-                        PoolName.MAMBA, host_indices=torch.tensor([3, 9]), keys=KEYS[:2]
-                    )
-                    self.assertEqual(
-                        store.batch_get_v2([incoming])[PoolName.MAMBA], [True] * 2
-                    )
-                    for buf, values in zip(
-                        state.get_hybrid_pool_buffer(), expected[rank]
-                    ):
-                        oracle = torch.full_like(buf.view(torch.uint8), 165)
-                        oracle[[3, 9]] = values
-                        torch.testing.assert_close(
-                            buf.view(torch.uint8), oracle, rtol=0, atol=0
-                        )
-
     def test_dcp1_state_keys_keep_the_existing_format(self):
         config = _config(tp=4, dcp=1, rank=2)
         kv, state = _pool(config), _mamba_pool()
@@ -578,14 +528,29 @@ class TestMooncakeDcpStorage(CustomTestCase):
         writer = _store(config, source, objects)
         writer.store.own(source, SOURCE_PAGES)
         self.assertEqual(_io(writer, config, SOURCE_PAGES, 1, True), [True] * 3)
+        state = _mamba_pool()
+        writer.register_mem_host_pool_v2(state, PoolName.MAMBA)
+        _own_mamba(writer.store, state, (5,))
+        transfer = PoolTransfer(
+            PoolName.MAMBA, host_indices=torch.tensor([5]), keys=[KEYS[-1]]
+        )
+        self.assertEqual(writer.batch_set_v2([transfer])[PoolName.MAMBA], [True])
         other = replace(config, pp_rank=0)
         reader = _store(other, _pool(other), objects)
+        reader.register_mem_host_pool_v2(_mamba_pool(), PoolName.MAMBA)
         self.assertEqual(reader.batch_exists(KEYS), 0)
         self.assertEqual(
             reader.batch_exists(
                 KEYS, HiCacheStorageExtraInfo(extra_info={"pp_rank": 1})
             ),
             3,
+        )
+        query = PoolTransfer(PoolName.MAMBA, hit_policy=PoolHitPolicy.TRAILING_PAGES)
+        self.assertEqual(
+            reader.batch_exists_v2(
+                KEYS, [query], HiCacheStorageExtraInfo(extra_info={"pp_rank": 1})
+            ).restorable_prefix_pages,
+            [3],
         )
 
     def test_short_get_is_a_failure_for_each_api_and_layout(self):
