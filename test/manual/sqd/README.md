@@ -139,16 +139,24 @@ energy conclusions from millisecond-scale handoff measurements.
 Create identical inputs for the split and full-model runs:
 
 ```bash
+git fetch --depth 1 origin 2fafcbbaf48203bf8d1c6d7a2c148929dcbba6a2
+git checkout --detach FETCH_HEAD
+python -m pip install 'nvidia-ml-py==13.610.43'
 python - <<'PY'
 import json
 from pathlib import Path
 cases = [
-    ["Explain why the sky looks blue in a few sentences."],
+    ["Explain why the sky looks blue. Write a detailed educational explanation "
+     "of at least 500 words, with examples."],
     ["The secret code is BLUEBIRD.\n"
      + "The library holds books about mountains, rivers, astronomy and music.\n" * 600
-     + "Explain the subject matter and name the secret code." for _ in range(4)],
-    ["Explain how a rainbow forms in a few sentences.\n"
-     + "Clouds and sunlight create changing weather.\n" * 120 for _ in range(8)],
+     + "Name the secret code, then write at least 500 words about " + topic + "."
+     for topic in ["how mountains form", "the water cycle", "how stars form",
+                   "the physics of musical instruments"]],
+    ["Background:\n" + "Clouds and sunlight create changing weather.\n" * 120
+     + "Write a detailed explanation of at least 500 words about " + topic + "."
+     for topic in ["rainbows", "thunderstorms", "snowflakes", "sunsets",
+                   "hurricanes", "fog", "seasons", "ocean currents"]],
 ]
 Path("/tmp/perf-cases.json").write_text(json.dumps(cases))
 Path("/tmp/perf-replicas.json").write_text(json.dumps(cases[1:]))
@@ -177,8 +185,9 @@ continuous-batching, conventional P/D or graph-enabled performance.
 `measurements.json` retains every warmup and measured sample. For 128 output
 steps, decode covers 127 steps: TPOT is decode time / 127, and throughput is
 batch size times 127 / decode time. Report medians and ranges across measured
-repetitions, not service-latency percentiles. Generation continues past EOS,
-so this is fixed-work decode throughput, not useful-response goodput.
+repetitions, not service-latency percentiles. Generation continues past EOS; verify that no EOS appears in the timed
+outputs before describing them as ordinary generated tokens. This remains
+fixed-work decode throughput, not a measurement of response goodput.
 
 Per-trial JSON records greedy IDs, prompt lengths and finite final logits;
 final-trial `.pt` files retain final logits. Compare these after timing against
