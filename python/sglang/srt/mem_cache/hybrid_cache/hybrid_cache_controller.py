@@ -1418,6 +1418,7 @@ class HybridCacheController(BaseHiCacheController):
                 )
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
+            self._retire_older_states(operation, backup_transfers, results)
 
         if not self.backup_skip:
             super()._page_backup(operation)
@@ -1441,6 +1442,105 @@ class HybridCacheController(BaseHiCacheController):
             operation.completed_tokens = (
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
+
+    # ---- KDA / Mamba state retention (R15) ---------------------------------------------------------------
+    # Policy "keep the newest N states per chain": after this rank wrote the state at the newest boundary, the
+    # chain's earlier boundaries that still carry a state are found with one exists call and all but the newest
+    # N-1 of them are queued for retirement after a grace period (a resume in flight holds a lease; the remove is
+    # never forced and a leased object is retried on the next drain). Off unless the storage backend's extra config
+    # sets state_retention_keep > 0. The chain is known only when prefix keys are passed to the backup
+    # (hicache_storage_pass_prefix_keys in the same extra config).
+    def _state_retention_cfg(self):
+        cfg = getattr(self, "_state_retention_cfg_cache", None)
+        if cfg is None:
+            extra = getattr(self.storage_backend, "extra_config", None) or {}
+            def _num(key, default, cast):
+                v = extra.get(key, default)
+                return cast(default if v is None else v)
+
+            try:
+                keep = _num("state_retention_keep", 0, int)
+                grace = _num("state_retention_grace_s", 600, float)
+                scan = _num("state_retention_scan_pages", 4096, int)
+            except (TypeError, ValueError):
+                keep, grace, scan = 0, 600.0, 4096
+            cfg = (keep, grace, scan)
+            self._state_retention_cfg_cache = cfg
+            self._state_retire = []
+            self._state_retire_lock = threading.Lock()
+            self._state_retention_stats = {
+                "writes": 0, "found": 0, "queued": 0, "retired": 0, "leased": 0, "missing": 0, "other": 0
+            }
+            if keep > 0:
+                logger.info(
+                    "KDA state retention on: keep %d state(s) per chain, grace %.0f s, scan %d pages", keep, grace, scan
+                )
+        return cfg
+
+    def _retire_older_states(self, operation, backup_transfers, results):
+        try:
+            keep, grace, scan = self._state_retention_cfg()
+            if keep <= 0:
+                return
+            if not any(t.name == PoolName.MAMBA for t in backup_transfers):
+                return
+            res = results.get(PoolName.MAMBA)
+            if res is None:
+                res = results.get(getattr(PoolName.MAMBA, "value", PoolName.MAMBA))
+            if not isinstance(res, (list, tuple)) or not res or not all(bool(x) for x in res):
+                return
+            if operation.prefix_keys is None:
+                return
+            span = list(operation.hash_value or [])
+            chain = list(operation.prefix_keys) + span[:-1]
+            if scan > 0 and len(chain) > scan:
+                chain = chain[-scan:]
+            st = self._state_retention_stats
+            st["writes"] += 1
+            if chain:
+                present = self.storage_backend.state_boundaries_present(chain)
+                st["found"] += len(present)
+                older = present[: max(0, len(present) - (keep - 1))]
+                if older:
+                    with self._state_retire_lock:
+                        self._state_retire.append([time.monotonic() + grace, list(older), 0])
+                    st["queued"] += len(older)
+            self._drain_state_retire()
+            if st["writes"] % 200 == 0:
+                logger.info("KDA state retention: %s", st)
+        except Exception as e:  # never let the policy break a backup
+            logger.warning("KDA state retention skipped: %r", e)
+
+    def _drain_state_retire(self, max_entries: int = 8):
+        now = time.monotonic()
+        due = []
+        with self._state_retire_lock:
+            keep_back = []
+            for entry in self._state_retire:
+                if entry[0] <= now and len(due) < max_entries:
+                    due.append(entry)
+                else:
+                    keep_back.append(entry)
+            self._state_retire = keep_back
+        st = self._state_retention_stats
+        for entry in due:
+            codes = self.storage_backend.retire_state_boundaries(entry[1])
+            retry = []
+            per = max(1, len(codes) // max(1, len(entry[1])))
+            for i, h in enumerate(entry[1]):
+                cs = codes[i * per : (i + 1) * per]
+                if all(c == 0 for c in cs):
+                    st["retired"] += 1
+                elif any(c == -706 for c in cs):  # OBJECT_HAS_LEASE: a resume is reading it; retry later
+                    st["leased"] += 1
+                    retry.append(h)
+                elif all(c in (0, -704) for c in cs):  # OBJECT_NOT_FOUND: evicted or retired by another rank's turn
+                    st["missing"] += 1
+                else:
+                    st["other"] += 1
+            if retry and entry[2] < 20:
+                with self._state_retire_lock:
+                    self._state_retire.append([now + 60.0, retry, entry[2] + 1])
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
         if not self.backup_skip:

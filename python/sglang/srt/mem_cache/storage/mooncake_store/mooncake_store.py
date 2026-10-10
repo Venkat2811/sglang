@@ -399,6 +399,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            # Kept for the cache controller's optional policies (KDA state retention, R15).
+            self.extra_config = dict(extra_config) if extra_config else {}
             self.enable_group_semantics = bool(
                 extra_config.get("enable_group_semantics", False)
                 if extra_config
@@ -881,6 +883,36 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
         ]
         return component_keys, key_multiplier
+
+    # ---- KDA / Mamba state retention (R15) ---------------------------------------------------------------
+    # Each turn writes a new recurrent state at the chain's newest page boundary and the older boundaries' states
+    # stay in the store until LRU eviction; these two helpers let the cache controller find the chain's older
+    # boundaries that still carry a complete state on this rank and retire them (never forced: an object under a
+    # lease is being read by a resume and keeps its lease until the reader is done).
+    def state_boundaries_present(
+        self, page_hashes: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> List[str]:
+        if not page_hashes or PoolName.MAMBA not in getattr(self, "registered_pools", {}):
+            return []
+        transfer = PoolTransfer(name=PoolName.MAMBA, keys=list(page_hashes))
+        component_keys, k = self._get_hybrid_page_component_keys(list(page_hashes), transfer)
+        if k <= 0:
+            return []
+        ex = self._batch_exist(self._tag_keys(component_keys), extra_info)
+        return [
+            h
+            for i, h in enumerate(page_hashes)
+            if all(r == 1 for r in ex[i * k : (i + 1) * k])
+        ]
+
+    def retire_state_boundaries(self, page_hashes: List[str]) -> List[int]:
+        if not page_hashes or PoolName.MAMBA not in getattr(self, "registered_pools", {}):
+            return []
+        transfer = PoolTransfer(name=PoolName.MAMBA, keys=list(page_hashes))
+        component_keys, k = self._get_hybrid_page_component_keys(list(page_hashes), transfer)
+        if k <= 0:
+            return []
+        return list(self.store.batch_remove(self._tag_keys(component_keys), False))
 
     def batch_exists_v2(
         self,
