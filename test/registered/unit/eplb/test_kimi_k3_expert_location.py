@@ -74,6 +74,41 @@ class TestKimiK3ExpertLocation(unittest.TestCase):
             self.source,
         )
 
+    def test_moe_exposes_its_routed_expert_weights(self):
+        moe = _class_node(self.tree, "KimiK3MoE")
+        self.assertTrue(
+            any(
+                isinstance(n, ast.FunctionDef) and n.name == "get_moe_weights"
+                for n in moe.body
+            )
+        )
+        self.assertIn("filter_moe_weight_param_global_expert(", self.source)
+
+    def test_entry_classes_expose_routed_experts_weights_of_layer(self):
+        for name in ("KimiK3LinearForCausalLM", "KimiK3ForConditionalGeneration"):
+            node = next(
+                (
+                    n
+                    for n in _class_node(self.tree, name).body
+                    if isinstance(n, ast.FunctionDef)
+                    and n.name == "routed_experts_weights_of_layer"
+                ),
+                None,
+            )
+            self.assertIsNotNone(node, name)
+            self.assertTrue(
+                any(
+                    isinstance(d, ast.Name) and d.id == "property"
+                    for d in node.decorator_list
+                ),
+                name,
+            )
+        # The text model builds the per-layer dict lazily over its MoE layers only.
+        self.assertIn("self._routed_experts_weights_of_layer = LazyValue(", self.source)
+        self.assertIn(
+            "if isinstance(self.model.layers[layer_id].mlp, KimiK3MoE)", self.source
+        )
+
     def test_classmethod_arithmetic_on_the_k3_config(self):
         # Run the two classmethod bodies as plain functions, without importing
         # the model module (it needs CUDA kernels).

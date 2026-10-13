@@ -67,6 +67,7 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    filter_moe_weight_param_global_expert,
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
@@ -122,7 +123,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
 )
-from sglang.srt.utils import is_hip, is_npu, make_layers
+from sglang.srt.utils import LazyValue, is_hip, is_npu, make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -854,6 +855,19 @@ class KimiK3MoE(nn.Module):
         if self.routed_expert_norm is None:
             return latent
         return self.routed_expert_norm(latent)
+
+    def get_moe_weights(self):
+        """The routed experts' weight tensors on this rank, in the form EPLB's
+        rebalance moves between physical slots. K3's shared experts are a
+        separate module, so every local slot of self.experts is a routed one."""
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
+        ]
 
     def _expert_location_dispatch_info(self):
         """EPLB's logical-to-physical remap for this layer's top-k; None unless
@@ -3114,6 +3128,10 @@ class KimiK3LinearModel(nn.Module):
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
 
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
+
     @classmethod
     def get_model_config_for_expert_location(cls, config: KimiLinearConfig):
         # One row per decoder layer (layer 0 is dense under first_k_dense_replace
@@ -3159,6 +3177,15 @@ class KimiK3LinearForCausalLM(nn.Module):
                 )
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
+        )
+        # EPLB's online rebalance reads the routed experts of every MoE layer
+        # on this pipeline stage; layer 0 is dense and has no entry.
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, KimiK3MoE)
+            }
         )
         self.pp_group = get_parallel().pp_group
         if self.pp_group.is_last_rank:
@@ -3537,6 +3564,14 @@ class KimiK3LinearForCausalLM(nn.Module):
 
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return (
+            self.language_model.routed_experts_weights_of_layer
+            if self.language_model is not None
+            else {}
+        )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
