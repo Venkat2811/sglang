@@ -1,0 +1,6 @@
+== as given: sequences [2048], heads 1, beta range [0.9252, 0.9979], lower_bound -5.0
+  gate: seq 0 (2048 rows) first row with cumulative log-decay < -88.72: 35, < -103.97: 40; mean log-decay per token -0.0971; per head first < -88.72: [35]
+  vendored pipeline, batched         NaN rows    256/2048, first NaN row 1792, max |diff| vs fp32 ref on finite rows 1.22e+37 (ref max 0.0166)
+                                     heads with NaN (head, rows, first row): [(0, 256, 1792)]
+  triton chunk_kda                   NaN rows      0/2048, max |diff| vs fp32 ref on finite rows 0.000143 (ref max 0.0166)
+  reference fp32 (self)              NaN rows      0/2048, max |diff| vs fp32 ref on finite rows 0 (ref max 0.0166)
