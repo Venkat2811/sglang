@@ -36,7 +36,12 @@ use tokio_util::sync::CancellationToken;
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
 // SGLang's DP controller dispatches to this rank; it outranks `routed_dp_rank` in the body.
 const X_DATA_PARALLEL_RANK: HeaderName = HeaderName::from_static("x-data-parallel-rank");
-type LoadGuards = (LoadGuard, RouterInflightLoadGuard, Option<DpRankGuard>);
+type LoadGuards = (
+    LoadGuard,
+    RouterInflightLoadGuard,
+    Option<DpRankGuard>,
+    Option<Arc<crate::server::admission::RequestScope>>,
+);
 
 /// A plain worker, or a prefill worker paired with a decode worker for PD.
 pub(super) struct SelectedWorkers {
@@ -253,6 +258,7 @@ async fn dispatch<T: Transport>(
         worker_load_guard,
         active_request_guard,
         prefill_rank.map(|rank| prefill.dp_rank_guard(rank)),
+        request.scope.clone(),
     );
 
     // In PD mode, prefill runs independently and decode supplies the client response.
@@ -277,12 +283,6 @@ async fn dispatch<T: Transport>(
             // Counted from arrival, so decode selection sees requests waiting here.
             let decode_load = decode.load_guard();
             if let Some(slot) = &decode_slot {
-                let mut abort = ctx.proxy.abort_on_drop(
-                    &prefill.url,
-                    prefill.protocol(),
-                    &headers,
-                    engine_rid.as_deref(),
-                );
                 admit_decode(
                     ctx,
                     request,
@@ -293,7 +293,6 @@ async fn dispatch<T: Transport>(
                     &stream_abort,
                 )
                 .await?;
-                abort.disarm();
             }
             let decode_rank = dp_aware
                 .then(|| select_dp_rank(&decode, None, &[], ctx.config.model.dp_rank_policy))
@@ -308,6 +307,7 @@ async fn dispatch<T: Transport>(
                     request_started_at.elapsed(),
                 ),
                 decode_rank.map(|rank| decode.dp_rank_guard(rank)),
+                request.scope.clone(),
             );
             let decode_leg = Leg::new(
                 dp_aware,
@@ -472,6 +472,7 @@ trait Transport: Clone + Send + Sync + 'static {
         worker: Arc<Worker>,
         path: &'static str,
         leg: Leg,
+        load_guards: LoadGuards,
     ) -> impl Future<Output = PrefillFailure<Self::Response>> + Send;
 }
 
@@ -562,7 +563,16 @@ impl Transport for Http {
         worker: Arc<Worker>,
         path: &'static str,
         leg: Leg,
+        load_guards: LoadGuards,
     ) -> PrefillFailure {
+        let mut abort = proxy
+            .abort_on_drop(
+                &worker.url,
+                worker.protocol(),
+                &leg.headers,
+                leg.additions.rid.as_deref(),
+            )
+            .with_guards(Some(Box::new(load_guards)));
         let result = proxy
             .forward_json_to(
                 &worker.url,
@@ -574,6 +584,9 @@ impl Transport for Http {
                 None,
             )
             .await;
+        if result.is_ok() {
+            abort.disarm();
+        }
         prefill_failure(result).await
     }
 }
@@ -651,11 +664,22 @@ impl<R: EngineRpc> Transport for Grpc<R> {
         worker: Arc<Worker>,
         _path: &'static str,
         leg: Leg,
+        load_guards: LoadGuards,
     ) -> PrefillFailure<Self::Response> {
         let (headers, body, additions) = (&leg.headers, leg.body, &leg.additions);
         let result = proxy
             .forward_grpc(
-                &worker, &*self.0, headers, body, additions, None, false, None, None, None, None,
+                &worker,
+                &*self.0,
+                headers,
+                body,
+                additions,
+                additions.rid.as_deref(),
+                false,
+                Some(Box::new(load_guards)),
+                None,
+                None,
+                None,
                 None,
             )
             .await;
@@ -760,7 +784,7 @@ fn parse_decode_url_header(decode_url: &str) -> Option<HeaderValue> {
 /// A prefill's client-visible failure; `None` means it succeeded.
 type PrefillFailure<R = Response<Body>> = Option<Result<R, ApiError>>;
 
-/// Runs prefill to completion even if the client disconnects. A failure also
+/// Cancels unfinished prefill when its client leaves. A failure also
 /// aborts decode's stream until its first token, which proves KV transfer completed.
 #[allow(clippy::too_many_arguments)]
 fn spawn_prefill_request<T: Transport>(
@@ -778,10 +802,22 @@ fn spawn_prefill_request<T: Transport>(
     let proxy = Arc::clone(&ctx.proxy);
     let (registry, model) = (Arc::clone(&metrics.registry), metrics.model.clone());
     tokio::spawn(async move {
-        let _load_guards = load_guards;
-        let failure = transport
-            .prefill(proxy, Arc::clone(&prefill_worker), path, leg)
-            .await;
+        let cancelled = load_guards
+            .3
+            .as_ref()
+            .map(|scope| scope.cancelled.clone())
+            .unwrap_or_default();
+        let work = transport.prefill(proxy, Arc::clone(&prefill_worker), path, leg, load_guards);
+        let failure = tokio::select! {
+            biased;
+            failure = work => failure,
+            () = cancelled.cancelled() => {
+                if let Some(slot) = &slot { slot.release(); }
+                registry.record_worker_request(&prefill_worker.url, &model, WorkerModeLabel::Prefill, RequestOutcome::Cancelled);
+                tracing::info!(worker = %prefill_worker.url, bootstrap_room, "prefill cancelled with client");
+                return None;
+            }
+        };
         if let Some(slot) = &slot {
             slot.release();
         }
@@ -928,8 +964,12 @@ async fn forward_to_response_worker(
             .await
     } else {
         // JSON forwarding reads the full response body before releasing load guards.
-        let _load_guards = load_guards;
-        ctx.proxy
+        let mut abort = ctx
+            .proxy
+            .abort_on_drop(&worker.url, worker.protocol(), headers, engine_rid)
+            .with_guards(Some(Box::new(load_guards)));
+        let result = ctx
+            .proxy
             .forward_json_to(
                 &worker.url,
                 worker.protocol(),
@@ -937,9 +977,13 @@ async fn forward_to_response_worker(
                 path,
                 headers,
                 body,
-                engine_rid,
+                None,
             )
-            .await
+            .await;
+        if result.is_ok() {
+            abort.disarm();
+        }
+        result
     }
 }
 

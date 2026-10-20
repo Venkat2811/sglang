@@ -458,7 +458,7 @@ fn streaming_chat_request() -> Request<Body> {
 }
 
 #[tokio::test]
-async fn pd_mode_disconnect_aborts_decode_but_not_prefill() {
+async fn pd_mode_disconnect_aborts_decode_but_not_completed_prefill() {
     let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let decode = crate::common::mock_worker::MockWorker::start_slow_stream(
         vec!["data: a\n\n", "data: b\n\n", "data: c\n\n"],
@@ -509,3 +509,69 @@ async fn pd_mode_disconnect_aborts_decode_but_not_prefill() {
 }
 
 mod reliability;
+
+#[tokio::test]
+async fn pd_disconnect_aborts_both_outstanding_legs_before_and_after_headers() {
+    for before_headers in [true, false] {
+        let prefill =
+            crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(30)).await;
+        let decode = if before_headers {
+            crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(30)).await
+        } else {
+            crate::common::mock_worker::MockWorker::start_slow_stream(
+                vec!["data: first\n\n", "data: second\n\n", "data: [DONE]\n\n"],
+                Duration::from_millis(50),
+            )
+            .await
+        };
+        let ctx = build_ctx(vec![
+            WorkerSpec {
+                id: WorkerId("p1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(30000),
+                ..Default::default()
+            },
+            WorkerSpec {
+                id: WorkerId("d1".into()),
+                url: decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                ..Default::default()
+            },
+        ]);
+        let task = tokio::spawn(build_router(Arc::clone(&ctx)).oneshot(streaming_chat_request()));
+        let p_body: Value = serde_json::from_slice(&prefill.wait_for_request().await).unwrap();
+        let d_body: Value = serde_json::from_slice(&decode.wait_for_request().await).unwrap();
+        assert_eq!(p_body["rid"], d_body["rid"]);
+        if before_headers {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            let response = task.await.unwrap().unwrap();
+            use futures::StreamExt;
+            let mut stream = response.into_body().into_data_stream();
+            assert!(stream.next().await.is_some());
+            drop(stream);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !prefill.abort_log.lock().unwrap().is_empty()
+                    && !decode.abort_log.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect must abort every outstanding worker leg");
+        for worker in [&prefill, &decode] {
+            assert_eq!(
+                *worker.abort_log.lock().unwrap(),
+                vec![json!({"rid":p_body["rid"], "abort_all":false})]
+            );
+        }
+    }
+}

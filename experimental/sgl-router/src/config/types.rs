@@ -317,6 +317,7 @@ pub struct ServerConfig {
     /// Resolve an omitted served-model name from worker metadata before loading the tokenizer.
     pub infer_model_from_workers: bool,
     pub worker_startup_timeout_secs: u64,
+    pub admission: AdmissionConfig,
 }
 
 impl ServerConfig {
@@ -350,8 +351,17 @@ impl Default for ServerConfig {
             worker_auth: None,
             infer_model_from_workers: false,
             worker_startup_timeout_secs: 1800,
+            admission: AdmissionConfig::default(),
         }
     }
+}
+
+/// Gateway-compatible refill credits plus a strict in-flight ceiling.
+#[derive(Debug, Clone, Default)]
+pub struct AdmissionConfig {
+    /// None disables admission limiting.
+    pub max_concurrent_requests: Option<usize>,
+    pub refill_per_second: u32,
 }
 
 #[derive(Debug, Clone)]

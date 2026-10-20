@@ -51,6 +51,7 @@ impl ChatRouting {
 
 pub struct AppContext {
     pub config: Config,
+    pub admission: crate::server::admission::Admission,
     pub tokenizers: Arc<TokenizerRegistry>,
     pub proxy: Arc<Proxy>,
     pub registry: Arc<WorkerRegistry>,
@@ -135,6 +136,7 @@ impl AppContext {
         let decode_policy =
             crate::policies::decode::build_decode_policy(config.model.decode_policy);
         Self {
+            admission: crate::server::admission::Admission::new(&config.server.admission),
             config,
             tokenizers,
             proxy,
@@ -209,6 +211,7 @@ impl AppContext {
     #[cfg(test)]
     pub fn stub() -> Self {
         Self {
+            admission: crate::server::admission::Admission::default(),
             decode_policy: crate::policies::decode::build_decode_policy(Default::default()),
             config: Config {
                 server: crate::config::ServerConfig {

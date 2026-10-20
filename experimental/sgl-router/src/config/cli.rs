@@ -159,6 +159,19 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = 1800)]
     pub worker_startup_timeout_secs: u64,
 
+    /// Global generation-request ceiling, held through response and abort cleanup. -1 disables.
+    #[arg(long, default_value_t = -1, allow_hyphen_values = true)]
+    pub max_concurrent_requests: i64,
+
+    /// Pending admission queue size. Only immediate rejection (0) is supported.
+    #[arg(long, default_value_t = 0)]
+    pub queue_size: usize,
+
+    /// Refill credits per second, in addition to credits returned on completion.
+    /// Refill never bypasses the strict concurrent-request ceiling.
+    #[arg(long, default_value_t = 0)]
+    pub rate_limit_tokens_per_second: u32,
+
     /// Upstream timeout in seconds: the whole response of a non-streaming request,
     /// the response headers of a streaming one. SGLang's chat endpoint sends those
     /// headers with the first token, so for streaming chat this bounds time to
@@ -656,6 +669,19 @@ impl Cli {
             .as_deref()
             .map(bearer)
             .transpose()?;
+        ensure!(
+            self.server.queue_size == 0,
+            "--queue-size must be 0 (admission does not queue)"
+        );
+        ensure!(
+            self.server.max_concurrent_requests == -1 || self.server.max_concurrent_requests > 0,
+            "--max-concurrent-requests must be -1 or positive"
+        );
+        let admission = super::AdmissionConfig {
+            max_concurrent_requests: (self.server.max_concurrent_requests > 0)
+                .then_some(self.server.max_concurrent_requests as usize),
+            refill_per_second: self.server.rate_limit_tokens_per_second,
+        };
         let config = Config {
             server: ServerConfig {
                 host: self.server.host,
@@ -666,6 +692,7 @@ impl Cli {
                 worker_auth,
                 infer_model_from_workers,
                 worker_startup_timeout_secs: self.server.worker_startup_timeout_secs,
+                admission,
             },
             observability: ObservabilityConfig {
                 log_level: self.server.log_level,

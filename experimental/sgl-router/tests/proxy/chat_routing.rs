@@ -1766,11 +1766,13 @@ async fn non_streaming_error_path_drops_active_load_guard() {
 
     // Drain so any drop-on-body-end work runs.
     let _ = res.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(
-        router_inflight_load.inflight_count(),
-        0,
-        "error path must drop the active-load guard",
-    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while router_inflight_load.inflight_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("error cleanup must release its load after the abort attempt");
 }
 
 fn has_metric_line(metrics: &str, expected: &str) -> bool {

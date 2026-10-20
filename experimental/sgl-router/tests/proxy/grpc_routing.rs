@@ -742,3 +742,49 @@ async fn errors_arrive_as_grpc_status() {
     codes.sort_by_key(|code| *code as i32);
     assert_eq!(codes, [Code::Internal, Code::Unavailable]);
 }
+
+#[tokio::test]
+async fn grpc_and_http_share_admission_through_the_response_stream() {
+    let port = MockEngine::default()
+        .stream("ChatComplete", |_request: proto::OpenAiRequest| {
+            stream::once(async { Ok(chunk("data: first\n\n", false, None)) })
+                .chain(stream::pending())
+                .boxed()
+        })
+        .start()
+        .await;
+    let mut ctx = router_ctx(&[(WorkerMode::Plain, "http://127.0.0.1:1", Some(port))]);
+    let config = sgl_router::config::AdmissionConfig {
+        max_concurrent_requests: Some(1),
+        refill_per_second: 1,
+    };
+    Arc::get_mut(&mut ctx).unwrap().admission =
+        sgl_router::server::admission::Admission::new(&config);
+    let mut client = serve_grpc(Arc::clone(&ctx)).await;
+    let mut first = client
+        .chat_complete(openai(chat(true)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(first.message().await.unwrap().is_some());
+    let second = client.chat_complete(openai(chat(true))).await;
+    assert_eq!(second.unwrap_err().code(), Code::ResourceExhausted);
+    let response = build_router(Arc::clone(&ctx))
+        .oneshot(
+            HttpRequest::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    drop(first);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ctx.admission.active() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}

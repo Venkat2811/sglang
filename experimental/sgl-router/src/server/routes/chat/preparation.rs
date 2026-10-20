@@ -88,6 +88,7 @@ fn namespace_field(value: &Value) -> Result<Option<String>, ()> {
 pub(super) struct PreparedRequest {
     /// Engine endpoint the request is forwarded to.
     pub(super) path: &'static str,
+    pub(super) scope: Option<Arc<crate::server::admission::RequestScope>>,
     pub(super) model: ModelId,
     pub(super) streaming: bool,
     /// Output budget, for decode KV; unknown if any prompt leaves it unset.
@@ -197,6 +198,7 @@ impl PreparedRequest {
                     .record_input_ids_forwarding(&model.0, InputIdsForwarding::Forwarded);
             }
             return Ok(Self {
+                scope: None,
                 responder: Some(responder),
                 ..Self::generate_value(ctx, model, generate, None)?
             });
@@ -245,6 +247,7 @@ impl PreparedRequest {
             forwarding_booked: false,
             parsed_body,
             sampling_defaults,
+            scope: None,
             responder: None,
         })
     }
@@ -303,6 +306,7 @@ impl PreparedRequest {
             fans_out: batch.is_some() || requests_multiple_samples(&fields, &sampling_defaults),
             input_ids_forwarding: None,
             forwarding_booked: false,
+            scope: None,
             responder: None,
             cache_namespace: cache_namespace(COMPLETIONS_PATH, &value),
             parsed_body: Some(value),
@@ -399,6 +403,7 @@ impl PreparedRequest {
             forwarding_booked: false,
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
+            scope: None,
             responder: None,
         })
     }
@@ -517,6 +522,7 @@ impl PreparedRequest {
             fans_out,
             input_ids_forwarding: None,
             forwarding_booked: false,
+            scope: None,
             responder: None,
             parsed_body: None,
             cache_namespace: CacheNamespace::default(),
@@ -553,6 +559,7 @@ impl PreparedRequest {
             forwarding_booked: false,
             parsed_body: None,
             sampling_defaults: Vec::new(),
+            scope: None,
             responder: None,
         }
     }
@@ -565,7 +572,7 @@ impl PreparedRequest {
 
     pub(super) fn engine_rid(&self) -> Option<String> {
         // Caller IDs are unsafe for prefix aborts; fan-out regenerates IDs.
-        // PD shares the minted ID, but only decode arms abort-on-drop.
+        // Both PD legs share the minted ID and abort their own unfinished work.
         if self.caller_set_rid || self.fans_out {
             return None;
         }

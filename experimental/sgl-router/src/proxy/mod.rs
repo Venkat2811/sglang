@@ -396,7 +396,8 @@ impl Proxy {
             .header("content-type", "application/json")
             .header("accept", "text/event-stream");
         let mut abort =
-            AbortOnDrop::new(self.client_for(protocol), &worker_url, headers, abort_rid);
+            AbortOnDrop::new(self.client_for(protocol), &worker_url, headers, abort_rid)
+                .with_guards(stream_guards);
         // A worker that never answers is a fault, unlike a long stream once it answers.
         let resp = match tokio::time::timeout(
             self.request_timeout,
@@ -450,11 +451,11 @@ impl Proxy {
             match breaker_outcome(status) {
                 BreakerOutcome::Failure => {
                     breaker.record_failure();
-                    None
+                    Some(Box::new(move |_| drop(abort)))
                 }
                 BreakerOutcome::Neutral => {
                     breaker.record_backpressure();
-                    None
+                    Some(Box::new(move |_| drop(abort)))
                 }
                 BreakerOutcome::Success => {
                     let breaker_for_hook = Arc::clone(breaker);
@@ -483,7 +484,7 @@ impl Proxy {
         permit.disarm();
         let body = sse::bytes_stream_to_body(
             resp.bytes_stream(),
-            stream_guards,
+            None,
             on_complete,
             first_byte_hook,
             sse::StreamLimits {

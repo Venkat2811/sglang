@@ -516,26 +516,34 @@ fn into_status(error: std::io::Error) -> Status {
 /// Aborts the engine request by the router's rid unless disarmed, as
 /// `/abort_request` does over HTTP. A dropped call alone is not enough: the
 /// engine's OpenAI RPCs abort an id of their own, not the request's rid.
-struct AbortOnDrop(Option<(SglangServiceClient<Channel>, String)>);
+struct AbortOnDrop {
+    request: Option<(SglangServiceClient<Channel>, String)>,
+    guards: Option<Box<dyn Send + 'static>>,
+}
 
 impl AbortOnDrop {
     fn new(client: &SglangServiceClient<Channel>, rid: Option<&str>) -> Self {
         let rid = rid.filter(|rid| !rid.is_empty());
-        Self(rid.map(|rid| (client.clone(), rid.to_owned())))
+        Self {
+            request: rid.map(|rid| (client.clone(), rid.to_owned())),
+            guards: None,
+        }
     }
 
     fn disarm(&mut self) {
-        self.0 = None;
+        self.request = None;
     }
 }
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        let Some((mut client, rid)) = self.0.take() else {
+        let Some((mut client, rid)) = self.request.take() else {
             return;
         };
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let guards = self.guards.take();
             runtime.spawn(async move {
+                let _guards = guards;
                 let abort = client.abort(proto::AbortRequest {
                     rid,
                     abort_all: false,
@@ -588,6 +596,7 @@ impl Proxy {
             worker: worker.url.clone(),
         })?;
         let mut abort = AbortOnDrop::new(&client, abort_rid);
+        abort.guards = stream_guards;
         let call = rpc.call(client, body, additions, trace_headers(headers));
         let failed = |status: &Status| status_breaker_outcome(status.code()).record(breaker);
         let respond = |status, replies: Vec<_>, mut abort: AbortOnDrop| {
@@ -607,7 +616,6 @@ impl Proxy {
                 .map_err(ApiError::UpstreamGrpc)?;
             let status = replies.last().and_then(R::status).unwrap_or(StatusCode::OK);
             permit.disarm();
-            drop(stream_guards);
             return Ok(respond(status, replies, abort));
         }
         let call = async {
@@ -627,7 +635,6 @@ impl Proxy {
         };
         if let Some(status) = first.as_ref().and_then(R::status) {
             permit.disarm();
-            drop(stream_guards);
             return Ok(respond(status, first.into_iter().collect(), abort));
         }
         // A status the engine ends the stream with decides the breaker outcome.
@@ -654,7 +661,7 @@ impl Proxy {
         permit.disarm();
         let replies = sse::pump(
             stream,
-            stream_guards,
+            None,
             Some(on_complete),
             on_first_byte,
             StreamLimits {

@@ -152,14 +152,21 @@ async fn pd_failure_returns_without_waiting_for_the_other_side() {
                     false => ((&decode.url, "decode"), (&prefill.url, "prefill")),
                 };
                 assert_eq!(outcomes(&ctx, blamed.0, blamed.1).len(), 1);
-                // A blamed prefill means decode was dispatched and then dropped,
-                // which is counted rather than dropped from the per-worker series.
-                // A blamed decode leaves prefill still running, with nothing to
-                // record yet.
-                let abandoned: &[&str] = if prefill_blamed { &["cancelled"] } else { &[] };
-                assert_eq!(outcomes(&ctx, other.0, other.1), abandoned);
+                // An error response cancels whichever leg remains outstanding.
+                // Load stays counted until its bounded abort attempt finishes.
                 let decode_worker = ctx.registry.get(&WorkerId("d".into())).unwrap();
-                assert_eq!(decode_worker.router_inflight_load(), 0);
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if outcomes(&ctx, other.0, other.1) == ["cancelled"]
+                            && decode_worker.router_inflight_load() == 0
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("failed PD requests must cancel and clean up the other leg");
             }
         }
     }

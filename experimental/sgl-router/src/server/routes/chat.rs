@@ -113,8 +113,13 @@ async fn serve_http(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
-    let (request, routing) = prepare(&ctx, endpoint, &headers, body, false).await?;
-    routing.dispatch(&ctx, request, headers, start).await
+    let scope = crate::server::admission::RequestScope::enter(&ctx.admission)?;
+    let client = scope.client();
+    let (mut request, routing) = prepare(&ctx, endpoint, &headers, body, false).await?;
+    request.scope = Some(scope);
+    let response = routing.dispatch(&ctx, request, headers, start).await?;
+    let successful = response.status().is_success();
+    Ok(response.map(|body| client.body(body, successful)))
 }
 
 /// A gRPC call whose request is `endpoint`'s HTTP body, sent to the engine as `rpc`.
@@ -130,9 +135,24 @@ pub async fn route_grpc<R: EngineRpc>(
     Option<RequestLogContext>,
 ) {
     let start = Instant::now();
+    let scope = match crate::server::admission::RequestScope::enter(&ctx.admission) {
+        Ok(scope) => scope,
+        Err(error) => return (Err(error), None),
+    };
+    let client = scope.client();
     match prepare(ctx, endpoint, &headers, body, true).await {
         Ok((mut request, routing)) => {
-            forward_request_grpc(rpc, ctx, &mut request, &routing, headers, start).await
+            request.scope = Some(scope);
+            let (result, log) =
+                forward_request_grpc(rpc, ctx, &mut request, &routing, headers, start).await;
+            (
+                result.map(|mut response| {
+                    response.replies =
+                        client.replies(response.replies, response.status.is_success());
+                    response
+                }),
+                log,
+            )
         }
         Err(error) => (Err(error), None),
     }
@@ -149,6 +169,11 @@ pub async fn route_typed<R: TypedRpc>(
     Option<RequestLogContext>,
 ) {
     let start = Instant::now();
+    let scope = match crate::server::admission::RequestScope::enter(&ctx.admission) {
+        Ok(scope) => scope,
+        Err(error) => return (Err(error), None),
+    };
+    let client = scope.client();
     let prepared = async {
         let model = ModelId(ctx.config.model.id.clone());
         let routing = ModelRouting::lookup(ctx, &model)?;
@@ -161,7 +186,17 @@ pub async fn route_typed<R: TypedRpc>(
     };
     match prepared.await {
         Ok((mut prepared, routing)) => {
-            forward_request_grpc(request, ctx, &mut prepared, &routing, headers, start).await
+            prepared.scope = Some(scope);
+            let (result, log) =
+                forward_request_grpc(request, ctx, &mut prepared, &routing, headers, start).await;
+            (
+                result.map(|mut response| {
+                    response.replies =
+                        client.replies(response.replies, response.status.is_success());
+                    response
+                }),
+                log,
+            )
         }
         Err(error) => (Err(error), None),
     }
