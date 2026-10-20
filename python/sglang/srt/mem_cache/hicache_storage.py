@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import threading
@@ -16,6 +18,7 @@ from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host import HostKVCache
+    from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +174,22 @@ def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
         name: (rs.index(False) if False in rs else len(rs))
         for name, rs in results.items()
     }
+
+
+def get_mamba_pool_schema_fingerprint(pool: MambaPoolHost) -> str:
+    # Pool layout and tensor schemas are fixed at allocation. Exclude capacity
+    # so a new engine can restore checkpoints into a differently sized cache.
+    # (From #41692; the DCP Mooncake Mamba keys of #41694 use it.)
+    schema = [
+        pool.layout,
+        [
+            (str(buf.dtype), list(buf.shape[1:]))
+            for buf in pool.get_hybrid_pool_buffer()
+        ],
+    ]
+    return hashlib.sha256(
+        json.dumps(schema, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 class HiCacheStorage(ABC):
