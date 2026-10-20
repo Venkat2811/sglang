@@ -74,7 +74,10 @@ fn config() -> Config {
 }
 
 fn build_ctx(specs: Vec<WorkerSpec>) -> Arc<AppContext> {
-    let cfg = config();
+    build_ctx_with_config(config(), specs)
+}
+
+fn build_ctx_with_config(cfg: Config, specs: Vec<WorkerSpec>) -> Arc<AppContext> {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     for s in specs {
@@ -83,6 +86,111 @@ fn build_ctx(specs: Vec<WorkerSpec>) -> Arc<AppContext> {
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+}
+
+#[path = "../component/policies/zmq_helpers.rs"]
+mod kv_fixture_wire;
+
+#[tokio::test]
+async fn pd_fixture_consumes_all_three_kv_publishers_and_rotates_decode() {
+    use sgl_router::state::kv_events::{
+        compute_block_hashes, EventConfig, KvEventIndex, KvWorkerId,
+    };
+    use zeromq::SocketSend;
+
+    let workers = [
+        crate::common::mock_worker::MockWorker::start(vec![]).await,
+        crate::common::mock_worker::MockWorker::start(vec![]).await,
+        crate::common::mock_worker::MockWorker::start(vec![]).await,
+    ];
+    let mut cfg = config();
+    cfg.model.decode_policy = sgl_router::config::DecodePolicyKind::RoundRobin;
+    let specs = workers
+        .iter()
+        .enumerate()
+        .map(|(i, worker)| WorkerSpec {
+            id: WorkerId(worker.url.clone()),
+            url: worker.url.clone(),
+            mode: if i == 0 {
+                WorkerMode::Prefill
+            } else {
+                WorkerMode::Decode
+            },
+            bootstrap_port: (i == 0).then_some(30000),
+            model_ids: vec![ModelId("tiny".into())],
+            ..Default::default()
+        })
+        .collect();
+    let ctx = build_ctx_with_config(cfg, specs);
+    let index = KvEventIndex::new();
+    let mut publishers = Vec::new();
+    for worker in &workers {
+        let (publisher, port) = kv_fixture_wire::make_pub_bound().await;
+        index
+            .add_worker(
+                &worker.url,
+                Some(EventConfig {
+                    host: "127.0.0.1".into(),
+                    port_base: port,
+                    topic: String::new(),
+                    block_size: 4,
+                    dp_size: 1,
+                    load_port_base: None,
+                    load_topic: None,
+                    replay_port_base: None,
+                    is_bigram: false,
+                }),
+            )
+            .await;
+        publishers.push(publisher);
+    }
+    let tokens: Vec<u32> = (0..16).collect();
+    let hashes = compute_block_hashes(&tokens, 4);
+    let payload = kv_fixture_wire::encode_event_batch(
+        0.0,
+        vec![kv_fixture_wire::encode_block_stored_event(
+            &hashes, None, &tokens, 4,
+        )],
+        Some(0),
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        for sequence in 1i64.. {
+            for publisher in &mut publishers {
+                publisher
+                    .send(kv_fixture_wire::build_multipart(sequence, payload.clone()))
+                    .await
+                    .unwrap();
+            }
+            let matched = index.tree().match_prefix(None, &hashes);
+            if matched.matched_blocks == hashes.len()
+                && workers.iter().all(|worker| {
+                    matched.holds(&KvWorkerId {
+                        url: worker.url.clone(),
+                        dp_rank: 0,
+                    })
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("each P/D worker must have an independent functioning KV subscriber");
+    let app = build_router(ctx);
+    for _ in 0..2 {
+        assert_eq!(
+            app.clone().oneshot(chat_request()).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+    for worker in &workers {
+        let body: Value = serde_json::from_slice(&worker.wait_for_request().await).unwrap();
+        assert_eq!(body["bootstrap_port"], 30000);
+    }
+    tokio::time::timeout(Duration::from_secs(2), index.shutdown())
+        .await
+        .unwrap();
 }
 
 fn chat_request() -> Request<Body> {
