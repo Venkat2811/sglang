@@ -34,7 +34,7 @@ use crate::policies::admission::{
 use crate::policies::buckets::{BucketRequest, BucketSelector};
 use crate::policies::cache_aware::estimate_matched_prefix_tokens;
 use crate::policies::decode::{
-    build_decode_policy, resolve_decode_with_capacity_fallback, DecodeSelectionContext,
+    resolve_decode_with_capacity_fallback, DecodePolicy, DecodeSelectionContext,
 };
 use crate::policies::{
     Policy, PrefillProposal, PrefixLookupResult, ProposalKind, SelectionContext,
@@ -742,6 +742,7 @@ fn prefill_policy_reason(
 /// Everything one decode-peer selection reads. Collaborators first, then the
 /// per-request facts.
 pub(crate) struct DecodeSelectionInputs<'a> {
+    pub decode_policy: &'a dyn DecodePolicy,
     pub decode_policy_kind: DecodePolicyKind,
     /// Disable for version-group probes so full groups do not count as admissible.
     pub allow_capacity_fallback: bool,
@@ -793,7 +794,7 @@ pub(crate) fn select_decode_peer(inputs: &DecodeSelectionInputs<'_>) -> Option<A
             tps_slo: inputs.tps_slo,
         },
     );
-    let decode_policy = build_decode_policy(inputs.decode_policy_kind);
+    let decode_policy = inputs.decode_policy;
     let decode_ctx = DecodeSelectionContext::new()
         .with_load_snapshot(snapshot)
         .with_prefill_url(inputs.prefill_url);
@@ -1006,6 +1007,7 @@ mod tests {
         request_input_tokens: u64,
     ) -> DecodeSelectionInputs<'a> {
         DecodeSelectionInputs {
+            decode_policy: &crate::policies::decode::DecodePowerOfTwoPolicy,
             decode_policy_kind: DecodePolicyKind::PowerOfTwo,
             allow_capacity_fallback: true,
             bucket_selector,

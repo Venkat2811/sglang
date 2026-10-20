@@ -29,6 +29,7 @@ mod pd_bootstrap_injection;
 mod pd_pool_isolation;
 mod pd_protocol_binding;
 mod radix_tree_routing;
+mod recipe_launch;
 mod reorg_launch;
 mod rerank_routing;
 mod retry;

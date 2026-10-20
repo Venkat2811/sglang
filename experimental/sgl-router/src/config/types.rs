@@ -314,6 +314,9 @@ pub struct ServerConfig {
     pub termination_grace_secs: Option<u64>,
     /// `Authorization` for the router's own requests to workers, from `--worker-api-key`.
     pub worker_auth: Option<HeaderValue>,
+    /// Resolve an omitted served-model name from worker metadata before loading the tokenizer.
+    pub infer_model_from_workers: bool,
+    pub worker_startup_timeout_secs: u64,
 }
 
 impl ServerConfig {
@@ -345,6 +348,8 @@ impl Default for ServerConfig {
             shutdown_drain_secs: default_shutdown_drain_secs(),
             termination_grace_secs: None,
             worker_auth: None,
+            infer_model_from_workers: false,
+            worker_startup_timeout_secs: 1800,
         }
     }
 }
@@ -778,6 +783,8 @@ impl DiscoveryBackend {
 #[derive(Debug, Clone)]
 pub struct StaticUrlsDiscoveryConfig {
     pub urls: Vec<String>,
+    /// Explicit static roles and bootstrap ports override worker self-discovery.
+    pub roles: std::collections::HashMap<String, (crate::discovery::WorkerMode, Option<u16>)>,
 }
 
 /// Kubernetes EndpointSlice discovery. Selectors classify slices; worker roles

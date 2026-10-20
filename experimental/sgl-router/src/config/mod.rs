@@ -1,9 +1,11 @@
 pub mod cli;
 pub mod sampling;
 pub mod types;
+mod worker_model;
 pub use cli::Cli;
 pub use sampling::*;
 pub use types::*;
+pub use worker_model::resolve_worker_model;
 
 use anyhow::{anyhow, ensure, Result};
 
@@ -276,6 +278,7 @@ mod tests {
                 default_chat_template_kwargs: Default::default(),
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                roles: Default::default(),
                 urls: urls.iter().map(|s| s.to_string()).collect(),
             }),
             proxy: ProxyConfig::default(),

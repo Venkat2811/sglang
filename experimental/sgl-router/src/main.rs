@@ -58,12 +58,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let routing = cli.routing.chat_routing;
     init_tracing(&cli.server.log_level, cli.server.log_format)?;
-    let config = cli
+    let mut config = cli
         .into_config()
         .context("resolve configuration from CLI flags")?;
 
     // Buffer termination signals before tokenizer loading or discovery can block startup.
     let (sigterm, sigint) = install_signal_handlers()?;
+    sgl_router::config::resolve_worker_model(&mut config).await?;
     log_startup(&config);
 
     // Load tokenizers used to prepare requests for routing.

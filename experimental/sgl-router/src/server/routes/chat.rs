@@ -401,7 +401,14 @@ async fn select_workers(
 
     let candidates = prefills_with_decode(ctx, request, candidates, resolver, &routing_context);
     let prefill = pick_prefill_worker(ctx, request, policy, &candidates, &routing_context)?;
-    let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context, true)?;
+    let decode = pick_decode_worker(
+        ctx,
+        request,
+        &prefill,
+        resolver,
+        &routing_context,
+        DecodePickMode::Dispatch,
+    )?;
     record_prefill_route(ctx, routing_context.prefix_matches.as_ref(), &prefill.url);
     Ok(SelectedWorkers {
         prefill,
@@ -440,8 +447,17 @@ fn prefills_with_decode(
             .iter()
             .filter(|p| {
                 *fits.entry(p.version_group()).or_insert_with(|| {
-                    pick_decode_worker(ctx, request, p, resolver, routing, allow_capacity_fallback)
-                        .is_ok()
+                    pick_decode_worker(
+                        ctx,
+                        request,
+                        p,
+                        resolver,
+                        routing,
+                        DecodePickMode::Probe {
+                            allow_capacity_fallback,
+                        },
+                    )
+                    .is_ok()
                 })
             })
             .cloned()
@@ -556,13 +572,18 @@ fn pick_prefill_worker(
     .map_err(|reason| policy_selection_failed(ctx, &request.model.0, reason))
 }
 
+enum DecodePickMode {
+    Dispatch,
+    Probe { allow_capacity_fallback: bool },
+}
+
 fn pick_decode_worker(
     ctx: &AppContext,
     request: &PreparedRequest,
     prefill: &Worker,
     resolver: &PdPoolResolver,
     routing: &RoutingContext<'_>,
-    allow_capacity_fallback: bool,
+    mode: DecodePickMode,
 ) -> Result<Option<Arc<Worker>>, ApiError> {
     if prefill.mode() != WorkerMode::Prefill {
         return Ok(None);
@@ -571,9 +592,18 @@ fn pick_decode_worker(
     let candidates = resolver
         .decode_peers(&request.model, prefill)
         .map_err(|error| pool_error(error, &request.model))?;
+    // Eligibility probes must not advance the serving policy's rotation.
+    let preview = matches!(mode, DecodePickMode::Probe { .. })
+        .then(|| crate::policies::decode::build_decode_policy(ctx.config.model.decode_policy));
     let decode = select_decode_peer(&DecodeSelectionInputs {
+        decode_policy: preview.as_deref().unwrap_or(ctx.decode_policy.as_ref()),
         decode_policy_kind: ctx.config.model.decode_policy,
-        allow_capacity_fallback,
+        allow_capacity_fallback: match mode {
+            DecodePickMode::Dispatch => true,
+            DecodePickMode::Probe {
+                allow_capacity_fallback,
+            } => allow_capacity_fallback,
+        },
         bucket_selector: ctx.bucket_selector.as_ref(),
         model_id: &request.model,
         prefill_url: &prefill.url,

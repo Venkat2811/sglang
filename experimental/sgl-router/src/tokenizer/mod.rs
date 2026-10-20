@@ -341,6 +341,7 @@ mod tests {
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {
+                    roles: Default::default(),
                     urls: vec!["http://placeholder:0".into()],
                 },
             ),

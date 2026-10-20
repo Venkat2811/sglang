@@ -64,8 +64,16 @@ pub struct Cli {
 #[derive(clap::Args, Debug)]
 pub struct ModelArgs {
     /// Model id this router serves (the OpenAI `model` field).
+    #[arg(
+        long,
+        visible_alias = "served-model-name",
+        required_unless_present = "model_path"
+    )]
+    pub model_id: Option<String>,
+
+    /// Gateway-compatible tokenizer/model path. Without --model-id, use the workers' served name.
     #[arg(long)]
-    pub model_id: String,
+    pub model_path: Option<String>,
 
     /// Local tokenizer.json or HuggingFace repo id. Defaults to --model-id; honors HF_TOKEN / HF_HOME.
     #[arg(long)]
@@ -147,6 +155,10 @@ pub struct ServerArgs {
     #[arg(long)]
     pub worker_api_key: Option<String>,
 
+    /// Startup budget for resolving the served model from static workers.
+    #[arg(long, default_value_t = 1800)]
+    pub worker_startup_timeout_secs: u64,
+
     /// Upstream timeout in seconds: the whole response of a non-streaming request,
     /// the response headers of a streaming one. SGLang's chat endpoint sends those
     /// headers with the first token, so for streaming chat this bounds time to
@@ -197,6 +209,18 @@ pub struct ServerArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct DiscoveryArgs {
+    /// Use explicit static prefill and decode lists.
+    #[arg(long, requires_all = ["prefill", "decode"], conflicts_with_all = ["worker_urls", "service_discovery"])]
+    pub pd_disaggregation: bool,
+
+    /// Prefill API URL and KV bootstrap port; repeat for each prefill worker.
+    #[arg(long, num_args = 2, value_names = ["URL", "BOOTSTRAP_PORT"], action = clap::ArgAction::Append, requires = "pd_disaggregation")]
+    pub prefill: Vec<String>,
+
+    /// Decode API URL; repeat for each decode worker.
+    #[arg(long, action = clap::ArgAction::Append, requires = "pd_disaggregation")]
+    pub decode: Vec<String>,
+
     /// Static worker URLs, space-separated or repeated. Conflicts with --service-discovery.
     #[arg(long, num_args = 1..)]
     pub worker_urls: Vec<String>,
@@ -246,6 +270,7 @@ pub struct RoutingArgs {
     /// Routing policy (defaults to power_of_two with reorg routing).
     #[arg(
         long,
+        visible_alias = "prefill-policy",
         value_enum,
         default_value = "round_robin",
         default_value_if("chat_routing", "reorg", "power_of_two")
@@ -491,6 +516,17 @@ pub struct AffinityArgs {
 impl Cli {
     /// Resolve CLI options and validate the resulting configuration.
     pub fn into_config(mut self) -> Result<Config> {
+        let infer_model_from_workers = self.model.model_id.is_none();
+        let model_id = self
+            .model
+            .model_id
+            .clone()
+            .or(self.model.model_path.clone())
+            .context("pass --model-id or --model-path")?;
+        ensure!(
+            self.server.worker_startup_timeout_secs > 0,
+            "--worker-startup-timeout-secs must be positive"
+        );
         let reorg = self.routing.chat_routing == ChatRoutingKind::Reorg;
         if reorg {
             ensure!(
@@ -553,6 +589,8 @@ impl Cli {
             .affinity
             .build_config(&self.cache, self.routing.policy)?;
         let discovery = self.discovery.into_config()?;
+        ensure!(!infer_model_from_workers || matches!(&discovery, DiscoveryBackend::StaticUrls(_)),
+            "--model-path without --model-id requires static workers; use --served-model-name with Kubernetes discovery");
         let path = self.routing.bucket_config.as_deref();
         let (bucket_config, reorg_buckets) = match path {
             Some(path) if reorg => (None, Some(load_bucket_config(path)?)),
@@ -626,6 +664,8 @@ impl Cli {
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
                 worker_auth,
+                infer_model_from_workers,
+                worker_startup_timeout_secs: self.server.worker_startup_timeout_secs,
             },
             observability: ObservabilityConfig {
                 log_level: self.server.log_level,
@@ -635,9 +675,10 @@ impl Cli {
                 tokenizer_path: (!self.model.no_tokenizer).then(|| {
                     self.model
                         .tokenizer_path
-                        .unwrap_or_else(|| self.model.model_id.clone())
+                        .or(self.model.model_path)
+                        .unwrap_or_else(|| model_id.clone())
                 }),
-                id: self.model.model_id,
+                id: model_id,
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
                 tokenizer: TokenizerConfig {
                     backend: self.model.tokenizer_backend,
@@ -682,7 +723,24 @@ impl Cli {
 }
 
 impl DiscoveryArgs {
-    fn into_config(self) -> Result<DiscoveryBackend> {
+    fn into_config(mut self) -> Result<DiscoveryBackend> {
+        let mut roles = std::collections::HashMap::new();
+        if self.pd_disaggregation {
+            for pair in self.prefill.chunks_exact(2) {
+                let port = pair[1]
+                    .parse::<std::num::NonZeroU16>()
+                    .context("--prefill bootstrap port must be between 1 and 65535")?;
+                self.worker_urls.push(pair[0].clone());
+                roles.insert(
+                    pair[0].clone(),
+                    (crate::discovery::WorkerMode::Prefill, Some(port.get())),
+                );
+            }
+            for url in self.decode {
+                self.worker_urls.push(url.clone());
+                roles.insert(url, (crate::discovery::WorkerMode::Decode, None));
+            }
+        }
         let has_static = !self.worker_urls.is_empty();
         let backend = match (has_static, self.service_discovery) {
             (true, true) => {
@@ -716,6 +774,7 @@ impl DiscoveryArgs {
                 );
                 DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                     urls: self.worker_urls,
+                    roles,
                 })
             }
             (false, true) => {

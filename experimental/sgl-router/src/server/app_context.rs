@@ -55,6 +55,7 @@ pub struct AppContext {
     pub proxy: Arc<Proxy>,
     pub registry: Arc<WorkerRegistry>,
     pub policies: Arc<PolicyRegistry>,
+    pub decode_policy: Box<dyn crate::policies::decode::DecodePolicy>,
     /// Converts static Bucket configuration into request candidate domains.
     pub bucket_selector: Arc<BucketSelector>,
     /// Select legacy policies or model-specific bucket-first routing.
@@ -131,12 +132,15 @@ impl AppContext {
         policies.attach_metrics(Arc::clone(&metrics));
         let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
         let decode_gate = DecodeGate::new(config.proxy.decode_dispatch_limit);
+        let decode_policy =
+            crate::policies::decode::build_decode_policy(config.model.decode_policy);
         Self {
             config,
             tokenizers,
             proxy,
             registry,
             policies,
+            decode_policy,
             bucket_selector,
             chat_routing: ChatRouting::Legacy,
             router_inflight_load,
@@ -205,6 +209,7 @@ impl AppContext {
     #[cfg(test)]
     pub fn stub() -> Self {
         Self {
+            decode_policy: crate::policies::decode::build_decode_policy(Default::default()),
             config: Config {
                 server: crate::config::ServerConfig {
                     host: "x".into(),
@@ -235,6 +240,7 @@ impl AppContext {
                 },
                 discovery: crate::config::DiscoveryBackend::StaticUrls(
                     crate::config::StaticUrlsDiscoveryConfig {
+                        roles: Default::default(),
                         urls: vec!["http://placeholder:0".into()],
                     },
                 ),
