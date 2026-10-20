@@ -578,9 +578,10 @@ impl PreparedRequest {
     }
 
     pub(super) fn engine_rid(&self) -> Option<String> {
-        // Caller IDs are unsafe for prefix aborts; fan-out regenerates IDs.
-        // Both PD legs share the minted ID and abort their own unfinished work.
-        if self.caller_set_rid || self.fans_out {
+        // Caller IDs are unsafe for prefix aborts. Native generation expands a
+        // router-owned prefix into per-sample IDs; OpenAI passthrough may mint its own.
+        // Both PD legs share the prefix and abort their own unfinished work.
+        if self.caller_set_rid || (self.fans_out && self.path != GENERATE_PATH) {
             return None;
         }
         Some(uuid::Uuid::new_v4().simple().to_string())
