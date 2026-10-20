@@ -35,6 +35,7 @@ pub struct FailedWorker {
 /// `message` is a human/log summary — the HTTP status is authoritative.
 #[derive(Serialize)]
 pub struct FlushCacheResult {
+    pub status: &'static str,
     pub successful: Vec<String>,
     pub failed: Vec<FailedWorker>,
     pub total_workers: usize,
@@ -65,6 +66,11 @@ impl FlushCacheResult {
             )
         };
         Self {
+            status: if failed.is_empty() {
+                "success"
+            } else {
+                "error"
+            },
             successful,
             failed,
             total_workers,
@@ -395,6 +401,26 @@ mod tests {
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         (status, body)
+    }
+
+    #[tokio::test]
+    async fn gateway_flush_status_matches_the_full_fanout_outcome() {
+        for (worker_status, expected_http, expected_status) in [
+            (StatusCode::OK, StatusCode::OK, "success"),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::BAD_GATEWAY,
+                "error",
+            ),
+        ] {
+            let (url, _stop) = spawn_fake_flush_worker(worker_status).await;
+            let (status, body) = post_flush(ctx_with_workers(&[&url])).await;
+            assert_eq!(status, expected_http);
+            assert_eq!(
+                body["status"], expected_status,
+                "gateway kits inspect this status field"
+            );
+        }
     }
 
     #[tokio::test]
