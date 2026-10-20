@@ -95,6 +95,10 @@ pub async fn serve(
     let mut app = router
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state);
+    // Python's `track_http_status_code` middleware feeds `sglang:routing_keys_active`.
+    if crate::utils::tokenizer_metrics::get().is_some() {
+        app = app.layer(axum::middleware::from_fn(track_routing_key));
+    }
     if let Some(http_layer) = http_layer {
         app = http_layer(app);
     }
@@ -137,4 +141,26 @@ pub async fn serve(
             tracing::info!("shutdown: stopping accepts, aborting in-flight handlers");
         }
     }
+}
+
+/// `routing_keys_active.inc/dec` around a request carrying `x-smg-routing-key`;
+/// like Python's middleware, the request counts until its response starts.
+async fn track_routing_key(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let metrics = crate::utils::tokenizer_metrics::get();
+    let key = request
+        .headers()
+        .get("x-smg-routing-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    if let (Some(metrics), Some(key)) = (metrics, &key) {
+        metrics.routing_key(key, true);
+    }
+    let response = next.run(request).await;
+    if let (Some(metrics), Some(key)) = (metrics, &key) {
+        metrics.routing_key(key, false);
+    }
+    response
 }

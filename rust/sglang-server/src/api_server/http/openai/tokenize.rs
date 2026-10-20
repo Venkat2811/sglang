@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::chat::ChatRequest;
-use super::{AppState, contains_media};
+use super::{AppState, ChatFormatter, contains_media};
 use crate::api_server::core::CoreError;
 use crate::message::types::{OneOrMany, TokenIds};
 
@@ -107,6 +107,27 @@ async fn tokenize(
         (Some(prompt), None) => (prompt, body.add_special_tokens),
         // The rendered template owns its special tokens, as on the chat path
         // (Python encodes it with `add_special_tokens=False`).
+        // Kimi-K3 renders straight to ids (the chat path's), as Python's `_process_messages` does.
+        (None, Some(messages)) if matches!(state.chat_formatter, Some(ChatFormatter::KimiK3(_))) => {
+            let Some(ChatFormatter::KimiK3(kimi_k3)) = &state.chat_formatter else {
+                unreachable!()
+            };
+            let mut fields = body.rest;
+            fields.insert("messages".into(), messages);
+            let kimi_k3 = kimi_k3.clone();
+            let encoded =
+                tokio::task::spawn_blocking(move || kimi_k3.encode(&Value::Object(fields))).await;
+            return match encoded {
+                Ok(Ok(tokens)) => Json(json!({
+                    "tokens": tokens,
+                    "count": tokens.len(),
+                    "max_model_len": state.server_args.tokenizer_model_max_length,
+                }))
+                .into_response(),
+                Ok(Err(message)) => bad_request(format!("chat template render failed: {message}")),
+                Err(error) => bad_request(error.to_string()),
+            };
+        }
         (None, Some(messages)) => match render_chat_prompt(&state, messages, body.rest) {
             Ok(prompt) => (OneOrMany::One(prompt), false /* add_special_tokens */),
             Err((error_type, message)) => {

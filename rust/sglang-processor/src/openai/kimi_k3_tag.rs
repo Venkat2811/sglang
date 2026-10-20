@@ -12,6 +12,7 @@ use crate::kimi_k3_format::{
 };
 
 const CLOSE_TOKEN: &str = "<|close|>";
+const ARGUMENT_CLOSE: &str = "<|close|>argument<|sep|>";
 
 const JSON_TYPES: [&str; 7] = [
     "string", "number", "integer", "boolean", "array", "object", "null",
@@ -71,6 +72,335 @@ pub(super) fn auto_tool_call_tag(
         "excludes": excludes,
     });
     Ok(Some(json!({"type": "structural_tag", "format": format})))
+}
+
+/// `get_kimik3_structural_tag`: the tag Python builds for `tool_choice`
+/// `"required"` or a named function (`at_least_one`: free text, then one tools
+/// section with at least one call) and for `"auto"` with a strict tool (the
+/// auto trigger over the same calls). A named choice keeps only its tool. The
+/// reasoning prefix is left to the reasoning parser (`thinking_mode=False`, as
+/// with `--reasoning-parser kimi_k3`); `strip` as in [`auto_tool_call_tag`].
+/// `Ok(None)` where Python's builder raises and the request goes unconstrained.
+pub(super) fn tool_call_tag_for_choice(
+    tools: &[Value],
+    named: Option<&str>,
+    at_least_one: bool,
+    parallel_tool_calls: bool,
+    strip: &[&str],
+) -> Result<Option<Value>, Unsupported> {
+    // `_select_tools`: a named choice keeps only its tool.
+    let selected: Vec<&Value> = tools
+        .iter()
+        .filter(|tool| named.is_none_or(|name| tool["function"]["name"] == name))
+        .collect();
+    if selected.is_empty() {
+        return Err(Unsupported("tool_choice"));
+    }
+    let Ok(call_tags) = selected
+        .iter()
+        .map(|tool| choice_call_tag(&tool["function"]))
+        .collect::<Result<Vec<Value>, ()>>()
+    else {
+        return Ok(None);
+    };
+    let tools_tag = tool_calls_tag(call_tags, parallel_tool_calls);
+    let keep = |tokens: &[&'static str]| -> Vec<&'static str> {
+        tokens.iter().copied().filter(|t| !strip.contains(t)).collect()
+    };
+    let format = if at_least_one {
+        let excludes = keep(&[TOOLS_OPEN, THINK_OPEN, THINK_CLOSE, CALL_OPEN]);
+        sequence(vec![any_text(&excludes), tools_tag])
+    } else {
+        json!({
+            "type": "triggered_tags",
+            "triggers": [TOOLS_OPEN],
+            "tags": [tools_tag],
+            "at_least_one": false,
+            "stop_after_first": !parallel_tool_calls,
+            "excludes": keep(&[THINK_OPEN, THINK_CLOSE, CALL_OPEN]),
+        })
+    };
+    Ok(Some(json!({"type": "structural_tag", "format": format})))
+}
+
+/// `_tool_call_tag(tool)` with `_tool_arguments_format`: a non-strict tool takes
+/// any number of loose arguments, a strict one its schema's.
+fn choice_call_tag(function: &Value) -> Result<Value, ()> {
+    let arguments = if function["strict"] == true {
+        strict_tool_arguments(&function["parameters"])?
+    } else {
+        json!({"type": "star", "content": dynamic_argument_format(&Value::Bool(true), &json!({}), true)?})
+    };
+    let name = escape_attr(function["name"].as_str().unwrap_or_default());
+    Ok(json!({
+        "type": "tag",
+        "begin": format!("{CALL_OPEN} tool=\"{name}\" index=\""),
+        "content": sequence(vec![
+            json!({"type": "regex", "pattern": "[1-9][0-9]*"}),
+            json!({"type": "const_string", "value": "\"<|sep|>"}),
+            arguments,
+        ]),
+        "end": CALL_CLOSE,
+    }))
+}
+
+fn xtml_type(json_type: &str) -> &str {
+    if json_type == "integer" { "number" } else { json_type }
+}
+
+fn types_of(schema: &Value, root: &Value) -> Result<Vec<&'static str>, ()> {
+    let mut steps = 0;
+    schema_types(schema, root, &[], &mut steps).ok_or(())
+}
+
+/// `_matches_json_type`.
+fn matches_json_type(value: &Value, json_type: &str) -> bool {
+    let value_type = self::json_type(value);
+    value_type == json_type || (json_type == "number" && value_type == "integer")
+}
+
+/// `_with_root_definitions`.
+fn with_root_definitions(schema: Value, root: &Value) -> Value {
+    let Value::Object(mut result) = schema else {
+        return schema;
+    };
+    for key in ["$defs", "definitions"] {
+        if let Some(definitions) = root.get(key)
+            && !result.contains_key(key)
+        {
+            result.insert(key.into(), definitions.clone());
+        }
+    }
+    Value::Object(result)
+}
+
+/// `_restrict_schema_type`; `Ok(None)` is Python's `False`.
+fn restrict_schema_type(
+    schema: &Value,
+    json_type: &str,
+    root: &Value,
+    depth: usize,
+) -> Result<Option<Value>, ()> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(());
+    }
+    let Value::Object(map) = schema else {
+        return Ok((schema != &Value::Bool(false)).then(|| json!({"type": json_type})));
+    };
+    if let Some(Value::String(reference)) = map.get("$ref")
+        && let Some(target) = resolve_local_ref(reference, root)
+    {
+        return Ok(restrict_schema_type(target, json_type, root, depth + 1)?
+            .map(|restricted| with_root_definitions(restricted, root)));
+    }
+    let mut result = map.clone();
+    match result.get("type") {
+        Some(Value::Array(types)) => {
+            if !types.iter().any(|t| t == json_type) {
+                return Ok(None);
+            }
+            result.insert("type".into(), json_type.into());
+        }
+        Some(Value::String(t)) => {
+            if t != json_type {
+                return Ok(None);
+            }
+        }
+        _ => {
+            result.insert("type".into(), json_type.into());
+        }
+    }
+    for keyword in ["anyOf", "oneOf"] {
+        let Some(Value::Array(options)) = result.get(keyword).cloned() else {
+            continue;
+        };
+        let mut restricted = Vec::new();
+        for option in options.iter().filter(|o| o.is_boolean() || o.is_object()) {
+            if types_of(option, root)?.contains(&json_type) {
+                restricted.push(
+                    restrict_schema_type(option, json_type, root, depth + 1)?
+                        .unwrap_or(Value::Bool(false)),
+                );
+            }
+        }
+        if restricted.is_empty() {
+            return Ok(None);
+        }
+        match restricted.as_slice() {
+            [Value::Object(only)] => {
+                result.shift_remove(keyword);
+                for (key, value) in only {
+                    result.insert(key.clone(), value.clone());
+                }
+            }
+            _ => {
+                result.insert(keyword.into(), Value::Array(restricted));
+            }
+        }
+    }
+    if let Some(Value::Array(values)) = result.get("enum") {
+        let kept: Vec<Value> = values
+            .iter()
+            .filter(|v| matches_json_type(v, json_type))
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            return Ok(None);
+        }
+        result.insert("enum".into(), Value::Array(kept));
+    }
+    if result
+        .get("const")
+        .is_some_and(|value| !matches_json_type(value, json_type))
+    {
+        return Ok(None);
+    }
+    Ok(Some(with_root_definitions(Value::Object(result), root)))
+}
+
+/// `_value_format`.
+fn value_format(schema: Value, json_type: &str, loose_string: bool) -> Value {
+    if loose_string && json_type == "string" {
+        return any_text(&[]);
+    }
+    let mut schema = schema;
+    // XGrammar 0.2.1 miscompiles a one-sided negative integer lower bound; the
+    // range is split at zero, as Python does.
+    if json_type == "integer"
+        && let Value::Object(map) = &schema
+        && !["maximum", "exclusiveMaximum", "multipleOf"]
+            .iter()
+            .any(|k| map.contains_key(*k))
+    {
+        let int = |key: &str| map.get(key).filter(|v| v.is_i64() || v.is_u64()).and_then(Value::as_i64);
+        let bounds: Vec<i64> = [int("minimum"), int("exclusiveMinimum").map(|v| v + 1)]
+            .into_iter()
+            .flatten()
+            .collect();
+        if bounds.iter().max().is_some_and(|max| *max < 0) {
+            let mut negative = map.clone();
+            negative.insert("maximum".into(), json!(-1));
+            let mut nonnegative = map.clone();
+            nonnegative.shift_remove("exclusiveMinimum");
+            nonnegative.insert("minimum".into(), json!(0));
+            schema = json!({"anyOf": [negative, nonnegative]});
+        }
+    }
+    let style = if json_type == "string" { "qwen_xml" } else { "json" };
+    json!({"type": "json_schema", "json_schema": schema, "style": style, "any_order": false, "max_whitespace_cnt": null})
+}
+
+/// `_argument_value_variants`.
+fn argument_value_variants(
+    schema: &Value,
+    root: &Value,
+    loose_strings: bool,
+) -> Result<Vec<(&'static str, Value)>, ()> {
+    let mut variants = Vec::new();
+    for json_type in types_of(schema, root)? {
+        if let Some(restricted) = restrict_schema_type(schema, json_type, root, 0)? {
+            variants.push((json_type, value_format(restricted, json_type, loose_strings)));
+        }
+    }
+    Ok(variants)
+}
+
+/// `_dynamic_argument_format`: any key, typed values.
+fn dynamic_argument_format(schema: &Value, root: &Value, loose_strings: bool) -> Result<Value, ()> {
+    let variants: Vec<Value> = argument_value_variants(schema, root, loose_strings)?
+        .into_iter()
+        .map(|(json_type, value)| {
+            sequence(vec![
+                json!({"type": "regex", "pattern": r#"[^"& \t\r\n\f\v=<>]+"#}),
+                json!({"type": "const_string", "value": format!("\" type=\"{}\"<|sep|>", xtml_type(json_type))}),
+                value,
+            ])
+        })
+        .collect();
+    let content = match variants.len() {
+        0 => return Err(()),
+        1 => variants.into_iter().next().expect("one variant"),
+        _ => json!({"type": "or", "elements": variants}),
+    };
+    Ok(json!({"type": "tag", "begin": "<|open|>argument key=\"", "content": content, "end": ARGUMENT_CLOSE}))
+}
+
+/// `_known_argument_format`.
+fn known_argument_format(key: &str, schema: &Value, root: &Value) -> Result<Option<Value>, ()> {
+    let key = escape_attr(key);
+    let mut variants: Vec<Value> = argument_value_variants(schema, root, false)?
+        .into_iter()
+        .map(|(json_type, value)| {
+            json!({
+                "type": "tag",
+                "begin": format!("<|open|>argument key=\"{key}\" type=\"{}\"<|sep|>", xtml_type(json_type)),
+                "content": value,
+                "end": ARGUMENT_CLOSE,
+            })
+        })
+        .collect();
+    Ok(match variants.len() {
+        0 => None,
+        1 => variants.pop(),
+        _ => Some(json!({"type": "or", "elements": variants})),
+    })
+}
+
+/// `_strict_arguments_format`.
+fn strict_arguments_format(parameters: &Value) -> Result<Value, ()> {
+    let empty = json!({});
+    let properties = parameters.get("properties").unwrap_or(&empty).as_object().ok_or(())?;
+    let no_required = json!([]);
+    let required: Vec<&str> = parameters
+        .get("required")
+        .unwrap_or(&no_required)
+        .as_array()
+        .ok_or(())?
+        .iter()
+        .map(|r| r.as_str().ok_or(()))
+        .collect::<Result<_, _>>()?;
+    if required.iter().any(|key| !properties.contains_key(*key)) {
+        return Err(());
+    }
+    let mut elements = Vec::new();
+    for (key, schema) in properties {
+        if !(schema.is_boolean() || schema.is_object()) {
+            return Err(());
+        }
+        match known_argument_format(key, schema, parameters)? {
+            Some(argument) if required.contains(&key.as_str()) => elements.push(argument),
+            Some(argument) => elements.push(json!({"type": "optional", "content": argument})),
+            None if required.contains(&key.as_str()) => return Err(()),
+            None => {}
+        }
+    }
+    match parameters.get("additionalProperties").unwrap_or(&Value::Bool(true)) {
+        Value::Bool(true) => elements.push(
+            json!({"type": "star", "content": dynamic_argument_format(&Value::Bool(true), parameters, false)?}),
+        ),
+        additional @ Value::Object(_) => elements.push(
+            json!({"type": "star", "content": dynamic_argument_format(additional, parameters, false)?}),
+        ),
+        Value::Bool(false) => {}
+        _ => return Err(()),
+    }
+    Ok(if elements.is_empty() {
+        json!({"type": "const_string", "value": ""})
+    } else {
+        sequence(elements)
+    })
+}
+
+/// `_tool_arguments_format` for a strict tool.
+fn strict_tool_arguments(parameters: &Value) -> Result<Value, ()> {
+    match parameters {
+        // Strict tools without parameters take no arguments.
+        Value::Null => Ok(json!({"type": "const_string", "value": ""})),
+        Value::Object(_) if types_of(parameters, parameters)?.contains(&"object") => {
+            strict_arguments_format(parameters)
+        }
+        _ => Err(()),
+    }
 }
 
 fn escape_attr(value: &str) -> String {

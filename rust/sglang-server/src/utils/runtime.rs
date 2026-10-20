@@ -124,6 +124,9 @@ impl Drop for Runtime {
 /// [`HttpLayer`]). Returns once threads are spawned (non-blocking).
 /// `Err` on a startup misconfiguration (e.g. no tokenizer for a non-skip server).
 pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtime, String> {
+    if cfg.server_args.metrics.is_some() {
+        crate::utils::tokenizer_metrics::init(&cfg.server_args);
+    }
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
     let plan = plan_cores(&cfg);
@@ -178,9 +181,13 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     )?;
     // The `TextTokenizer` view of it, for the tokenizer pool. The MM workers
     // never tokenize: a multimodal text prompt passes through the pool first.
-    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer
-        .as_ref()
-        .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
+    let kimi_chunks = tokenizer::kimi_chunking(
+        &cfg.server_args.tokenizer_path,
+        cfg.server_args.revision.as_deref(),
+    );
+    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer.as_ref().map(|t| {
+        Arc::new(tokenizer::DynamoTokenizer::with_kimi_chunks(t.clone(), kimi_chunks)) as _
+    });
 
     // The potentially slow/fallible tokenizer load above happens before the
     // ports become visible. Own both sockets before starting any worker or

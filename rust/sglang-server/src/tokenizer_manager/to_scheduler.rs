@@ -352,16 +352,34 @@ impl Intake {
     /// stop in the output) — so the shard needs no back-reference to the request.
     /// Returns `false` if the shard is gone.
     fn register_detok(&self, req: &Request) -> bool {
-        let (decode_logprob_text, no_stop_trim) = match &req.kind {
+        let times = match &req.kind {
+            RequestKind::Generate(g) if crate::utils::tokenizer_metrics::get().is_some() => {
+                let sp = &g.sampling_params;
+                // `_request_has_grammar`.
+                let has_grammar = [&sp.json_schema, &sp.regex, &sp.ebnf, &sp.structural_tag]
+                    .iter()
+                    .any(|c| c.as_deref().is_some_and(|c| !c.is_empty()));
+                Some(crate::utils::tokenizer_metrics::RequestTimes::new(
+                    g.received_at.unwrap_or_else(std::time::Instant::now),
+                    g.stream,
+                    has_grammar,
+                    g.input_ids.as_ref().map_or(0, |ids| ids.len() as u32),
+                ))
+            }
+            _ => None,
+        };
+        let (decode_logprob_text, no_stop_trim, skip_special_tokens) = match &req.kind {
             RequestKind::Generate(g) => (
                 g.return_text_in_logprobs.unwrap_or(false),
                 g.sampling_params.no_stop_trim,
+                g.sampling_params.skip_special_tokens,
             ),
             RequestKind::Control(_)
             | RequestKind::Detokenize { .. }
             | RequestKind::Tokenize { .. } => (
                 false, /* decode_logprob_text */
                 false, /* no_stop_trim */
+                true,  /* skip_special_tokens */
             ),
         };
         self.senders
@@ -371,6 +389,8 @@ impl Intake {
                 sink: req.sink.clone(),
                 decode_logprob_text,
                 no_stop_trim,
+                skip_special_tokens,
+                times,
             })
             .is_ok()
     }
@@ -473,6 +493,9 @@ impl Intake {
         }
         if matches!(source, AbortSource::Local(_)) {
             return;
+        }
+        if let Some(metrics) = crate::utils::tokenizer_metrics::get() {
+            metrics.on_abort();
         }
 
         // The channel is BOUNDED and drops pushes under exactly the load this matters

@@ -13,3 +13,4 @@ pub mod shm;
 pub mod sock;
 pub mod startup;
 pub mod threads;
+pub mod tokenizer_metrics;

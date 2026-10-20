@@ -34,6 +34,9 @@ pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
 pub enum ChatFormatter {
     HuggingFace(PromptFormatter),
     Legacy(Box<LegacyFormatter>),
+    /// Kimi-K3: rendered to token ids by `sglang-processor` and served
+    /// through `/generate` (`kimi_k3.rs`), never as prompt text.
+    KimiK3(std::sync::Arc<super::kimi_k3::KimiK3Chat>),
 }
 
 impl ChatFormatter {
@@ -50,6 +53,9 @@ impl ChatFormatter {
                     message: error.to_string(),
                 }),
             ChatFormatter::Legacy(formatter) => formatter.render(request),
+            ChatFormatter::KimiK3(_) => Err(TemplateError::Renderer {
+                message: "Kimi-K3 chat renders to token ids, not text".into(),
+            }),
         }
     }
 
@@ -59,7 +65,7 @@ impl ChatFormatter {
     /// Python's jinja path, which keeps only the request's own stops.
     pub(super) fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
-            ChatFormatter::HuggingFace(_) => None,
+            ChatFormatter::HuggingFace(_) | ChatFormatter::KimiK3(_) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }

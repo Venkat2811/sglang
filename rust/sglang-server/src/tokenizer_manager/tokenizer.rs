@@ -50,8 +50,12 @@ pub fn load_tokenizer(
     let path = tokenizer_path.ok_or_else(|| {
         "no tokenizer configured: set tokenizer_path or enable skip_tokenizer_init".to_string()
     })?;
-    let file = resolve_model_file(path, revision, "tokenizer.json")
-        .ok_or_else(|| format!("tokenizer.json not found for '{path}'"))?;
+    // `tokenizer.json`, or `tiktoken.model` / `*.tiktoken` (Kimi), as the processor discovers them.
+    let file = sglang_processor::resolve_tokenizer_file(path, revision).ok_or_else(|| {
+        format!(
+            "no supported tokenizer file found for '{path}' (expected tokenizer.json, tiktoken.model, or *.tiktoken)"
+        )
+    })?;
     let tokenizer = dynamo_tokenizers::Tokenizer::from_file_with_options(
         &file,
         dynamo_tokenizers::TokenizerOptions {
@@ -106,14 +110,57 @@ fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>, filename: &str)
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Whether the tokenizer source resolves to a tiktoken file. The tiktoken models
+/// served here (Kimi) encode with `tokenization_kimi.py`'s cuts ([`kimi_encode`]).
+pub fn kimi_chunking(tokenizer_path: &str, revision: Option<&str>) -> bool {
+    sglang_processor::resolve_tokenizer_file(tokenizer_path, revision)
+        .is_some_and(|file| file.ends_with("tiktoken.model") || file.ends_with(".tiktoken"))
+}
+
+/// `tokenization_kimi.py` encodes 400k-char windows, each split after 25k
+/// consecutive (non-)whitespace chars, and BPE is not chunk-invariant
+/// (as `experimental/sgl-router/src/tokenizer/kimi.rs`).
+pub fn kimi_encode(
+    tokenizer: &dynamo_tokenizers::Tokenizer,
+    segments: &[dynamo_tokenizers::EncodeSegment<'_>],
+) -> Result<Vec<u32>, String> {
+    let mut chunks = Vec::new();
+    for segment in segments {
+        let (mut start, mut run, mut was_space) = (0, 0, false);
+        for (count, (offset, ch)) in segment.text.char_indices().enumerate() {
+            // Python's `str.isspace` also covers U+001C..U+001F.
+            let space = ch.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&ch);
+            run = if space == was_space { run + 1 } else { 1 };
+            if (count > 0 && count % 400_000 == 0) || run > 25_000 {
+                chunks.push(dynamo_tokenizers::EncodeSegment::new(
+                    &segment.text[start..offset],
+                    segment.allow_special,
+                ));
+                (start, run) = (offset, 1);
+            }
+            was_space = space;
+        }
+        chunks.push(dynamo_tokenizers::EncodeSegment::new(
+            &segment.text[start..],
+            segment.allow_special,
+        ));
+    }
+    tokenizer
+        .encode_segments(&chunks)
+        .map(|encoding| encoding.token_ids().to_vec())
+        .map_err(|e| e.to_string())
+}
+
 /// Real tokenizer over an already-loaded dynamo `Tokenizer` (Arc inside).
 pub struct DynamoTokenizer {
     inner: dynamo_tokenizers::Tokenizer,
+    /// Encode as `tokenization_kimi.py` does ([`kimi_encode`]).
+    kimi_chunks: bool,
 }
 
 impl DynamoTokenizer {
-    pub fn new(inner: dynamo_tokenizers::Tokenizer) -> Self {
-        Self { inner }
+    pub fn with_kimi_chunks(inner: dynamo_tokenizers::Tokenizer, kimi_chunks: bool) -> Self {
+        Self { inner, kimi_chunks }
     }
 }
 
@@ -123,6 +170,12 @@ impl TextTokenizer for DynamoTokenizer {
             // Match Python sglang: reject an empty prompt as a 400 (`Validation`),
             // not the misleading 500 a tokenize error would give.
             return Err(Error::Validation("prompt cannot be empty".into()));
+        }
+        if self.kimi_chunks {
+            // Raw prompts may spell special tokens, as Python's `encode(text)` allows.
+            let segment = dynamo_tokenizers::EncodeSegment::control(text);
+            let ids = kimi_encode(&self.inner, &[segment]).map_err(Error::Tokenize)?;
+            return Ok(ids.into_iter().map(i64::from).collect());
         }
         let encoding = self
             .inner

@@ -140,6 +140,7 @@ impl CoreHandle {
         &self,
         mut request: GenerateRequest,
     ) -> Result<CoreCall, CoreError> {
+        request.received_at.get_or_insert_with(std::time::Instant::now);
         self.prepare_generations(std::slice::from_mut(&mut request))
             .await?;
         self.submit(RequestKind::Generate(Box::new(request)))
@@ -155,6 +156,10 @@ impl CoreHandle {
         &self,
         mut requests: Vec<GenerateRequest>,
     ) -> Result<Vec<CoreCall>, CoreError> {
+        let received_at = std::time::Instant::now();
+        for request in &mut requests {
+            request.received_at.get_or_insert(received_at);
+        }
         self.prepare_generations(&mut requests).await?;
 
         let mut calls = Vec::with_capacity(requests.len());

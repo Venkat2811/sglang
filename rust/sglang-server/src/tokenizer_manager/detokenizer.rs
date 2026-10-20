@@ -35,11 +35,6 @@ use crate::utils::{
     fsm::{Event, RequestState},
 };
 
-/// Default for `skip_special_tokens` (SGLang's SamplingParams default). The
-/// per-request value isn't available on the response yet; see the note in
-/// `DetokenizerBackend::new_decoder`.
-const SKIP_SPECIAL_TOKENS: bool = true;
-
 /// Per-request incremental decoder. `step` feeds the new token ids for one chunk
 /// and returns the newly decoded text delta (empty if the ids only produced a
 /// partial/incomplete multi-byte sequence that needs more tokens). `finish` marks
@@ -91,14 +86,14 @@ pub enum DetokenizerBackend {
 impl DetokenizerBackend {
     /// Mint a per-request decoder, or `None` in skip mode (the shard passes the
     /// token ids through untouched instead of decoding text).
-    fn new_decoder(&self) -> Option<Box<dyn StreamDecoder>> {
+    fn new_decoder(&self, skip_special_tokens: bool) -> Option<Box<dyn StreamDecoder>> {
         match self {
             // NOTE: the stream is seeded with an empty prompt context, which is
             // correct for the common case. Seeding with the prompt's trailing
             // tokens (for perfect first-token spacing) would require Register to
             // carry input_ids — deferred.
             DetokenizerBackend::Dynamo(t) => Some(Box::new(DynamoDecoder {
-                stream: t.decode_stream(&[], SKIP_SPECIAL_TOKENS),
+                stream: t.decode_stream(&[], skip_special_tokens),
             })),
             DetokenizerBackend::Skip => None,
         }
@@ -157,6 +152,8 @@ struct DetokState {
     /// its FSM) was handed to the scheduler when queued; the shard is the sole
     /// owner of the response state, so no lock.
     fsm: RequestState,
+    /// Timing for the TokenizerManager metrics; `None` without `--enable-metrics`.
+    times: Option<crate::utils::tokenizer_metrics::RequestTimes>,
 }
 
 /// One detokenizer shard: owns a *local* `rid -> DetokState` map (single accessor,
@@ -201,6 +198,8 @@ impl Runnable for DetokenizerWorker {
                     sink,
                     decode_logprob_text,
                     no_stop_trim,
+                    skip_special_tokens,
+                    times,
                 } => {
                     table.insert(
                         rid.clone(),
@@ -208,7 +207,8 @@ impl Runnable for DetokenizerWorker {
                             sink,
                             decode_logprob_text,
                             no_stop_trim,
-                            decoder: self.backend.new_decoder(),
+                            decoder: self.backend.new_decoder(skip_special_tokens),
+                            times,
                             // Registered == handed to the scheduler == Queued.
                             fsm: RequestState::Queued,
                         },
@@ -236,7 +236,9 @@ impl Runnable for DetokenizerWorker {
                     handle_fail(&mut table, &rid, message, &self.abort)
                 }
                 DetokMsg::Deregister { rid } => {
-                    table.remove(&rid);
+                    if let Some(mut st) = table.remove(&rid) {
+                        count_dropped(&mut st);
+                    }
                 }
             }
         }
@@ -282,6 +284,14 @@ fn handle_result(table: &mut HashMap<Rid, DetokState>, rid: &Rid, payload: bytes
 /// producers of this message are server faults — a malformed scheduler output
 /// frame — not bad client input. Also aborts the request on the scheduler, which
 /// otherwise keeps generating tokens for a connection that will never read them.
+/// A request leaving the table without its finish chunk still counts as a
+/// finished (aborted) request in the TokenizerManager metrics, as in Python.
+fn count_dropped(st: &mut DetokState) {
+    if let (Some(mut times), Some(metrics)) = (st.times.take(), crate::utils::tokenizer_metrics::get()) {
+        metrics.on_dropped(&mut times);
+    }
+}
+
 fn handle_fail(
     table: &mut HashMap<Rid, DetokState>,
     rid: &Rid,
@@ -289,6 +299,7 @@ fn handle_fail(
     abort: &flume::Sender<AbortSource>,
 ) {
     if let Some(mut st) = table.remove(rid) {
+        count_dropped(&mut st);
         // Abort first: `try_send` on the sink can release the handler, which frees
         // the rid for reuse (same ordering hazard as the disconnect path).
         let _ = abort.send(AbortSource::Detok(rid.clone()));
@@ -351,6 +362,7 @@ fn handle_chunk(
                 let _ = st.fsm.apply(Event::Error(e.clone()));
                 let _ = abort.send(AbortSource::Detok(rid.clone()));
                 let _ = st.sink.try_send(ResponseItem::Error(e));
+                count_dropped(st);
                 table.remove(&rid);
                 return;
             }
@@ -385,6 +397,15 @@ fn handle_chunk(
     ev.text = delta_text;
     ev.completion_tokens = n_tok;
     ev.stop_token_trimmed = stop_token_trimmed;
+    if let (Some(times), Some(metrics)) = (st.times.as_mut(), crate::utils::tokenizer_metrics::get()) {
+        metrics.on_chunk(
+            times,
+            n_tok,
+            ev.prompt_tokens,
+            ev.cached_tokens,
+            ev.finish_reason.as_ref(),
+        );
+    }
 
     if finished {
         // The Done frame *is* the final frame: Finalizing → Completed.
@@ -422,6 +443,7 @@ fn handle_chunk(
             if matches!(e, SinkError::Full) {
                 let _ = abort.send(AbortSource::Detok(rid.clone()));
             }
+            count_dropped(st);
             table.remove(&rid);
         }
     }
@@ -474,6 +496,7 @@ mod tests {
                 no_stop_trim: false,
                 decoder: None,
                 fsm: RequestState::Queued,
+                times: None,
             },
         );
 
@@ -545,6 +568,7 @@ mod tests {
                 no_stop_trim: false,
                 decoder: None,
                 fsm: RequestState::Queued,
+                times: None,
             },
         );
 
@@ -591,6 +615,7 @@ mod tests {
             no_stop_trim: false,
             decoder: None,
             fsm: RequestState::Queued,
+            times: None,
         };
         table.insert(Rid::from("alice"), state(tx_a));
         table.insert(Rid::from("bob"), state(tx_b));
@@ -648,6 +673,7 @@ mod tests {
                 no_stop_trim,
                 decoder: None, // skip mode → output_ids passthrough
                 fsm: RequestState::Queued,
+                times: None,
             },
         );
         let (tm_tx, _tm_rx) = flume::unbounded::<AbortSource>();

@@ -383,6 +383,7 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
             skip_special_tokens: false,
             sampling_params,
             stream,
+            received_at: None,
             // Python `GenerateReqInput` defaults.
             return_logprob: return_logprob.unwrap_or(false),
             logprob_start_len: logprob_start_len.unwrap_or(-1),
@@ -524,6 +525,9 @@ pub struct GenerateRequest {
     pub sampling_params: SamplingParams,
     /// Whether the caller requested incremental output.
     pub stream: bool,
+    /// When the core received the request (Python's `created_time`), for the
+    /// TokenizerManager metrics.
+    pub received_at: Option<std::time::Instant>,
     /// Logprob / hidden-state options. This path bypasses the Python
     /// `TokenizerManager`, so `into_requests` replicates its scalar
     /// normalization. Resolved to concrete values THERE rather than at the wire

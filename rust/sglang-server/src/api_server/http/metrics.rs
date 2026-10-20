@@ -36,11 +36,15 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     // Reading and merging every process's files is blocking file I/O.
     let collected = tokio::task::spawn_blocking(move || {
         let files = prometheus::read_dir_files(&dir)?;
-        let families = prometheus::merge(
+        let mut families = prometheus::merge(
             files
                 .iter()
                 .map(|(name, data)| (name.as_str(), data.as_slice())),
         );
+        // The TokenizerManager's request metrics live in this process.
+        if let Some(metrics) = crate::utils::tokenizer_metrics::get() {
+            crate::utils::tokenizer_metrics::merge_into(&mut families, metrics.families());
+        }
         Ok::<_, std::io::Error>(prometheus::render(&families))
     })
     .await;

@@ -175,7 +175,7 @@ async fn health_generate(
 /// The body is extracted as a `Result` so a deserialization failure is answered
 /// with **400** (Python's status for a bad request) carrying serde's field-level
 /// message, instead of axum's default 422.
-async fn generate(
+pub(super) async fn generate(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Result<Json<serde_json::Value>, JsonRejection>,

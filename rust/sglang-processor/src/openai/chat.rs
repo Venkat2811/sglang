@@ -7,7 +7,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use super::kimi_k3_tag::auto_tool_call_tag;
+use super::kimi_k3_tag::{auto_tool_call_tag, tool_call_tag_for_choice};
 use super::request::{
     OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, float_logit_bias,
     format_json_schema, lora_path, one, usage_flags, yes,
@@ -200,13 +200,16 @@ pub fn lower_chat(
     let Value::Object(mut raw) = original.clone() else {
         return Err(Unsupported("unparsed_request"));
     };
+    // Kimi-K3 with its tool parser serves tools declared on a system turn too
+    // (`_effective_tools`); other models still leave them to the engine.
+    let k3_tools = model.is_kimi_k3() && settings.tool_call_parser.as_deref() == Some("kimi_k3");
     if UNSUPPORTED_FIELDS
         .iter()
         .any(|field| raw.get(*field).is_some_and(|v| v != false))
         || raw
             .get("messages")
             .and_then(Value::as_array)
-            .is_some_and(|m| m.iter().any(has_tools_or_media))
+            .is_some_and(|m| m.iter().any(|message| has_tools_or_media(message, k3_tools)))
     {
         return Err(Unsupported("unsupported_chat_feature"));
     }
@@ -229,8 +232,50 @@ pub fn lower_chat(
     {
         return Err(Unsupported("tool_grammar"));
     }
-    let tools = request_tools(&raw)?;
-    let tool_definitions = raw.get("tools").and_then(Value::as_array).cloned();
+    // `_effective_tools`: the request's tools, then each system turn's.
+    let effective_tools = match k3_tools {
+        true => {
+            let mut all: Vec<Value> = match raw.get("tools") {
+                Some(Value::Array(tools)) => tools.clone(),
+                Some(Value::Null) | None => Vec::new(),
+                Some(_) => return Err(Unsupported("invalid_request")),
+            };
+            let declared = raw.get("tools").is_some_and(|t| !t.is_null());
+            for message in raw.get("messages").and_then(Value::as_array).into_iter().flatten() {
+                if matches!(message["role"].as_str(), Some("system" | "developer"))
+                    && let Some(tools) = message["tools"].as_array()
+                {
+                    all.extend(tools.iter().cloned());
+                }
+            }
+            (declared || !all.is_empty()).then_some(Value::Array(all))
+        }
+        false => raw.get("tools").cloned(),
+    };
+    if let Some(Value::Array(all)) = &effective_tools
+        && raw.get("tools").and_then(Value::as_array).map_or(0, Vec::len) != all.len()
+    {
+        let names: Vec<&Value> = all.iter().map(|tool| &tool["function"]["name"]).collect();
+        if (1..names.len()).any(|i| names[..i].contains(&names[i])) {
+            return Err(Unsupported("invalid_request"));
+        }
+    }
+    let mut tool_view = Map::new();
+    for key in ["tool_choice", "parallel_tool_calls"] {
+        if let Some(value) = raw.get(key) {
+            tool_view.insert(key.into(), value.clone());
+        }
+    }
+    if let Some(tools) = &effective_tools {
+        tool_view.insert("tools".into(), tools.clone());
+    }
+    let tools = request_tools(&tool_view, k3_tools)?;
+    // `"required"` or a named function: served for Kimi-K3 through its tag below.
+    let forced_choice = raw
+        .get("tool_choice")
+        .filter(|choice| *choice == "required" || named_choice(choice).is_some())
+        .map(|choice| named_choice(choice).map(str::to_owned));
+    let tool_definitions = effective_tools.as_ref().and_then(Value::as_array).cloned();
     let parallel_tool_calls = raw.get("parallel_tool_calls") != Some(&Value::Bool(false));
     let tool_parsing = match (
         settings.tool_call_parser.as_deref(),
@@ -298,6 +343,11 @@ pub fn lower_chat(
     if tools.is_some() {
         request.skip_special_tokens = false;
     }
+    if forced_choice.is_some()
+        && !(kimi_k3 && settings.tool_call_parser.as_deref() == Some("kimi_k3"))
+    {
+        return Err(Unsupported("tool_choice"));
+    }
     // K3 also stops on its tool parser's `eot_token`.
     let tool_call_stop = match &tool_parsing {
         Some((parser, _)) if kimi_k3 => match parser.as_str() {
@@ -341,7 +391,23 @@ pub fn lower_chat(
             .map(|config| config.think_tokens())
             .unwrap_or_default();
         let strip: Vec<&str> = strip.into_iter().filter(|t| !t.is_empty()).collect();
-        if let Some(tag) = auto_tool_call_tag(definitions, parallel_tool_calls, &strip)? {
+        // `get_structure_constraint`: a forced choice, or `auto` with a strict
+        // tool, takes the schema-aware tag; plain `auto` the lighter one.
+        let any_strict = definitions.iter().any(|tool| tool["function"]["strict"] == true);
+        let tag = match &forced_choice {
+            Some(named) => tool_call_tag_for_choice(
+                definitions,
+                named.as_deref(),
+                true,
+                parallel_tool_calls,
+                &strip,
+            )?,
+            None if any_strict => {
+                tool_call_tag_for_choice(definitions, None, false, parallel_tool_calls, &strip)?
+            }
+            None => auto_tool_call_tag(definitions, parallel_tool_calls, &strip)?,
+        };
+        if let Some(tag) = tag {
             sampling["structural_tag"] = python_json(&tag, true).into();
         }
     }
@@ -410,11 +476,15 @@ pub fn lower_chat(
 }
 
 /// The names of the tools a request lets the model call, or `None` when
-/// `tool_choice` turns them off. Only `auto` without strict tools is served:
-/// it adds no constraint, while the others depend on the engine's xgrammar.
-fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupported> {
+/// `tool_choice` turns them off. Strict tools, `"required"` and named
+/// choices are served for Kimi-K3 (`allow_strict`) only.
+fn request_tools(
+    raw: &Map<String, Value>,
+    allow_strict: bool,
+) -> Result<Option<Vec<String>>, Unsupported> {
     let choice = raw.get("tool_choice").filter(|c| !c.is_null());
-    if choice.is_some_and(|c| c != "auto" && c != "none")
+    let forced = |c: &Value| *c == "required" || named_choice(c).is_some();
+    if choice.is_some_and(|c| c != "auto" && c != "none" && !forced(c))
         || raw
             .get("parallel_tool_calls")
             .is_some_and(|p| !p.is_boolean())
@@ -432,7 +502,9 @@ fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupp
         let well_formed = tool.get("type").is_none_or(Value::is_string)
             && tool.get("defer_loading").is_none_or(Value::is_null)
             && function.get("defer_loading").is_none_or(Value::is_null)
-            && function.get("strict").is_none_or(|s| s == false)
+            && function
+                .get("strict")
+                .is_none_or(|s| s == false || (allow_strict && s == true))
             && function
                 .get("description")
                 .is_none_or(|d| d.is_string() || d.is_null())
@@ -442,8 +514,15 @@ fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupp
         };
         names.push(name.to_owned());
     }
-    let parse = !tools.is_empty() && choice.is_none_or(|c| c == "auto");
+    let parse = !tools.is_empty() && choice.is_none_or(|c| c != "none");
     Ok(parse.then_some(names))
+}
+
+/// The function a `{"type": "function", "function": {"name": ...}}` choice names.
+fn named_choice(choice: &Value) -> Option<&str> {
+    (choice["type"] == "function")
+        .then(|| choice["function"]["name"].as_str())
+        .flatten()
 }
 
 const SCHEMA_TYPES: &[&str] = &[
@@ -517,14 +596,15 @@ fn truthy(value: &Value) -> bool {
         && value.as_array().is_none_or(|items| !items.is_empty())
 }
 
-fn has_tools_or_media(message: &Value) -> bool {
+fn has_tools_or_media(message: &Value, system_tools_served: bool) -> bool {
     let media = |part: &Value| {
         matches!(
             part["type"].as_str(),
             Some("image_url" | "video_url" | "audio_url" | "input_audio")
         )
     };
-    message.get("tools").is_some_and(truthy)
+    // Kimi-K3 renders a system turn's tools and ignores other turns' (as SGLang does).
+    (!system_tools_served && message.get("tools").is_some_and(truthy))
         || message["content"]
             .as_array()
             .is_some_and(|parts| parts.iter().any(media))

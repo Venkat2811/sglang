@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 mod chat;
 mod completions;
+mod kimi_k3;
 mod models;
 mod pd_routing;
 mod template;
@@ -49,6 +50,9 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     // there is none (text cannot be submitted), so chat is disabled.
     if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
         return None;
+    }
+    if let Some(kimi_k3) = kimi_k3::KimiK3Chat::load(server_args) {
+        return Some(ChatFormatter::KimiK3(Arc::new(kimi_k3)));
     }
     let config_file = tokenizer::resolve_model_file(
         &server_args.tokenizer_path,

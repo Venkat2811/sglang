@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{State, rejection::JsonRejection},
-    http::StatusCode,
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -60,16 +61,25 @@ pub(super) struct ChatRequest {
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<ChatRequest>, JsonRejection>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
+    // Kimi-K3 renders and parses as SGLang's Python chat layer does, over `/generate`.
+    let kimi_k3 = match &state.chat_formatter {
+        Some(ChatFormatter::KimiK3(kimi_k3)) => Some(kimi_k3.clone()),
+        _ => None,
+    };
+    if let Some(kimi_k3) = kimi_k3 {
+        return kimi_k3.chat(state, headers, body).await;
+    }
     let ChatRequest {
         request,
         chat_template_kwargs,
         routing,
-    } = match body {
-        Ok(Json(request)) => request,
-        Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
+    } = match serde_json::from_slice::<ChatRequest>(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false);
         }
     };
     if let Some(message) = model_error(&request.model, &state.server_args.served_model_name) {

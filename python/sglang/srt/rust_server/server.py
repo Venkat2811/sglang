@@ -26,7 +26,14 @@ from sglang.srt.managers.utils import (
     msgpack_decode_explained,
 )
 from sglang.srt.observability.startup_time import build_engine_startup_time
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_mm,
+    get_observability,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.rust_server.config import _build_server_args, _partition_cores
 from sglang.srt.rust_server.multimodal import (
     MM_TRANSPORT_STATS,
@@ -252,6 +259,24 @@ class RustServer:
             [scheduler_startup_time],
             tokenizer_e2e=time.time() - psutil.Process().create_time(),
         )
+        # The TokenizerManager's startup gauges; this process writes them to the
+        # multiprocess directory the Rust `/metrics` merges, beside its request
+        # metrics (`rust/sglang-server/src/utils/tokenizer_metrics.rs`).
+        if get_observability().enable_metrics:
+            from sglang.srt.disaggregation.utils import DisaggregationMode
+            from sglang.srt.observability.metrics_collector import (
+                TokenizerMetricsCollector,
+            )
+
+            labels = {
+                "model_name": get_serving().served_model_name,
+                "engine_type": DisaggregationMode.to_engine_type(
+                    get_disagg().disaggregation_mode
+                ),
+            }
+            TokenizerMetricsCollector(labels=labels).emit_startup_time(
+                self.startup_time
+            )
 
     def mm_transport_stats(self) -> Dict[str, int]:
         """Snapshot of the zero-copy accounting at the multimodal hand-off
