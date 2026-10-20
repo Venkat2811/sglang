@@ -787,6 +787,68 @@ fn parse_optional_positive_f64_header(
     Ok(Some(parsed))
 }
 
+/// Startup/recovery probe uses the same preparation and HTTP forwarding as clients,
+/// with explicit workers to avoid requiring health proof in order to obtain it.
+pub(crate) async fn generation_probe(
+    ctx: &AppContext,
+    prefill: Arc<Worker>,
+    decode: Option<Arc<Worker>>,
+) -> bool {
+    let scope = crate::server::admission::RequestScope::enter(
+        &crate::server::admission::Admission::default(),
+    )
+    .expect("unlimited health admission");
+    let mut client = scope.client();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-sgl-router-probe",
+        axum::http::HeaderValue::from_static("health"),
+    );
+    if let Some(auth) = &ctx.config.server.worker_auth {
+        headers.insert(axum::http::header::AUTHORIZATION, auth.clone());
+    }
+    // A single explicit token avoids chat-template overhead and minimizes cache footprint.
+    // Use an ordinary unique rid: engine health-special ids can skip generation when busy.
+    let body = Bytes::from(serde_json::json!({"input_ids":[1],"stream":false,"sampling_params":{"max_new_tokens":1,"temperature":0}}).to_string());
+    let Ok((mut request, _routing)) = prepare(ctx, Endpoint::Generate, &headers, body, false).await
+    else {
+        return false;
+    };
+    request.scope = Some(scope);
+    request.wait_for_prefill = true;
+    let started = Instant::now();
+    let duration = RequestDurationGuard::new(ctx, &request.model, started);
+    let selected = SelectedWorkers {
+        prefill,
+        decode,
+        track_dispatch_timestamps: false,
+    };
+    let Ok(dispatched) =
+        forward_request(ctx, &mut request, selected, headers, started, &duration).await
+    else {
+        return false;
+    };
+    if !dispatched.response.status().is_success() {
+        return false;
+    }
+    let Ok(bytes) = axum::body::to_bytes(dispatched.response.into_body(), 64 << 10).await else {
+        return false;
+    };
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let ok = body["usage"]["completion_tokens"]
+        .as_u64()
+        .is_some_and(|n| n > 0)
+        || body["meta_info"]["completion_tokens"]
+            .as_u64()
+            .is_some_and(|n| n > 0);
+    if ok {
+        client.complete();
+    }
+    ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

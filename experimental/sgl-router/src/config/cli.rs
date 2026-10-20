@@ -159,6 +159,31 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = 1800)]
     pub worker_startup_timeout_secs: u64,
 
+    /// Maximum inference request body size, in bytes.
+    #[arg(long, default_value_t = 32 << 20)]
+    pub max_payload_size: usize,
+
+    /// Prometheus HTTP port, on --host. 0 asks the OS for a free port.
+    #[arg(long, default_value_t = 29000)]
+    pub prometheus_port: u16,
+
+    /// Disable dispatch retries.
+    #[arg(long, conflicts_with = "retry_max_attempts")]
+    pub disable_retries: bool,
+
+    /// Seconds between active worker status and real generation checks.
+    #[arg(long, default_value_t = 60)]
+    pub health_check_interval_secs: u64,
+    /// Timeout for each worker status or full-path generation probe.
+    #[arg(long, default_value_t = 5)]
+    pub health_check_timeout_secs: u64,
+    /// Consecutive failed check cycles before excluding a worker.
+    #[arg(long, default_value_t = 3)]
+    pub health_failure_threshold: u32,
+    /// Consecutive successful full-path check cycles before admitting a worker.
+    #[arg(long, default_value_t = 2)]
+    pub health_success_threshold: u32,
+
     /// Global generation-request ceiling, held through response and abort cleanup. -1 disables.
     #[arg(long, default_value_t = -1, allow_hyphen_values = true)]
     pub max_concurrent_requests: i64,
@@ -693,6 +718,14 @@ impl Cli {
                 infer_model_from_workers,
                 worker_startup_timeout_secs: self.server.worker_startup_timeout_secs,
                 admission,
+                max_payload_size: self.server.max_payload_size,
+                prometheus_port: self.server.prometheus_port,
+                health_check: super::HealthCheckConfig {
+                    interval_secs: self.server.health_check_interval_secs,
+                    timeout_secs: self.server.health_check_timeout_secs,
+                    failure_threshold: self.server.health_failure_threshold,
+                    success_threshold: self.server.health_success_threshold,
+                },
             },
             observability: ObservabilityConfig {
                 log_level: self.server.log_level,
@@ -731,7 +764,11 @@ impl Cli {
             proxy: ProxyConfig {
                 request_timeout_secs: self.server.request_timeout_secs,
                 stream_idle_timeout_secs: self.server.stream_idle_timeout_secs,
-                max_attempts: self.server.retry_max_attempts,
+                max_attempts: if self.server.disable_retries {
+                    NonZeroU32::new(1).unwrap()
+                } else {
+                    self.server.retry_max_attempts
+                },
                 initial_backoff_ms: self.server.retry_initial_backoff_ms,
                 max_backoff_ms: self.server.retry_max_backoff_ms,
                 decode_dispatch_limit: self.server.decode_dispatch_limit,

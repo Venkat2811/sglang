@@ -64,6 +64,25 @@ async fn main() -> Result<()> {
 
     // Buffer termination signals before tokenizer loading or discovery can block startup.
     let (sigterm, sigint) = install_signal_handlers()?;
+    // Serve liveness on the final socket while metadata/tokenizer startup is pending.
+    let listen_addr = format!("{}:{}", config.server.host, config.server.port);
+    let socket =
+        std::net::TcpListener::bind(&listen_addr).with_context(|| format!("bind {listen_addr}"))?;
+    socket.set_nonblocking(true)?;
+    let startup_listener = TcpListener::from_std(socket.try_clone()?)?;
+    let listener = TcpListener::from_std(socket)?;
+    let startup_app = axum::Router::new()
+        .route(
+            "/liveness",
+            axum::routing::get(|| async { axum::http::StatusCode::OK }),
+        )
+        .route(
+            "/healthz",
+            axum::routing::get(|| async { axum::http::StatusCode::OK }),
+        )
+        .fallback(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE });
+    let startup_handle =
+        tokio::spawn(async move { axum::serve(startup_listener, startup_app).await });
     sgl_router::config::resolve_worker_model(&mut config).await?;
     log_startup(&config);
 
@@ -122,6 +141,7 @@ async fn main() -> Result<()> {
 
     // Discovery feeds worker changes to the manager, which maintains this routing catalog.
     let worker_registry = Arc::new(WorkerRegistry::default());
+    worker_registry.require_active_health();
     let (discovery_handle, worker_manager_handle) = start_worker_discovery_and_manager(
         &config,
         &worker_registry,
@@ -141,14 +161,16 @@ async fn main() -> Result<()> {
         external_kv_indexer_client,
     )?;
     app_context.chat_routing = chat_routing;
+    app_context.active_health = Some(Arc::new(sgl_router::health::active::ActiveHealth::new(
+        config.server.health_check.clone(),
+    )));
     let app_context = Arc::new(app_context);
     app_context.mark_ready();
+    let health_handle = tokio::spawn(sgl_router::health::active::ActiveHealth::run(Arc::clone(
+        &app_context,
+    )));
 
     // Serve HTTP requests until shutdown, allowing in-flight requests to finish.
-    let listen_addr = format!("{}:{}", config.server.host, config.server.port);
-    let listener = TcpListener::bind(&listen_addr)
-        .await
-        .with_context(|| format!("bind {listen_addr}"))?;
     tracing::info!("listening on {listen_addr}");
     let grpc_listener = match config.server.grpc_port {
         Some(port) => {
@@ -161,7 +183,23 @@ async fn main() -> Result<()> {
         }
         None => None,
     };
+    let metrics_addr = format!("{}:{}", config.server.host, config.server.prometheus_port);
+    let metrics_listener = TcpListener::bind(&metrics_addr)
+        .await
+        .with_context(|| format!("bind metrics {metrics_addr}"))?;
+    let metrics_app = axum::Router::new()
+        .route(
+            "/metrics",
+            axum::routing::get(sgl_router::server::routes::metrics::metrics),
+        )
+        .with_state(Arc::clone(&app_context));
+    let metrics_handle =
+        tokio::spawn(async move { axum::serve(metrics_listener, metrics_app).await });
+    startup_handle.abort();
+    let _ = startup_handle.await;
     let outcome = serve(listener, grpc_listener, app_context, sigterm, sigint).await;
+    metrics_handle.abort();
+    health_handle.abort();
 
     // Stop background tasks once the HTTP server has finished draining.
     discovery_handle.abort();

@@ -206,7 +206,7 @@ impl Proxy {
 
     /// The forwarding client for `protocol`, taken from the selected worker's
     /// [`crate::workers::Worker::protocol`].
-    fn client_for(&self, protocol: WireProtocol) -> &Client {
+    pub(crate) fn client_for(&self, protocol: WireProtocol) -> &Client {
         match protocol {
             WireProtocol::Http1 => &self.default_client,
             WireProtocol::H2c => &self.h2c_client,

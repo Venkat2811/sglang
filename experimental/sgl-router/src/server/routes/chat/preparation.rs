@@ -89,6 +89,7 @@ pub(super) struct PreparedRequest {
     /// Engine endpoint the request is forwarded to.
     pub(super) path: &'static str,
     pub(super) scope: Option<Arc<crate::server::admission::RequestScope>>,
+    pub(super) wait_for_prefill: bool,
     pub(super) model: ModelId,
     pub(super) streaming: bool,
     /// Output budget, for decode KV; unknown if any prompt leaves it unset.
@@ -199,6 +200,7 @@ impl PreparedRequest {
             }
             return Ok(Self {
                 scope: None,
+                wait_for_prefill: false,
                 responder: Some(responder),
                 ..Self::generate_value(ctx, model, generate, None)?
             });
@@ -248,6 +250,7 @@ impl PreparedRequest {
             parsed_body,
             sampling_defaults,
             scope: None,
+            wait_for_prefill: false,
             responder: None,
         })
     }
@@ -307,6 +310,7 @@ impl PreparedRequest {
             input_ids_forwarding: None,
             forwarding_booked: false,
             scope: None,
+            wait_for_prefill: false,
             responder: None,
             cache_namespace: cache_namespace(COMPLETIONS_PATH, &value),
             parsed_body: Some(value),
@@ -404,6 +408,7 @@ impl PreparedRequest {
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
             scope: None,
+            wait_for_prefill: false,
             responder: None,
         })
     }
@@ -523,6 +528,7 @@ impl PreparedRequest {
             input_ids_forwarding: None,
             forwarding_booked: false,
             scope: None,
+            wait_for_prefill: false,
             responder: None,
             parsed_body: None,
             cache_namespace: CacheNamespace::default(),
@@ -560,6 +566,7 @@ impl PreparedRequest {
             parsed_body: None,
             sampling_defaults: Vec::new(),
             scope: None,
+            wait_for_prefill: false,
             responder: None,
         }
     }

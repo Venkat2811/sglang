@@ -27,7 +27,12 @@ pub async fn healthz() -> StatusCode {
 /// Conditions 3 and 4 latch on the first 200 (`BootstrapTracker::admit_ready`),
 /// so a later scale-up cannot drag a serving replica back to 503.
 pub async fn readyz(State(ctx): State<Arc<AppContext>>) -> StatusCode {
-    if !ctx.is_ready() {
+    if !ctx.is_ready()
+        || ctx
+            .active_health
+            .as_ref()
+            .is_some_and(|health| !health.ready(&ctx))
+    {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
     let model = ModelId(ctx.config.model.id.clone());
@@ -47,6 +52,27 @@ pub async fn readyz(State(ctx): State<Arc<AppContext>>) -> StatusCode {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
+}
+
+pub async fn workers(State(ctx): State<Arc<AppContext>>) -> axum::Json<serde_json::Value> {
+    let mut workers = ctx.registry.all();
+    workers.sort_by(|a, b| a.url.cmp(&b.url));
+    axum::Json(
+        serde_json::json!({"workers": workers.iter().map(|w| serde_json::json!({
+        "url": w.url,
+        "worker_type": match w.mode() { crate::discovery::WorkerMode::Plain => "regular", crate::discovery::WorkerMode::Prefill => "prefill", crate::discovery::WorkerMode::Decode => "decode" },
+        "is_healthy": w.is_healthy(),
+    })).collect::<Vec<_>>() }),
+    )
+}
+
+pub async fn server_info(State(ctx): State<Arc<AppContext>>) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "served_model_name": ctx.config.model.id,
+        "worker_count": ctx.registry.len(),
+        "max_concurrent_requests": ctx.config.server.admission.max_concurrent_requests,
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 #[cfg(test)]

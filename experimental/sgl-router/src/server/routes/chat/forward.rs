@@ -342,10 +342,11 @@ async fn dispatch<T: Transport>(
         stream_abort,
         decode_slot,
     );
+    let wait_for_prefill = ctx.config.proxy.stream_after_prefill || request.wait_for_prefill;
     let dispatch = async {
         match prefill_task {
             Some((task, prefill)) => {
-                let wait = ctx.config.proxy.stream_after_prefill;
+                let wait = wait_for_prefill;
                 forward_pd(task, prefill, response, wait).await
             }
             None => (response.await, None),

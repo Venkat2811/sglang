@@ -318,6 +318,9 @@ pub struct ServerConfig {
     pub infer_model_from_workers: bool,
     pub worker_startup_timeout_secs: u64,
     pub admission: AdmissionConfig,
+    pub max_payload_size: usize,
+    pub prometheus_port: u16,
+    pub health_check: HealthCheckConfig,
 }
 
 impl ServerConfig {
@@ -352,6 +355,27 @@ impl Default for ServerConfig {
             infer_model_from_workers: false,
             worker_startup_timeout_secs: 1800,
             admission: AdmissionConfig::default(),
+            max_payload_size: 32 << 20,
+            prometheus_port: 29000,
+            health_check: HealthCheckConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HealthCheckConfig {
+    pub interval_secs: u64,
+    pub timeout_secs: u64,
+    pub failure_threshold: u32,
+    pub success_threshold: u32,
+}
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: 60,
+            timeout_secs: 5,
+            failure_threshold: 3,
+            success_threshold: 2,
         }
     }
 }

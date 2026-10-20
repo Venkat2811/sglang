@@ -4,7 +4,6 @@
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{outcome_from_status, RequestLogContext};
-use crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -97,9 +96,19 @@ pub(crate) fn pod_id() -> &'static str {
 ///     lines; `stream_outcome_total` carries their real ending.
 async fn access_log_and_record(
     State(ctx): State<Arc<AppContext>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
+    let request_id_header = req
+        .headers()
+        .get("x-request-id")
+        .cloned()
+        .unwrap_or_else(|| {
+            axum::http::HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())
+                .expect("UUID header")
+        });
+    req.headers_mut()
+        .insert("x-request-id", request_id_header.clone());
     let method = req.method().clone();
     let method_label = normalize_method(&method);
     let path = req.uri().path().to_owned();
@@ -118,7 +127,8 @@ async fn access_log_and_record(
 
     ctx.metrics.record_ingress(&route, method_label);
     let inflight = ctx.inflight_http.enter();
-    let resp = next.run(req).await;
+    let mut resp = next.run(req).await;
+    resp.headers_mut().insert("x-request-id", request_id_header);
     let status = resp.status();
     let latency_ms = start.elapsed().as_millis() as u64;
     ctx.metrics
@@ -183,9 +193,12 @@ async fn log_413(req: Request, next: Next) -> Response {
 }
 
 /// A Messages route: body limit, 413 logging and the Anthropic 413 envelope.
-fn messages_route(route: MethodRouter<Arc<AppContext>>) -> MethodRouter<Arc<AppContext>> {
+fn messages_route(
+    route: MethodRouter<Arc<AppContext>>,
+    max_payload_size: usize,
+) -> MethodRouter<Arc<AppContext>> {
     route
-        .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+        .layer(DefaultBodyLimit::max(max_payload_size))
         .layer(middleware::from_fn(log_413))
         .layer(middleware::from_fn(
             crate::server::routes::messages::envelope_413,
@@ -193,8 +206,21 @@ fn messages_route(route: MethodRouter<Arc<AppContext>>) -> MethodRouter<Arc<AppC
 }
 
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
+    let max_payload_size = ctx.config.server.max_payload_size;
     let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
+        .route("/liveness", get(crate::server::routes::health::healthz))
+        .route("/readiness", get(crate::server::routes::health::readyz))
+        .route("/health", get(crate::server::routes::health::readyz))
+        .route(
+            "/health_generate",
+            get(crate::server::routes::health::readyz),
+        )
+        .route("/workers", get(crate::server::routes::health::workers))
+        .route(
+            "/server_info",
+            get(crate::server::routes::health::server_info),
+        )
         .route("/readyz", get(crate::server::routes::health::readyz))
         .route("/metrics", get(crate::server::routes::metrics::metrics))
         .route(
@@ -212,47 +238,53 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/v1/chat/completions",
             post(crate::server::routes::chat::chat_completions)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_payload_size))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/messages",
-            messages_route(post(crate::server::routes::messages::messages)),
+            messages_route(
+                post(crate::server::routes::messages::messages),
+                max_payload_size,
+            ),
         )
         .route(
             "/v1/messages/count_tokens",
-            messages_route(post(crate::server::routes::messages::count_tokens)),
+            messages_route(
+                post(crate::server::routes::messages::count_tokens),
+                max_payload_size,
+            ),
         )
         .route(
             "/v1/completions",
             post(crate::server::routes::chat::completions)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_payload_size))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/generate",
             post(crate::server::routes::chat::generate)
                 .put(crate::server::routes::chat::generate)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_payload_size))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/embeddings",
             post(crate::server::routes::chat::embeddings)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_payload_size))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/classify",
             post(crate::server::routes::chat::classify)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_payload_size))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/rerank",
             post(crate::server::routes::chat::rerank)
                 .put(crate::server::routes::chat::rerank)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_payload_size))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
