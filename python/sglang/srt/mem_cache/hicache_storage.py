@@ -43,6 +43,44 @@ class HiCacheStorageConfig:
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
     dp_rank: int = 0
     extra_config: Optional[dict] = None
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    logical_page_size: Optional[int] = None
+    kv_cache_dtype: Optional[torch.dtype] = None
+    host_layout: Optional[str] = None
+
+    def __post_init__(self):
+        if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
+            raise ValueError("Invalid DCP size or rank for HiCache storage.")
+        if self.dcp_size == 1:
+            return
+        if not self.is_mla_model:
+            raise ValueError("DCP storage shard identity currently requires MLA.")
+        if (
+            self.tp_size % self.dcp_size != 0
+            or not 0 <= self.tp_rank < self.tp_size
+            or self.tp_rank % self.dcp_size != self.dcp_rank
+        ):
+            raise ValueError("DCP storage requires contiguous DCP groups within TP.")
+        if (
+            self.logical_page_size is None
+            or self.logical_page_size <= 0
+            or self.logical_page_size % self.dcp_size != 0
+            or self.kv_cache_dtype is None
+            or not self.host_layout
+        ):
+            raise ValueError(
+                "DCP storage requires a DCP-aligned logical page size, KV dtype, "
+                "and host layout."
+            )
+
+    @property
+    def is_storage_writer(self) -> bool:
+        """MLA replicas share one writer per DCP shard, in the first DCP group.
+
+        With DCP disabled, MLA uses rank 0 and non-MLA uses every TP rank.
+        """
+        return not self.is_mla_model or self.tp_rank == self.dcp_rank
 
 
 @dataclass
@@ -436,6 +474,16 @@ class HiCacheFile(HiCacheStorage):
         self.config_suffix = (
             f"_{model_name}{shard_suffix}" if is_mla_model else self.tp_config_suffix
         )
+        if storage_config.dcp_size > 1:
+            # Equivalent MLA shards in different DCP groups share a file. TP
+            # size restricts reuse to matching topologies; TP rank is omitted.
+            # TP-sharded state keeps tp_config_suffix (TP rank and size).
+            dtype_name = str(storage_config.kv_cache_dtype).removeprefix("torch.")
+            self.config_suffix += (
+                f"_tp{tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
+                f"_page{storage_config.logical_page_size}"
+                f"_{dtype_name}_{storage_config.host_layout}"
+            )
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -471,10 +519,10 @@ class HiCacheFile(HiCacheStorage):
         # module, so a top-level import here would be circular.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
-        # Each rank creates and evicts its TP-sharded files; rank 0 also owns
-        # the shared MLA files.
+        # Each rank creates and evicts its TP-sharded files; the MLA writer of
+        # each DCP shard (rank 0 without DCP) also owns the shared MLA files.
         owned_suffixes = (self.tp_config_suffix,)
-        if is_mla_model and tp_rank == 0:
+        if is_mla_model and storage_config.is_storage_writer:
             owned_suffixes += (self.config_suffix,)
         self._evictor = LRUFileEvictor(
             self.file_path,
@@ -528,10 +576,10 @@ class HiCacheFile(HiCacheStorage):
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
             return target_location
-        except FileNotFoundError:
+        except OSError as e:
             if self.metadata_cache is not None:
                 self.metadata_cache.remove(suffixed)
-            logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
+            logger.warning(f"Failed to fetch {key} from HiCacheFile storage: {e}")
             return None
 
     def batch_get(
@@ -720,7 +768,9 @@ class HiCacheFile(HiCacheStorage):
         for transfer in transfers:
             host_pool = self.registered_pools[transfer.name]
             keys = transfer.keys or []
-            page_size = getattr(host_pool, "page_size", 1) or 1
+            # MLA receives logical DCP indices; recurrent state still uses
+            # independent one-slot indices. Each pool defines that boundary.
+            page_size = host_pool.logical_page_size
             expected = len(keys) * page_size
             host_indices = transfer.host_indices
 
