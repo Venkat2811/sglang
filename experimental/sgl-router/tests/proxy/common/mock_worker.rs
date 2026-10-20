@@ -56,6 +56,19 @@ where
 }
 
 impl MockWorker {
+    pub async fn wait_for_request(&self) -> Bytes {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(body) = self.captured.lock().unwrap().last_body.clone() {
+                    return body;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker must receive the independently dispatched request")
+    }
+
     /// Bind to a random port on 127.0.0.1 and start serving.
     ///
     /// `stream_chunks` are the raw SSE bytes returned when a streaming

@@ -140,7 +140,9 @@ impl CoreHandle {
         &self,
         mut request: GenerateRequest,
     ) -> Result<CoreCall, CoreError> {
-        request.received_at.get_or_insert_with(std::time::Instant::now);
+        request
+            .received_at
+            .get_or_insert_with(std::time::Instant::now);
         self.prepare_generations(std::slice::from_mut(&mut request))
             .await?;
         self.submit(RequestKind::Generate(Box::new(request)))

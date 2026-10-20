@@ -986,6 +986,7 @@ async fn full_decode_group_falls_back_to_another_version_group() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    workers[1].wait_for_request().await;
     let dispatched: Vec<_> = workers
         .iter()
         .map(|w| w.captured.lock().unwrap().last_body.is_some())
