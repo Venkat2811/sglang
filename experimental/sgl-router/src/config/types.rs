@@ -151,6 +151,8 @@ pub enum PolicyKind {
 /// Policy used to select decode workers for PD requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum DecodePolicyKind {
+    #[value(name = "round_robin")]
+    RoundRobin,
     #[default]
     #[value(name = "power_of_two")]
     PowerOfTwo,

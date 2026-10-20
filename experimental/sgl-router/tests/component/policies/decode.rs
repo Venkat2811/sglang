@@ -32,6 +32,57 @@ fn worker(id: &str) -> Arc<Worker> {
     }))
 }
 
+#[test]
+fn recipe_round_robin_decode_cycles_independently_of_load_and_iteration_order() {
+    use clap::Parser;
+    use sgl_router::config::Cli;
+    use sgl_router::policies::decode::build_decode_policy;
+
+    let config = Cli::try_parse_from([
+        "sgl-router",
+        "--model-id",
+        "m",
+        "--no-tokenizer",
+        "--worker-urls",
+        "http://worker:30000",
+        "--decode-policy",
+        "round_robin",
+    ])
+    .expect("the recipe's decode policy must be accepted")
+    .into_config()
+    .unwrap();
+    let policy = build_decode_policy(config.model.decode_policy);
+    let first = worker("d0");
+    let second = worker("d1");
+    first.active_requests.store(100, Ordering::Relaxed);
+    let context = DecodeSelectionContext::new();
+    assert!(policy
+        .propose(&CandidateDomain::global_decode(&[]), &context)
+        .is_none());
+    for i in 0..8 {
+        let candidates = if i % 2 == 0 {
+            vec![first.clone(), second.clone()]
+        } else {
+            vec![second.clone(), first.clone()]
+        };
+        let proposal = policy
+            .propose(&CandidateDomain::global_decode(&candidates), &context)
+            .unwrap();
+        assert_eq!(proposal.primary.id.0, if i % 2 == 0 { "d0" } else { "d1" });
+    }
+    assert_eq!(
+        policy
+            .propose(
+                &CandidateDomain::global_decode(std::slice::from_ref(&second)),
+                &context,
+            )
+            .unwrap()
+            .primary
+            .id,
+        second.id
+    );
+}
+
 fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineReportedLoadSnapshot {
     EngineReportedLoadSnapshot::from_native_cache_workers(
         7,

@@ -739,6 +739,9 @@ async fn default_pd_groups_apply_configured_inflight_admission() {
         let response = app.clone().oneshot(request(body("hi"))).await.unwrap();
         assert_eq!(response.status(), expected);
         response.into_body().collect().await.unwrap();
+        if expected == StatusCode::OK {
+            prefill.wait_for_request().await;
+        }
         assert_eq!(
             prefill.captured.lock().unwrap().last_body.is_some(),
             expected == StatusCode::OK

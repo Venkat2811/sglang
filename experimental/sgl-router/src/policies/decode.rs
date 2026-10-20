@@ -12,6 +12,7 @@ use crate::policies::registry::select_decode_with_affinity;
 use crate::policies::{ProposalKind, SelectionProposal};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use rand::Rng;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[derive(Debug, Default)]
@@ -55,6 +56,28 @@ pub trait DecodePolicy: Send + Sync + std::fmt::Debug {
         domain: &CandidateDomain,
         ctx: &DecodeSelectionContext<'_>,
     ) -> Option<SelectionProposal>;
+}
+
+#[derive(Debug, Default)]
+pub struct DecodeRoundRobinPolicy {
+    counter: AtomicUsize,
+}
+
+impl DecodePolicy for DecodeRoundRobinPolicy {
+    fn propose(
+        &self,
+        domain: &CandidateDomain,
+        _ctx: &DecodeSelectionContext<'_>,
+    ) -> Option<SelectionProposal> {
+        if domain.workers.is_empty() {
+            return None;
+        }
+        // Registry iteration order must not change the rotation between requests.
+        let mut workers: Vec<_> = domain.workers.iter().collect();
+        workers.sort_unstable_by(|a, b| a.id.0.cmp(&b.id.0));
+        let index = self.counter.fetch_add(1, Ordering::Relaxed) % workers.len();
+        Some(SelectionProposal::primary(Arc::clone(workers[index])))
+    }
 }
 
 /// Resolves decode admission and degrades to Power-of-Two when capacity is exhausted.
@@ -158,6 +181,7 @@ impl DecodePolicy for LegacyHostAffinityDecodePolicy {
 /// Builds a decode policy scoped to one role.
 pub fn build_decode_policy(kind: DecodePolicyKind) -> Box<dyn DecodePolicy> {
     match kind {
+        DecodePolicyKind::RoundRobin => Box::new(DecodeRoundRobinPolicy::default()),
         DecodePolicyKind::PowerOfTwo => Box::new(DecodePowerOfTwoPolicy::new()),
         DecodePolicyKind::LegacyHostAffinity => Box::new(LegacyHostAffinityDecodePolicy),
     }

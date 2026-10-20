@@ -1104,11 +1104,12 @@ async fn version_group_capacity_fallback_preserves_decode_limits() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let use_first = second_full && !short_first;
+        workers[usize::from(!use_first)].wait_for_request().await;
         let dispatched: Vec<_> = workers
             .iter()
             .map(|w| w.captured.lock().unwrap().last_body.is_some())
             .collect();
-        let use_first = second_full && !short_first;
         assert_eq!(
             dispatched,
             [use_first, !use_first, use_first, !use_first],
