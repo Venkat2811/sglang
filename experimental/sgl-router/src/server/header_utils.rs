@@ -16,6 +16,10 @@ pub fn should_forward_request_header(name: &HeaderName) -> bool {
             | "x-correlation-id"
             | "traceparent"
             | "tracestate"
+            | "x-attempt-id"
+            | "x-maas-backend"
+            | "x-maas-admission"
+            | "x-dynamo-session-id"
             // Set by `--dp-aware`; chat dispatch strips the client's copy.
             | "x-data-parallel-rank"
     ) || n.starts_with("x-request-id-")
@@ -133,5 +137,23 @@ mod tests {
             !should_forward_request_header(&HeaderName::from_static("x-sglextra")),
             "x-sglextra (no hyphen after x-sglext) must not forward",
         );
+    }
+}
+
+#[cfg(test)]
+mod gateway_tests {
+    #[test]
+    fn gateway_correlation_headers_are_forwarded() {
+        for name in [
+            "x-attempt-id",
+            "x-maas-backend",
+            "x-maas-admission",
+            "x-dynamo-session-id",
+        ] {
+            assert!(
+                super::should_forward_request_header(&axum::http::HeaderName::from_static(name)),
+                "{name}"
+            );
+        }
     }
 }

@@ -113,11 +113,17 @@ async fn serve_http(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
-    let scope = crate::server::admission::RequestScope::enter(&ctx.admission)?;
+    let scope =
+        crate::server::admission::RequestScope::enter_request(&ctx, endpoint.path(), &headers)?;
     let client = scope.client();
-    let (mut request, routing) = prepare(&ctx, endpoint, &headers, body, false).await?;
-    request.scope = Some(scope);
-    let response = routing.dispatch(&ctx, request, headers, start).await?;
+    let (mut request, routing) = prepare(&ctx, endpoint, &headers, body, false)
+        .await
+        .inspect_err(|e| scope.life.fail(e.error_code()))?;
+    request.scope = Some(Arc::clone(&scope));
+    let response = routing
+        .dispatch(&ctx, request, headers, start)
+        .await
+        .inspect_err(|e| scope.life.fail(e.error_code()))?;
     let successful = response.status().is_success();
     Ok(response.map(|body| client.body(body, successful)))
 }
@@ -135,26 +141,33 @@ pub async fn route_grpc<R: EngineRpc>(
     Option<RequestLogContext>,
 ) {
     let start = Instant::now();
-    let scope = match crate::server::admission::RequestScope::enter(&ctx.admission) {
-        Ok(scope) => scope,
-        Err(error) => return (Err(error), None),
-    };
+    let scope =
+        match crate::server::admission::RequestScope::enter_request(ctx, endpoint.path(), &headers)
+        {
+            Ok(scope) => scope,
+            Err(error) => return (Err(error), None),
+        };
     let client = scope.client();
     match prepare(ctx, endpoint, &headers, body, true).await {
         Ok((mut request, routing)) => {
-            request.scope = Some(scope);
+            request.scope = Some(Arc::clone(&scope));
             let (result, log) =
                 forward_request_grpc(rpc, ctx, &mut request, &routing, headers, start).await;
             (
-                result.map(|mut response| {
-                    response.replies =
-                        client.replies(response.replies, response.status.is_success());
-                    response
-                }),
+                result
+                    .inspect_err(|e| scope.life.fail(e.error_code()))
+                    .map(|mut response| {
+                        response.replies =
+                            client.replies(response.replies, response.status.is_success());
+                        response
+                    }),
                 log,
             )
         }
-        Err(error) => (Err(error), None),
+        Err(error) => {
+            scope.life.fail(error.error_code());
+            (Err(error), None)
+        }
     }
 }
 
@@ -169,10 +182,12 @@ pub async fn route_typed<R: TypedRpc>(
     Option<RequestLogContext>,
 ) {
     let start = Instant::now();
-    let scope = match crate::server::admission::RequestScope::enter(&ctx.admission) {
-        Ok(scope) => scope,
-        Err(error) => return (Err(error), None),
-    };
+    let scope =
+        match crate::server::admission::RequestScope::enter_request(ctx, endpoint.path(), &headers)
+        {
+            Ok(scope) => scope,
+            Err(error) => return (Err(error), None),
+        };
     let client = scope.client();
     let prepared = async {
         let model = ModelId(ctx.config.model.id.clone());
@@ -186,19 +201,24 @@ pub async fn route_typed<R: TypedRpc>(
     };
     match prepared.await {
         Ok((mut prepared, routing)) => {
-            prepared.scope = Some(scope);
+            prepared.scope = Some(Arc::clone(&scope));
             let (result, log) =
                 forward_request_grpc(request, ctx, &mut prepared, &routing, headers, start).await;
             (
-                result.map(|mut response| {
-                    response.replies =
-                        client.replies(response.replies, response.status.is_success());
-                    response
-                }),
+                result
+                    .inspect_err(|e| scope.life.fail(e.error_code()))
+                    .map(|mut response| {
+                        response.replies =
+                            client.replies(response.replies, response.status.is_success());
+                        response
+                    }),
                 log,
             )
         }
-        Err(error) => (Err(error), None),
+        Err(error) => {
+            scope.life.fail(error.error_code());
+            (Err(error), None)
+        }
     }
 }
 
@@ -444,6 +464,35 @@ async fn select_workers(
         &routing_context,
         DecodePickMode::Dispatch,
     )?;
+    if let Some(scope) = &request.scope {
+        if scope.life.selection.is_empty() {
+            let signal = routing_context.prefix_matches.as_ref();
+            let matches = signal.and_then(|s| match &s.outcome {
+                sgl_kv_indexer::PrefixOutcome::Matched { matches, .. } => Some(matches.as_slice()),
+                _ => None,
+            });
+            let cached = |url: &str| {
+                matches.map(|entries| {
+                    let blocks = entries
+                        .iter()
+                        .find(|m| m.address == url)
+                        .map_or(0, |m| m.matched_prefix_blocks);
+                    crate::policies::cache_aware::estimate_matched_prefix_tokens(
+                        request.input_token_count as u64,
+                        signal.unwrap().query_blocks,
+                        blocks,
+                    )
+                })
+            };
+            let rows=candidates.iter().filter(|w|w.id==prefill.id).chain(candidates.iter().filter(|w|w.id!=prefill.id)).take(64).map(|w| {
+                let matched=cached(&w.url);
+                serde_json::json!({"worker_id":w.id.0,"url":w.url,"selected":w.id==prefill.id,"matched_prefix_tokens":matched,
+                    "uncached_tokens":matched.map(|n|(request.input_token_count as u64).saturating_sub(n)),"router_inflight":w.router_inflight_load(),
+                    "score_kind":ctx.config.model.policy.to_string(),"decision_reason":"ordinary_selection"})
+            }).collect();
+            scope.life.candidates(rows, cached(&prefill.url));
+        }
+    }
     record_prefill_route(ctx, routing_context.prefix_matches.as_ref(), &prefill.url);
     Ok(SelectedWorkers {
         prefill,
@@ -581,6 +630,7 @@ fn pick_prefill_worker(
         policy_kind: ctx.config.model.policy,
         bucket_selector: ctx.bucket_selector.as_ref(),
         metrics: ctx.metrics.as_ref(),
+        diagnostics: request.scope.as_ref().map(|s| &s.life.selection),
         model_id: &request.model,
         body: Some(&request.body),
         routing_key: routing.routing_key,

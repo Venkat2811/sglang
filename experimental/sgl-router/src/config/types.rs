@@ -320,6 +320,7 @@ pub struct ServerConfig {
     pub admission: AdmissionConfig,
     pub max_payload_size: usize,
     pub prometheus_port: u16,
+    pub admin_port: Option<u16>,
     pub health_check: HealthCheckConfig,
 }
 
@@ -357,6 +358,7 @@ impl Default for ServerConfig {
             admission: AdmissionConfig::default(),
             max_payload_size: 32 << 20,
             prometheus_port: 29000,
+            admin_port: None,
             health_check: HealthCheckConfig::default(),
         }
     }

@@ -44,7 +44,7 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
                     WorkerMode::Prefill => "prefill",
                     WorkerMode::Decode => "decode",
                 },
-                healthy: cb.admit,
+                healthy: cb.admit && w.active_health_passes(),
                 cb_state: cb.state_code,
                 // Saturating rather than `as i64`: a guard-accounting
                 // underflow would wrap usize and render as a nonsensical
@@ -54,6 +54,7 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
         })
         .collect();
     let mut body = ctx.metrics.render_with_workers(&workers);
+    body.push_str(&ctx.admission.render_metrics());
     body.push_str(&ctx.tokenizers.stats().render());
     // Pull-on-scrape, like the worker gauges above: the tree and the tally
     // own the numbers, so a worker that goes away stops emitting series
@@ -695,5 +696,18 @@ mod tests {
         assert!(
             body.contains(r#"sgl_router_worker_inflight_requests{worker_url="http://p0:30000"} 0"#)
         );
+        ctx.registry.all()[0].set_active_healthy(false);
+        let res = crate::server::app::build_router(ctx)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains(r#"sgl_router_worker_health{worker_url="http://p0:30000"} 0"#));
     }
 }

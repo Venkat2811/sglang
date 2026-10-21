@@ -228,7 +228,7 @@ impl ApiError {
     /// a gateway converts on. Distinct per condition even when two conditions
     /// share a class (and thus a status): `upstream_timeout` and
     /// `stale_request_expired` both map to 504 but stay tellable apart here.
-    fn error_code(&self) -> &'static str {
+    pub(crate) fn error_code(&self) -> &'static str {
         match self {
             ApiError::AdmissionRejected => "admission_rejected",
             ApiError::BadRequest(_) => "bad_request",

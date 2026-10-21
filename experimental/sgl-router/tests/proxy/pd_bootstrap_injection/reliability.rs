@@ -223,6 +223,11 @@ async fn prefill_failure_aborts_decode_before_its_first_token() {
                 "cancelled"
             };
             assert_eq!(outcomes(&ctx, &decode.url, "decode"), [expected]);
+            let metrics = ctx.metrics.render();
+            assert!(metrics
+                .contains(r#"sgl_router_pd_failures_total{model_id="tiny",outcome="prefill"} 1"#));
+            assert!(metrics
+                .contains(r#"sgl_router_pd_prefill_duration_seconds_count{model_id="tiny"} 1"#));
         }
     }
 }

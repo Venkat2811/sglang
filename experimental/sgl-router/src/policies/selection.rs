@@ -44,6 +44,24 @@ use crate::state::kv_events::CacheNamespace;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 
+/// Optional request-local selection evidence; never changes a policy decision.
+#[derive(Default)]
+pub(crate) struct SelectionDiagnostics(
+    std::sync::Mutex<Option<(Vec<serde_json::Value>, Option<u64>)>>,
+);
+impl SelectionDiagnostics {
+    pub fn record(&self, mut candidates: Vec<serde_json::Value>, predicted: Option<u64>) {
+        candidates.truncate(64);
+        *self.0.lock().unwrap() = Some((candidates, predicted));
+    }
+    pub fn take(&self) -> Option<(Vec<serde_json::Value>, Option<u64>)> {
+        self.0.lock().unwrap().take()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.lock().unwrap().is_none()
+    }
+}
+
 /// Everything one prefill selection reads. Collaborators first, then the
 /// per-request facts.
 pub(crate) struct PrefillSelectionInputs<'a> {
@@ -51,6 +69,7 @@ pub(crate) struct PrefillSelectionInputs<'a> {
     pub policy_kind: PolicyKind,
     pub bucket_selector: &'a BucketSelector,
     pub metrics: &'a MetricsRegistry,
+    pub diagnostics: Option<&'a SelectionDiagnostics>,
     /// Names the model in the selection context and in the log lines.
     pub model_id: &'a ModelId,
     pub body: Option<&'a [u8]>,
@@ -501,6 +520,17 @@ impl<'a> Selector<'a> {
             .candidates
             .iter()
             .find(|candidate| candidate.worker.id == decision.selected.id)?;
+        if let Some(diagnostics) = inputs.diagnostics {
+            let chosen = &decision.selected.id;
+            let rows=proposal.candidates.iter().filter(|c|&c.worker.id==chosen)
+                .chain(proposal.candidates.iter().filter(|c|&c.worker.id!=chosen)).take(64)
+                .map(|c|serde_json::json!({"worker_id":c.worker.id.0,"url":c.worker.url,"selected":&c.worker.id==chosen,
+                    "matched_prefix_tokens":c.matched_prefix_tokens,"uncached_tokens":c.uncached_tokens,
+                    "router_inflight":c.worker.router_inflight_load(),"candidate_range_id":c.candidate_range_id,
+                    "decision_reason":format!("{:?}",decision.reason),"load_snapshot_version":decision.load_snapshot_version,
+                    "prefill_pressure_source":cache_decision.prefill_pressure_source,"score_kind":"cache_affinity"})).collect();
+            diagnostics.record(rows, Some(selected_candidate.matched_prefix_tokens));
+        }
         tracing::debug!(
             model = %inputs.model_id,
             policy = ?ProposalKind::CacheAffinity,
@@ -952,6 +982,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cache_selection_diagnostics_report_the_actual_bounded_candidate_costs() {
+        let owner = worker("owner");
+        let shallow = worker("shallow");
+        let workers = vec![Arc::clone(&owner), Arc::clone(&shallow)];
+        let loads = queued_snapshot(&[(&owner, 0, 10, 10_000_000), (&shallow, 0, 10, 10_000_000)]);
+        let signal = prefix_signal(&[(&owner, 9), (&shallow, 4)], 10);
+        let policy = CacheAwarePolicy::new(AffinityConfig::default());
+        let buckets = BucketSelector::new(None);
+        let metrics = MetricsRegistry::new();
+        let model = ModelId("model".into());
+        let diagnostics = super::SelectionDiagnostics::default();
+        let mut inputs = prefill_inputs(
+            &policy,
+            &buckets,
+            &metrics,
+            &model,
+            &workers,
+            Some(&loads),
+            100_000,
+        );
+        inputs.policy_kind = PolicyKind::CacheAware;
+        inputs.external_prefix = Some(&signal);
+        inputs.diagnostics = Some(&diagnostics);
+        let selected = select_prefill_worker(&inputs).unwrap();
+        assert_eq!(selected.id, owner.id);
+        let (candidates, predicted) = diagnostics
+            .take()
+            .expect("selection must publish its actual cost inputs");
+        assert_eq!(predicted, Some(90_000));
+        assert_eq!(candidates.len(), 2);
+        let selected = candidates.iter().find(|c| c["selected"] == true).unwrap();
+        assert_eq!(selected["matched_prefix_tokens"], 90_000);
+        assert_eq!(selected["uncached_tokens"], 10_000);
+        assert!(selected["decision_reason"].is_string());
+    }
+
     fn booked_decisions(metrics: &MetricsRegistry) -> Vec<String> {
         metrics
             .render()
@@ -978,6 +1045,7 @@ mod tests {
             policy_kind: PolicyKind::PowerOfTwo,
             bucket_selector,
             metrics,
+            diagnostics: None,
             model_id,
             body: None,
             routing_key: None,

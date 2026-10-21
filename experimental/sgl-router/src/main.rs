@@ -195,9 +195,24 @@ async fn main() -> Result<()> {
         .with_state(Arc::clone(&app_context));
     let metrics_handle =
         tokio::spawn(async move { axum::serve(metrics_listener, metrics_app).await });
+    let admin_handle = if let Some(port) = config.server.admin_port {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .context("bind loopback admin listener")?;
+        tracing::info!(address=%listener.local_addr()?,"serving loopback admin");
+        let app = sgl_router::server::admin::router(Arc::clone(&app_context));
+        Some(tokio::spawn(
+            async move { axum::serve(listener, app).await },
+        ))
+    } else {
+        None
+    };
     startup_handle.abort();
     let _ = startup_handle.await;
     let outcome = serve(listener, grpc_listener, app_context, sigterm, sigint).await;
+    if let Some(handle) = admin_handle {
+        handle.abort();
+    }
     metrics_handle.abort();
     health_handle.abort();
 
@@ -216,17 +231,26 @@ async fn main() -> Result<()> {
 fn init_tracing(default_level: &str, format: LogFormat) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    let (filter, handle) = tracing_subscriber::reload::Layer::new(filter);
     let install_result = match format {
-        LogFormat::Json => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(true)
-            .json()
+        LogFormat::Json => tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(true)
+                    .json()
+                    .event_format(sgl_router::server::logging::StructuredJson),
+            )
             .try_init(),
-        LogFormat::Text => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(true)
+        LogFormat::Text => tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_target(true))
             .try_init(),
     };
+    if install_result.is_ok() {
+        sgl_router::server::logging::set_reload_handle(handle);
+    }
     if let Err(e) = install_result {
         tracing::debug!(
             default_level = %default_level,

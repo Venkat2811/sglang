@@ -711,7 +711,7 @@ async fn dispatched_error_names_its_worker_in_the_access_log() {
     let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     let line = logs
         .lines()
-        .find(|l| l.contains("rid-dispatched-error"))
+        .find(|l| l.contains("rid-dispatched-error") && l.contains("http_request"))
         .unwrap_or_else(|| panic!("no access-log line for the request; captured:\n{logs}"));
     assert!(
         line.contains(&format!(r#"worker="{}""#, worker.url)),

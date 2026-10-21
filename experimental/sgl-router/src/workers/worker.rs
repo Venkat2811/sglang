@@ -339,6 +339,10 @@ impl Worker {
     pub fn set_active_healthy(&self, healthy: bool) {
         self.active_healthy.store(healthy, Ordering::Relaxed);
     }
+    pub(crate) fn active_health_passes(&self) -> bool {
+        self.active_healthy.load(Ordering::Relaxed)
+    }
+
     pub fn is_healthy(&self) -> bool {
         self.active_healthy.load(Ordering::Relaxed) && self.breaker.would_allow()
     }

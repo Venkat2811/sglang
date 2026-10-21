@@ -167,6 +167,10 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = 29000)]
     pub prometheus_port: u16,
 
+    /// Optional admin port, bound only on IPv4 loopback (0 chooses a free port).
+    #[arg(long)]
+    pub admin_port: Option<u16>,
+
     /// Disable dispatch retries.
     #[arg(long, conflicts_with = "retry_max_attempts")]
     pub disable_retries: bool,
@@ -720,6 +724,7 @@ impl Cli {
                 admission,
                 max_payload_size: self.server.max_payload_size,
                 prometheus_port: self.server.prometheus_port,
+                admin_port: self.server.admin_port,
                 health_check: super::HealthCheckConfig {
                     interval_secs: self.server.health_check_interval_secs,
                     timeout_secs: self.server.health_check_timeout_secs,
