@@ -74,24 +74,6 @@ from sglang.srt.runtime_context import get_resources
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
-# ABLATION (timing only, outputs are wrong by design; never for serving or correctness):
-# SGLANG_ABLATE_DEEPEP_COMM=1 makes DeepEP low-latency dispatch/combine local no-ops after the first real
-# dispatch/combine pair on this rank. Dispatch returns the first real receive buffer (stale contents) with masked_m
-# counted from this rank's own routing (global expert id mod local experts, so each rank feeds its expert GEMMs about
-# as many rows as a real exchange delivers); combine returns zeros. Bounds what hiding or removing the exchange buys.
-_ABLATE_DEEPEP_COMM = os.environ.get("SGLANG_ABLATE_DEEPEP_COMM", "0") == "1"
-_ABLATE_TEMPLATE: dict = {}
-_LOG_DEEPEP_RECV = os.environ.get("SGLANG_LOG_DEEPEP_RECV", "0") == "1"  # diagnostic, eager only
-
-
-class _AblationEvent:
-    def current_stream_wait(self):
-        pass
-
-
-def _ablation_noop_hook():
-    pass
-
 logger = logging.getLogger(__name__)
 
 _NVSHMEM_QP_DEPTH_DEFAULT = 1024
@@ -785,34 +767,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
-        if _ABLATE_DEEPEP_COMM and "recv" in _ABLATE_TEMPLATE:
-            self._ablated = True
-            num_local = self.num_local_experts
-            valid = topk_ids >= 0
-            local_ids = torch.where(valid, topk_ids % num_local, torch.zeros_like(topk_ids))
-            masked_m = (
-                torch.nn.functional.one_hot(local_ids, num_local)
-                .masked_fill(~valid.unsqueeze(-1), 0)
-                .sum(dim=(0, 1))
-                .to(torch.int32)
-            )
-            return (
-                _ABLATE_TEMPLATE["recv"],
-                topk_ids,
-                topk_weights,
-                masked_m,
-                expected_m,
-                _AblationEvent(),
-                _ablation_noop_hook,
-            )
-        self._ablated = False
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
             topk_weights,
         )
-        if _ABLATE_DEEPEP_COMM:
-            _ABLATE_TEMPLATE.setdefault("recv", hidden_states)
         return (
             hidden_states,
             topk_ids,
@@ -838,18 +797,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
             masked_m
         )
-        if _LOG_DEEPEP_RECV and not torch.cuda.is_current_stream_capturing():
-            # DIAGNOSTIC (eager runs only): rows this rank received per local expert, every 50th dispatch.
-            self._recv_log_ct = getattr(self, "_recv_log_ct", 0) + 1
-            if self._recv_log_ct % 50 == 0:
-                m = masked_m.to(torch.int64).cpu()
-                logger.info(
-                    "DEEPEP_RECV rank=%d rows=%d experts_hit=%d max_rows_per_expert=%d",
-                    torch.distributed.get_rank(),
-                    int(m.sum()),
-                    int((m > 0).sum()),
-                    int(m.max()),
-                )
 
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
@@ -944,13 +891,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        if _ABLATE_DEEPEP_COMM and getattr(self, "_ablated", False):
-            out = torch.zeros(
-                (topk_ids.shape[0], hidden_states.shape[-1]),
-                dtype=torch.bfloat16,
-                device=hidden_states.device,
-            )
-            return out, _AblationEvent(), _ablation_noop_hook
         hidden_states, event, hook = self._combine_core(
             hidden_states,
             topk_ids,
