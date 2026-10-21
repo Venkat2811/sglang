@@ -243,6 +243,31 @@ class TestKimiK3BankOnShards(CustomTestCase):
             ):
                 self.assertEqual(kimi_k3._uses_ep_a2a(), expected)
 
+    def test_fully_dp_dense_ffn_runs_on_this_ranks_rows(self):
+        """With --moe-dense-tp-size 1 under an a2a backend the scheduler shares
+        no DP token counts, so a dense layer that still DP-gathered over TP
+        sized its collective from local counts only and hung."""
+        config = SimpleNamespace(**{**vars(CONFIG), "attn_res_block_size": None})
+        for fully_dp, group, width in ((True, "replicated", 1), (False, "tp", 4)):
+            with (
+                self.subTest(fully_dp=fully_dp),
+                patch.object(kimi_k3, "is_dense_ffn_fully_dp", return_value=fully_dp),
+                patch.object(kimi_k3, "is_dp_attention_enabled", return_value=True),
+                patch.object(
+                    kimi_k3,
+                    "get_parallel",
+                    lambda: SimpleNamespace(enable_dense_mlp_attn_tp=False),
+                ),
+                patch.object(
+                    kimi_k3,
+                    "resolve_linear_parallel_group",
+                    lambda name: (0, {"replicated": 1, "tp": 4}[name]),
+                ),
+            ):
+                self.assertEqual(kimi_k3._dense_mlp_parallel_group(), group)
+                _, ffn = kimi_k3._stage_facts(config, 0, sp_collective=False)
+                self.assertEqual(ffn.dense_tp_size, width)
+
 
 if __name__ == "__main__":
     unittest.main()
