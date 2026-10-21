@@ -76,7 +76,7 @@ def _init_state() -> Optional[_State]:
     if (
         device_sm not in (100, 103)
         or group.world_size not in _SUPPORTED_WORLD_SIZES
-        or a2a not in ("megamoe", "deepep")
+        or a2a not in ("megamoe", "deepep", "deepep_v2")
         or not is_custom_allreduce
         or comm_disabled
         or not has_multicast
