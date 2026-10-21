@@ -15,7 +15,8 @@ use tokio::sync::mpsc;
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::ids::Rid;
 use crate::message::io_struct::{
-    CheckWeightsReqInput, ControlRequest, FlushCacheReqInput, GetInternalStateReq,
+    CheckWeightsReqInput, ClearHiCacheReqInput, ControlRequest, FlushCacheReqInput,
+    GetInternalStateReq,
 };
 use crate::message::request::{GenerateRequest, Request, RequestKind};
 use crate::message::response::{ResponseItem, ResponseSink};
@@ -243,6 +244,17 @@ impl CoreHandle {
             .await?;
         rmp_serde::from_slice::<FlushCacheOutcome>(&bytes).map_err(|error| {
             CoreError::InvalidResponse(format!("invalid flush-cache response: {error}"))
+        })
+    }
+
+    pub(crate) async fn clear_hicache_storage(&self) -> Result<ClearStorageOutcome, CoreError> {
+        let bytes = self
+            .control(ControlRequest::ClearHiCacheReqInput(
+                ClearHiCacheReqInput::new(Rid::new().to_string()),
+            ))
+            .await?;
+        rmp_serde::from_slice(&bytes).map_err(|error| {
+            CoreError::InvalidResponse(format!("invalid storage-clear response: {error}"))
         })
     }
 
@@ -595,6 +607,11 @@ fn generation_event(item: ResponseItem) -> CoreEvent {
             ))
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct ClearStorageOutcome {
+    pub success: bool,
 }
 
 /// The scheduler's `FlushCacheReqOutput`: whether the flush ran, and why not.

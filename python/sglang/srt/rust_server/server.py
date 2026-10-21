@@ -552,6 +552,11 @@ class RustServer:
                 header_cols += extra.header_cols()
                 data_cols += extra.data_cols()
 
+        if payload.cached_tokens_details is not None:
+            # BatchHeader puts details after all twelve optional shape columns.
+            header_cols.extend([[] for _ in range(18 - len(header_cols))])
+            header_cols.append(payload.cached_tokens_details)
+
         header = msgspec.msgpack.encode(header_cols)
         # Pass the raw column list; the Rust side concatenates it into the frame
         # with the GIL released.

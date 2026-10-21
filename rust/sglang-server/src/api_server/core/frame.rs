@@ -95,6 +95,10 @@ impl CoreOutput {
             .extras
             .get_or_insert_with(|| Box::new(ChunkExtras::default()));
 
+        if delta_extras.cached_tokens_details.is_some() {
+            extras.cached_tokens_details = delta_extras.cached_tokens_details.clone();
+        }
+
         extras
             .out_lp_val
             .extend_from_slice(&delta_extras.out_lp_val);
@@ -224,6 +228,17 @@ impl CoreOutput {
         let Some(extras) = self.extras.as_deref() else {
             return meta;
         };
+
+        meta.cached_tokens_details =
+            extras
+                .cached_tokens_details
+                .as_ref()
+                .map(|details| api::CachedTokensDetails {
+                    device: details.device,
+                    host: details.host,
+                    storage: details.storage,
+                    storage_backend: details.storage_backend.clone(),
+                });
 
         // Python always sets input and output token logprobs together, including
         // the empty input list emitted by a disaggregated decode node.

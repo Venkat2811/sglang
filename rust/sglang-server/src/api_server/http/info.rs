@@ -12,7 +12,7 @@ use axum::{
     extract::{Query, State, rejection::QueryRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -35,6 +35,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/get_model_info", get(model_info))
         .route("/model_info", get(model_info))
         .route("/flush_cache", get(flush_cache).post(flush_cache))
+        .route(
+            "/hicache/storage-backend/clear",
+            post(clear_hicache_storage),
+        )
         .route("/weights_checker", get(check_weights).post(check_weights))
 }
 
@@ -103,8 +107,12 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
 
 #[derive(Deserialize)]
 struct FlushCacheQuery {
-    #[serde(default)]
+    #[serde(default = "default_flush_timeout")]
     timeout: f64,
+}
+
+fn default_flush_timeout() -> f64 {
+    5.0
 }
 
 /// `GET|POST /flush_cache?timeout=<s>` — the scheduler flushes its caches in
@@ -116,11 +124,15 @@ async fn flush_cache(
     query: Result<Query<FlushCacheQuery>, QueryRejection>,
 ) -> Response {
     let timeout = match query {
-        Ok(Query(query)) if query.timeout >= 0.0 => query.timeout,
+        Ok(Query(query))
+            if query.timeout.is_finite() && (0.0..=3600.0).contains(&query.timeout) =>
+        {
+            query.timeout
+        }
         Ok(_) => {
             return native_error(
                 StatusCode::BAD_REQUEST,
-                "timeout must be greater than or equal to 0",
+                "timeout must be finite and between 0 and 3600 seconds",
                 false,
             );
         }
@@ -128,7 +140,22 @@ async fn flush_cache(
             return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
         }
     };
-    let outcome = match state.core.flush_cache(timeout).await {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs_f64(timeout + 1.0),
+        state.core.flush_cache(timeout),
+    )
+    .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(_) => {
+            return native_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "flush cache scheduler response timed out",
+                false,
+            );
+        }
+    };
+    let outcome = match result {
         Ok(outcome) => outcome,
         Err(CoreError::Unavailable) => {
             return native_error(
@@ -155,6 +182,32 @@ async fn flush_cache(
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     response
+}
+
+async fn clear_hicache_storage(State(state): State<Arc<AppState>>) -> Response {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        state.core.clear_hicache_storage(),
+    )
+    .await;
+    match result {
+        Ok(Ok(outcome)) if outcome.success => (
+            StatusCode::OK,
+            "Hierarchical cache storage backend cleared.\n",
+        )
+            .into_response(),
+        Ok(Ok(_)) => native_error(
+            StatusCode::BAD_REQUEST,
+            "Hierarchical cache storage backend clear failed.",
+            false,
+        ),
+        Ok(Err(error)) => native_error(error.http_status(), &error.to_string(), false),
+        Err(_) => native_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "storage clear scheduler response timed out",
+            false,
+        ),
+    }
 }
 
 /// Python's `CheckWeightsReqInput` body, every field optional.
@@ -557,7 +610,7 @@ mod tests {
             ),
             (
                 "GET",
-                "/flush_cache",
+                "/flush_cache?timeout=0",
                 0.0,
                 (false, "Timed out waiting for idle state."),
                 StatusCode::BAD_REQUEST,
@@ -565,7 +618,7 @@ mod tests {
             ),
             (
                 "POST",
-                "/flush_cache",
+                "/flush_cache?timeout=0",
                 0.0,
                 (false, ""),
                 StatusCode::BAD_REQUEST,
@@ -825,5 +878,132 @@ mod tests {
             abort_rx.recv_async().await.unwrap(),
             crate::tokenizer_manager::wiring::AbortSource::Guard(aborted) if aborted == rid
         ));
+    }
+    /// Clear must cross the scheduler boundary and preserve unsuccessful outcomes.
+    #[tokio::test]
+    async fn regression_storage_clear_is_a_real_control_operation() {
+        for success in [true, false] {
+            let (state, intake, _abort) = test_state(ServerArgs::default());
+            let response = tokio::spawn(
+                routes().with_state(state).oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/hicache/storage-backend/clear")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            );
+            let event =
+                tokio::time::timeout(std::time::Duration::from_millis(300), intake.recv_async())
+                    .await
+                    .expect("clear must reach the scheduler")
+                    .unwrap();
+            let TmEvent::Intake { request, admission } = event else {
+                panic!("expected intake");
+            };
+            assert!(admission.try_accept());
+            let RequestKind::Control(control) = &request.kind else {
+                panic!("expected control");
+            };
+            let header = control.encode().unwrap();
+            let header = rmpv::decode::read_value(&mut &header[..]).unwrap();
+            assert_eq!(header[0].as_str(), Some("ClearHiCacheReqInput"));
+            assert_eq!(header.as_array().unwrap().len(), 3);
+            request
+                .sink
+                .try_send(ResponseItem::Control(Bytes::from(
+                    rmp_serde::to_vec_named(&serde_json::json!({"success":success})).unwrap(),
+                )))
+                .unwrap();
+            assert_eq!(
+                response.await.unwrap().unwrap().status(),
+                if success {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            );
+        }
+    }
+    /// A normal post-completion flush gets a bounded drain budget by default.
+    #[tokio::test]
+    async fn regression_flush_default_waits_for_idle_and_repeated_flush_succeeds() {
+        let (state, intake, _abort) = test_state(ServerArgs::default());
+        for _ in 0..2 {
+            let response = tokio::spawn(
+                routes().with_state(Arc::clone(&state)).oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/flush_cache")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            );
+            let TmEvent::Intake { request, admission } = intake.recv_async().await.unwrap() else {
+                panic!("expected intake");
+            };
+            assert!(admission.try_accept());
+            let RequestKind::Control(control) = &request.kind else {
+                panic!("expected control");
+            };
+            let header = control.encode().unwrap();
+            let header = rmpv::decode::read_value(&mut &header[..]).unwrap();
+            let timeout = header[3].as_f64().unwrap();
+            assert!(
+                timeout > 0.0 && timeout <= 5.0,
+                "default must permit scheduler cleanup: {timeout}"
+            );
+            request
+                .sink
+                .try_send(ResponseItem::Control(Bytes::from(
+                    rmp_serde::to_vec_named(&serde_json::json!({"success":true,"message":""}))
+                        .unwrap(),
+                )))
+                .unwrap();
+            assert_eq!(response.await.unwrap().unwrap().status(), StatusCode::OK);
+        }
+    }
+    #[tokio::test]
+    async fn flush_without_scheduler_reply_expires_and_invalid_budgets_never_dispatch() {
+        let (state, intake, _abort) = test_state(ServerArgs::default());
+        let app = routes().with_state(state);
+        for value in ["NaN", "inf", "-1", "3601"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri(format!("/flush_cache?timeout={value}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(intake.try_recv().is_err());
+        }
+        let response = tokio::spawn(
+            app.oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/flush_cache?timeout=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        let TmEvent::Intake {
+            request: _request,
+            admission,
+        } = intake.recv_async().await.unwrap()
+        else {
+            panic!("expected intake");
+        };
+        assert!(admission.try_accept());
+        let response = tokio::time::timeout(std::time::Duration::from_secs(3), response)
+            .await
+            .expect("flush must not wait indefinitely for a scheduler reply")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 }

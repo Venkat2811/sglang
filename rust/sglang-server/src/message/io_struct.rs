@@ -92,6 +92,8 @@ control_messages! {
     /// `/server_info`'s control request: a bare `BaseReq` with no extra fields.
     GetInternalStateReq {}
 
+    ClearHiCacheReqInput {}
+
     /// `/flush_cache`'s control request: the scheduler flushes its caches in
     /// its own loop, waiting up to `timeout_s` for running requests to drain.
     FlushCacheReqInput {
@@ -168,6 +170,12 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
 }
 
 impl GetInternalStateReq {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
+    }
+}
+
+impl ClearHiCacheReqInput {
     pub fn new(rid: String) -> Self {
         Self { rid }
     }

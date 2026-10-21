@@ -16,7 +16,7 @@ use axum::{
 };
 use dynamo_protocols::types::{
     Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
-    CreateCompletionResponse, Logprobs, Prompt, Stop,
+    CreateCompletionResponse, Logprobs, Prompt, PromptTokensDetails, Stop,
 };
 use futures::StreamExt;
 use serde::Deserialize;
@@ -372,6 +372,7 @@ pub(super) async fn unary_completion(
     let mut choices = Vec::with_capacity(submitted.len());
     let mut extensions = Vec::with_capacity(submitted.len());
     let mut prompt_tokens = BTreeMap::<usize, u32>::new();
+    let mut cached_tokens = BTreeMap::<usize, u32>::new();
     let mut completion_tokens = 0u64;
 
     for choice in submitted {
@@ -385,6 +386,10 @@ pub(super) async fn unary_completion(
         prompt_tokens
             .entry(choice.prompt_index)
             .or_insert(output.prompt_tokens);
+        cached_tokens
+            .entry(choice.prompt_index)
+            .and_modify(|cached| *cached = (*cached).max(output.cached_tokens))
+            .or_insert(output.cached_tokens);
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
         let (response_choice, extension) = completion_choice(
             choice.index,
@@ -408,6 +413,10 @@ pub(super) async fn unary_completion(
     let usage = completion_usage(
         prompt_tokens,
         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+        cached_tokens
+            .values()
+            .copied()
+            .fold(0u32, u32::saturating_add),
     );
 
     Json(completion_response_value(
@@ -530,6 +539,7 @@ pub(super) fn completion_event_stream(
         let mut echoes = Vec::with_capacity(count);
         let mut first_chunks = vec![true; count];
         let mut prompt_tokens_by_prompt = BTreeMap::<usize, u32>::new();
+        let mut cached_tokens_by_prompt = BTreeMap::<usize, u32>::new();
         let mut completion_tokens_by_choice = vec![0u64; count];
         let mut streams = Vec::with_capacity(count);
 
@@ -553,6 +563,7 @@ pub(super) fn completion_event_stream(
             prompt_tokens_by_prompt
                 .entry(prompt_indexes[index])
                 .or_insert(output.prompt_tokens);
+            cached_tokens_by_prompt.entry(prompt_indexes[index]).and_modify(|cached|*cached=(*cached).max(output.cached_tokens)).or_insert(output.cached_tokens);
             completion_tokens_by_choice[index] = completion_tokens_by_choice[index]
                 .saturating_add(output.completion_tokens);
             let first = std::mem::replace(&mut first_chunks[index], false);
@@ -565,6 +576,7 @@ pub(super) fn completion_event_stream(
                 completion_usage(
                     output.prompt_tokens,
                     u32::try_from(completion_tokens_by_choice[index]).unwrap_or(u32::MAX),
+                    output.cached_tokens,
                 )
             });
             let (choice, extension) = completion_choice(
@@ -604,6 +616,7 @@ pub(super) fn completion_event_stream(
                 usage: Some(completion_usage(
                     prompt_tokens,
                     u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                    cached_tokens_by_prompt.values().copied().fold(0u32,u32::saturating_add),
                 )),
             };
             yield completion_response_value(final_chunk, &[]).to_string();
@@ -612,11 +625,19 @@ pub(super) fn completion_event_stream(
     }
 }
 
-pub(super) fn completion_usage(prompt_tokens: u32, completion_tokens: u32) -> CompletionUsage {
+pub(super) fn completion_usage(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cached_tokens: u32,
+) -> CompletionUsage {
     CompletionUsage {
         prompt_tokens,
         completion_tokens,
         total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        prompt_tokens_details: Some(PromptTokensDetails {
+            cached_tokens: Some(cached_tokens),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -856,5 +877,56 @@ mod tests {
         assert_eq!(usage["usage"]["prompt_tokens"], 5);
         assert_eq!(usage["usage"]["completion_tokens"], 2);
         assert_eq!(frames[3], "[DONE]");
+    }
+    /// Sampling choices share prompt usage, including the cache contribution.
+    #[tokio::test]
+    async fn regression_completions_include_cached_usage_in_unary_and_sse() {
+        for stream in [false, true] {
+            let mut choices = Vec::new();
+            for (index, prompt_index, cached) in [(0, 0, 3), (1, 0, 3), (2, 1, 2)] {
+                let rid = format!("sample-{index}");
+                let (choice, tx) = submitted(index, prompt_index, &rid);
+                let mut event = chunk(&rid, "OK", true);
+                if let crate::message::response::ResponseItem::Done(output) = &mut event {
+                    output.cached_tokens = cached;
+                }
+                tx.send(event).await.unwrap();
+                choices.push(choice);
+            }
+            let value = if stream {
+                let frames: Vec<_> = completion_event_stream(
+                    choices,
+                    "response".into(),
+                    "model".into(),
+                    1,
+                    false,
+                    false,
+                    true,
+                    true,
+                )
+                .collect()
+                .await;
+                frames
+                    .iter()
+                    .filter_map(|f| serde_json::from_str::<serde_json::Value>(f).ok())
+                    .find(|v| v["choices"].as_array().is_some_and(Vec::is_empty))
+                    .unwrap()
+            } else {
+                let response =
+                    unary_completion(choices, "response".into(), "model".into(), 1, false, false)
+                        .await;
+                serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 65536)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap()
+            };
+            assert_eq!(value["usage"]["prompt_tokens"], 10);
+            assert_eq!(
+                value["usage"]["prompt_tokens_details"]["cached_tokens"], 5,
+                "stream={stream}"
+            );
+        }
     }
 }

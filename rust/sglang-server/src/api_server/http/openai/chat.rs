@@ -471,6 +471,7 @@ pub(super) async fn unary_chat(
     };
     let mut choices = Vec::with_capacity(submitted.len());
     let mut prompt_tokens = 0;
+    let mut cached_tokens = 0u32;
     let mut completion_tokens = 0u64;
 
     for (index, call) in submitted {
@@ -484,6 +485,7 @@ pub(super) async fn unary_chat(
         if prompt_tokens == 0 {
             prompt_tokens = output.prompt_tokens;
         }
+        cached_tokens = cached_tokens.max(output.cached_tokens);
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
         let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
         let finish_reason = chat_finish_reason(&output);
@@ -538,6 +540,7 @@ pub(super) async fn unary_chat(
         usage: Some(completion_usage(
             prompt_tokens,
             u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+            cached_tokens,
         )),
     })
     .into_response()
@@ -565,6 +568,7 @@ pub(super) fn chat_event_stream(
         let count = submitted.len();
         let mut streams = Vec::with_capacity(count);
         let mut prompt_tokens = 0u32;
+        let mut cached_tokens=0u32;
         let mut completion_tokens = 0u64;
         // One stateful reasoning splitter per choice (Python keeps a
         // `reasoning_parser_dict` per index).
@@ -624,7 +628,8 @@ pub(super) fn chat_event_stream(
             if prompt_tokens == 0 {
                 prompt_tokens = output.prompt_tokens;
             }
-            completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+            cached_tokens=cached_tokens.max(output.cached_tokens);
+        completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
             let finish_reason = chat_finish_reason(&output);
             // Split the step's text into (reasoning, normal) deltas when
             // `--reasoning-parser` is set. Mirrors Python's per-step emission:
@@ -733,6 +738,7 @@ pub(super) fn chat_event_stream(
                     usage: Some(completion_usage(
                         prompt_tokens,
                         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                        cached_tokens,
                     )),
                 }),
                 id: None,
