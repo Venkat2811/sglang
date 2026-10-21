@@ -20,6 +20,7 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBank,
     AttnBankOutputRead,
 )
+from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.models import kimi_k3
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -224,6 +225,23 @@ class TestKimiK3BankOnShards(CustomTestCase):
                 self.assertEqual(
                     kimi_k3._carries_bank_slices(config, sp_collective=True), carries
                 )
+
+    def test_dispatcher_combining_backends_are_ep_a2a(self):
+        """A DeepEP-family combine completes the routed sum on the source rows,
+        so K3's MoE region must run without a DP gather or TP reduce; leaving
+        deepep_v2 out all-reduced shared-expert partials across DP groups."""
+        for backend, expected in (
+            (MoeA2ABackend.NONE, False),
+            (MoeA2ABackend.DEEPEP, True),
+            (MoeA2ABackend.DEEPEP_V2, True),
+            (MoeA2ABackend.MOONCAKE, True),
+            (MoeA2ABackend.MORI, True),
+        ):
+            with (
+                self.subTest(backend=backend),
+                patch.object(kimi_k3, "get_moe_a2a_backend", return_value=backend),
+            ):
+                self.assertEqual(kimi_k3._uses_ep_a2a(), expected)
 
 
 if __name__ == "__main__":
