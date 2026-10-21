@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
@@ -620,7 +621,14 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori"):
+        # ABLATION (timing-only ceilings, never serving): SGLANG_CEILING_ALLOW_DSPARK_A2A=1 lets DSpark run with DP
+        # attention over another a2a backend (DeepEP) so verify-step timing can be measured; correctness unvalidated.
+        _ceiling_allow_a2a = os.environ.get("SGLANG_CEILING_ALLOW_DSPARK_A2A", "0") == "1"
+        if (
+            not _is_npu
+            and not _ceiling_allow_a2a
+            and cfg.moe_a2a_backend not in ("none", "megamoe", "mori")
+        ):
             raise ValueError(
                 "DSpark with dp attention supports moe_a2a_backend 'none' "
                 "(built-in TP MoE), 'megamoe', or 'mori', got "
