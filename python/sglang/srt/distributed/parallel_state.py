@@ -432,6 +432,15 @@ class GroupCoordinator:
         assert self.cpu_group is not None
         assert self.device_group is not None
 
+        # ABLATION (timing only, outputs wrong by design; never for serving or correctness):
+        # SGLANG_ABLATE_XNODE_COLLECTIVES=1 turns this group's all-reduce and all-gather-into-tensor into local
+        # no-ops when the group spans more GPUs than one node has (the two-node TP16 group), keeping every shape.
+        # Bounds what hiding or removing the cross-node exchange buys on the no-a2a path.
+        self._ablate_xnode = (
+            os.environ.get("SGLANG_ABLATE_XNODE_COLLECTIVES", "0") == "1"
+            and self.world_size > torch.cuda.device_count()
+        )
+
         # Import communicators
         self.use_pynccl = use_pynccl
         self.use_mscclpp = use_mscclpp
@@ -710,6 +719,8 @@ class GroupCoordinator:
         """
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
+            return input_
+        if self._ablate_xnode:
             return input_
 
         if input_.is_cpu:
@@ -1369,6 +1380,10 @@ class GroupCoordinator:
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if self._ablate_xnode:
+            output.zero_()
+            output.view(self.world_size, -1)[self.rank_in_group].copy_(input.reshape(-1))
+            return
         if _is_npu or _is_cpu:
             # TODO: add optimized all_gather_into_tensor kernel for cpu
             self._all_gather_into_tensor(output, input)
