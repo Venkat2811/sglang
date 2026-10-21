@@ -232,6 +232,7 @@ pub struct Worker {
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
     active_healthy: Arc<AtomicBool>,
+    generation_success: Arc<Mutex<Option<tokio::time::Instant>>>,
     health_instance: u64,
     pub active_requests: Arc<AtomicUsize>,
     /// Timestamped ledger for requests whose policy reads Engine Load;
@@ -298,6 +299,7 @@ impl Worker {
             model_ids: spec.model_ids,
             breaker,
             active_healthy: Arc::new(AtomicBool::new(true)),
+            generation_success: Arc::new(Mutex::new(None)),
             health_instance: NEXT_HEALTH_INSTANCE.fetch_add(1, Ordering::Relaxed),
             active_requests,
             slots,
@@ -334,6 +336,17 @@ impl Worker {
 
     pub(crate) fn health_instance(&self) -> u64 {
         self.health_instance
+    }
+
+    pub(crate) fn record_generation_success(&self) {
+        *self.generation_success.lock().unwrap() = Some(tokio::time::Instant::now());
+    }
+
+    pub(crate) fn recently_generated(&self, freshness: Duration) -> bool {
+        self.generation_success
+            .lock()
+            .unwrap()
+            .is_some_and(|at| at.elapsed() <= freshness)
     }
 
     pub fn set_active_healthy(&self, healthy: bool) {
@@ -375,6 +388,7 @@ impl Worker {
             && self.protocol == prev.protocol
         {
             self.active_healthy = Arc::clone(&prev.active_healthy);
+            self.generation_success = Arc::clone(&prev.generation_success);
             self.health_instance = prev.health_instance;
         }
         self.active_requests = Arc::clone(&prev.active_requests);

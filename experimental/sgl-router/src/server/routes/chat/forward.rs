@@ -67,6 +67,11 @@ pub(super) async fn forward_request(
     request_started_at: Instant,
     duration: &Arc<RequestDurationGuard>,
 ) -> Result<HttpDispatched, ApiError> {
+    if let Some(scope) = &request.scope {
+        let mut proof = vec![Arc::clone(&workers.prefill)];
+        proof.extend(workers.decode.iter().cloned());
+        scope.life.bind_generation_workers(proof);
+    }
     let dispatched = dispatch(
         Http,
         ctx,

@@ -39,6 +39,7 @@ pub(crate) struct Lifecycle {
     route: Mutex<Route>,
     observation: Mutex<Observation>,
     prefill_observation: Mutex<Option<u64>>,
+    generation_workers: Mutex<Vec<Arc<crate::workers::Worker>>>,
 }
 impl Default for Lifecycle {
     fn default() -> Self {
@@ -53,6 +54,7 @@ impl Default for Lifecycle {
             route: Mutex::new(Route::default()),
             observation: Mutex::new(Observation::default()),
             prefill_observation: Mutex::new(None),
+            generation_workers: Mutex::new(Vec::new()),
         }
     }
 }
@@ -127,17 +129,27 @@ impl Lifecycle {
             .terminal
             .compare_exchange(0, 2, Ordering::Relaxed, Ordering::Relaxed);
     }
+    pub fn bind_generation_workers(&self, workers: Vec<Arc<crate::workers::Worker>>) {
+        *self.generation_workers.lock().unwrap() = workers;
+    }
+
     pub fn complete(&self) {
         let mut observation = self.observation.lock().unwrap();
         observation.finish();
         let error = observation.error;
+        let generated = observation.total(|t| t.completion).is_some_and(|n| n > 0);
         drop(observation);
         if error {
             self.fail("response_error_event");
-        } else {
-            let _ = self
-                .terminal
-                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed);
+        } else if self
+            .terminal
+            .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+            && generated
+        {
+            for worker in self.generation_workers.lock().unwrap().iter() {
+                worker.record_generation_success();
+            }
         }
     }
     pub fn observe_prefill(&self, data: &[u8]) {
@@ -385,5 +397,40 @@ mod tests {
         o.finish();
         assert_eq!(o.actual(), Some(9));
         assert!(o.error);
+    }
+}
+
+#[cfg(test)]
+mod generation_proof_tests {
+    use super::*;
+    #[test]
+    fn generation_proof_requires_positive_tokens_and_successful_completion() {
+        for (body, abort, expected) in [
+            (r#"{"meta_info":{"completion_tokens":1}}"#, false, true),
+            (r#"{"meta_info":{"completion_tokens":0}}"#, false, false),
+            (
+                r#"{"error":{"message":"failed"},"meta_info":{"completion_tokens":1}}"#,
+                false,
+                false,
+            ),
+            (r#"{"meta_info":{"completion_tokens":1}}"#, true, false),
+        ] {
+            let worker = Arc::new(crate::workers::Worker::new(Default::default()));
+            let life = Lifecycle::default();
+            life.bind_generation_workers(vec![Arc::clone(&worker)]);
+            life.observe(body.as_bytes());
+            assert!(
+                !worker.recently_generated(std::time::Duration::from_secs(1)),
+                "body data alone is not completed proof"
+            );
+            if abort {
+                life.abort();
+            }
+            life.complete();
+            assert_eq!(
+                worker.recently_generated(std::time::Duration::from_secs(1)),
+                expected
+            );
+        }
     }
 }

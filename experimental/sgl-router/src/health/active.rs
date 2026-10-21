@@ -128,16 +128,27 @@ impl ActiveHealth {
         let mut proven = HashSet::new();
         let mut probes = stream::iter(pairs)
             .map(|(prefill, decode)| async move {
-                let ok = tokio::time::timeout(
-                    timeout,
-                    crate::server::routes::chat::generation_probe(
-                        ctx,
-                        Arc::clone(&prefill),
-                        decode.clone(),
-                    ),
-                )
-                .await
-                .unwrap_or(false);
+                let freshness = Duration::from_secs(
+                    self.config
+                        .interval_secs
+                        .saturating_add(self.config.timeout_secs),
+                );
+                // Completed positive-token client responses prove service without queuing another probe behind them.
+                let recent = prefill.recently_generated(freshness)
+                    && decode
+                        .as_ref()
+                        .is_none_or(|worker| worker.recently_generated(freshness));
+                let ok = recent
+                    || tokio::time::timeout(
+                        timeout,
+                        crate::server::routes::chat::generation_probe(
+                            ctx,
+                            Arc::clone(&prefill),
+                            decode.clone(),
+                        ),
+                    )
+                    .await
+                    .unwrap_or(false);
                 (prefill, decode, ok)
             })
             .buffer_unordered(8);
@@ -199,6 +210,7 @@ mod tests {
             ..Default::default()
         };
         ctx.registry.add(spec()).unwrap();
+        ctx.registry.all()[0].record_generation_success();
         let health = ActiveHealth::new(HealthCheckConfig::default());
         {
             let mut state = health.state.lock().unwrap();
@@ -214,6 +226,7 @@ mod tests {
             health.ready(&ctx),
             "unchanged metadata refresh preserves live proof"
         );
+        assert!(ctx.registry.all()[0].recently_generated(Duration::from_secs(1)));
         ctx.registry.remove(&WorkerId("worker".into()));
         assert!(!health.ready(&ctx));
         ctx.registry.add(spec()).unwrap();
@@ -221,5 +234,6 @@ mod tests {
             !health.ready(&ctx),
             "recreated endpoints need fresh generation evidence"
         );
+        assert!(!ctx.registry.all()[0].recently_generated(Duration::from_secs(1)));
     }
 }

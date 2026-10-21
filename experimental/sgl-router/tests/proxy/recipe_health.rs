@@ -23,16 +23,21 @@ use tokio::process::Command;
 struct Engine {
     works: AtomicBool,
     delay_ms: AtomicU64,
+    probe_delay_ms: AtomicU64,
 }
 
 async fn generate(
     State(engine): State<Arc<Engine>>,
     uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
-    tokio::time::sleep(Duration::from_millis(
-        engine.delay_ms.load(Ordering::Relaxed),
-    ))
-    .await;
+    let delay = engine.delay_ms.load(Ordering::Relaxed)
+        + if headers.contains_key("x-sgl-router-probe") {
+            engine.probe_delay_ms.load(Ordering::Relaxed)
+        } else {
+            0
+        };
+    tokio::time::sleep(Duration::from_millis(delay)).await;
     if engine.works.load(Ordering::Relaxed) && uri.path() == "/v1/chat/completions" {
         Json(json!({"choices":[{"message":{"content":"OK"},"finish_reason":"stop"}],"usage":{"completion_tokens":1}})).into_response()
     } else if engine.works.load(Ordering::Relaxed) {
@@ -245,6 +250,7 @@ async fn fake_engine(
     let engine = Arc::new(Engine {
         works: AtomicBool::new(works),
         delay_ms: AtomicU64::new(delay_ms),
+        probe_delay_ms: AtomicU64::new(0),
     });
     let app = axum::Router::new()
         .route("/health", get(|| async { StatusCode::OK }))
@@ -410,4 +416,94 @@ async fn startup_liveness_is_available_while_worker_model_resolution_is_pending(
     );
     process.kill().await.unwrap();
     process.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn recent_successful_generation_keeps_busy_workers_ready_without_masking_stalls() {
+    let engine = Arc::new(Engine::default());
+    engine.works.store(true, Ordering::Relaxed);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let worker = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new()
+        .route("/health", get(|| async { StatusCode::OK }))
+        .route(
+            "/server_info",
+            get(|| async { Json(json!({"served_model_name":"tiny","model_path":"fixture"})) }),
+        )
+        .route("/generate", post(generate))
+        .route("/abort_request", post(|| async { StatusCode::OK }))
+        .with_state(Arc::clone(&engine));
+    let server = tokio::spawn(async {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let http = port();
+    let mut process = Command::new(env!("CARGO_BIN_EXE_sgl-router"))
+        .args([
+            "--model-id",
+            "tiny",
+            "--no-tokenizer",
+            "--worker-urls",
+            &worker,
+            "--policy",
+            "round_robin",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &http.to_string(),
+            "--prometheus-port",
+            &port().to_string(),
+            "--disable-retries",
+            "--disable-circuit-breaker",
+            "--health-check-interval-secs",
+            "1",
+            "--health-check-timeout-secs",
+            "1",
+            "--health-failure-threshold",
+            "2",
+            "--health-success-threshold",
+            "1",
+            "--shutdown-drain-secs",
+            "0",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let base = format!("http://127.0.0.1:{http}");
+    let client = reqwest::Client::new();
+    wait_status(&client, &base, "/readiness", StatusCode::OK).await;
+    engine.probe_delay_ms.store(2_000, Ordering::Relaxed);
+    for _ in 0..65 {
+        let response = client
+            .post(format!("{base}/generate"))
+            .json(&json!({"input_ids":[7],"sampling_params":{"max_new_tokens":1}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "completed generation must retain full-path proof under load"
+        );
+        response.bytes().await.unwrap();
+        assert_eq!(
+            status(&client, &base, "/readiness").await,
+            Some(StatusCode::OK)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Old traffic must expire; an always-successful health GET cannot hide a stalled generator.
+    wait_status(
+        &client,
+        &base,
+        "/readiness",
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await;
+    engine.probe_delay_ms.store(0, Ordering::Relaxed);
+    wait_status(&client, &base, "/readiness", StatusCode::OK).await;
+    process.kill().await.unwrap();
+    process.wait().await.unwrap();
+    server.abort();
 }
