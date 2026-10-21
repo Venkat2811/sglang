@@ -81,6 +81,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 # as many rows as a real exchange delivers); combine returns zeros. Bounds what hiding or removing the exchange buys.
 _ABLATE_DEEPEP_COMM = os.environ.get("SGLANG_ABLATE_DEEPEP_COMM", "0") == "1"
 _ABLATE_TEMPLATE: dict = {}
+_LOG_DEEPEP_RECV = os.environ.get("SGLANG_LOG_DEEPEP_RECV", "0") == "1"  # diagnostic, eager only
 
 
 class _AblationEvent:
@@ -837,6 +838,18 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
             masked_m
         )
+        if _LOG_DEEPEP_RECV and not torch.cuda.is_current_stream_capturing():
+            # DIAGNOSTIC (eager runs only): rows this rank received per local expert, every 50th dispatch.
+            self._recv_log_ct = getattr(self, "_recv_log_ct", 0) + 1
+            if self._recv_log_ct % 50 == 0:
+                m = masked_m.to(torch.int64).cpu()
+                logger.info(
+                    "DEEPEP_RECV rank=%d rows=%d experts_hit=%d max_rows_per_expert=%d",
+                    torch.distributed.get_rank(),
+                    int(m.sum()),
+                    int((m > 0).sum()),
+                    int(m.max()),
+                )
 
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
