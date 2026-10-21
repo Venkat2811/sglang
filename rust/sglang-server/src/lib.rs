@@ -43,7 +43,7 @@ use crate::utils::{logging, runtime, shm::ShmSegment};
 
 // Version 1 includes the 19-column generation header. Keep in lockstep with
 // python/sglang/srt/rust_server/server.py when changing the scheduler wire.
-const RUST_SERVER_WIRE_VERSION: u32 = 1;
+const RUST_SERVER_WIRE_VERSION: u32 = 2;
 
 /// One drained request handed to Python by [`Server::recv_requests`]: the
 /// msgpack scalar header plus every non-scalar payload as a named buffer --

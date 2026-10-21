@@ -1,6 +1,6 @@
 //! TokenizerManager — to_scheduler side.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::message::detok::DetokMsg;
 use crate::message::finish_reason::{AbortReason, FinishKind};
@@ -114,11 +114,11 @@ impl Runnable for Intake {
                     self.drive(req)
                 }
                 Some(Lane::Event(TmEvent::AbortRequest {
-                    rid_prefix,
+                    rids,
                     abort_all,
                     reply,
                 })) => {
-                    let _ = reply.send(self.abort_request(&rid_prefix, abort_all));
+                    let _ = reply.send(self.abort_request(&rids, abort_all));
                 }
                 None => {
                     // Shutdown, or the inbox closed. Drain whatever is still queued
@@ -529,7 +529,9 @@ impl Intake {
 
         // The channel is BOUNDED and drops pushes under exactly the load this matters
         // for, so report the miss rather than assuming the scheduler was told.
-        match ControlRequest::AbortReq(AbortReq::new(rid.as_str().to_string(), false)).encode() {
+        match ControlRequest::AbortReq(AbortReq::exact(vec![rid.as_str().to_owned()], false))
+            .encode()
+        {
             Ok(header) => {
                 if !self.to_scheduler_tx.try_push(SchedulerRequest {
                     header,
@@ -546,22 +548,25 @@ impl Intake {
         }
     }
 
-    fn abort_request(&mut self, rid_prefix: &str, abort_all: bool) -> Result<(), Error> {
-        if rid_prefix.is_empty() && !abort_all {
+    fn abort_request(&mut self, rids: &HashSet<Rid>, abort_all: bool) -> Result<(), Error> {
+        if rids.is_empty() && !abort_all {
             return Ok(());
         }
-        let header =
-            ControlRequest::AbortReq(AbortReq::new(rid_prefix.into(), abort_all)).encode()?;
+        let header = ControlRequest::AbortReq(AbortReq::exact(
+            rids.iter().map(|rid| rid.as_str().to_owned()).collect(),
+            abort_all,
+        ))
+        .encode()?;
         if !self.to_scheduler_tx.try_push(SchedulerRequest {
             header,
             buffers: Vec::new(),
         }) {
             return Err(Error::QueueFull);
         }
-        // The scheduler matches prefixes, including the suffix from Rid::from_client.
+        // One exact target set crosses the scheduler boundary atomically.
         // Pool work is not on the scheduler yet and must be stopped on its return.
         for (rid, pending) in &mut self.request_states {
-            if !(abort_all || rid.starts_with(rid_prefix)) {
+            if !(abort_all || rids.contains(rid)) {
                 continue;
             }
             let Some(sink) = pending.generation_sink.take() else {

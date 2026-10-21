@@ -57,9 +57,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Version 1 includes the 19-column generation header. Bump both sides whenever
-# the positional scheduler wire changes; Python and the extension deploy together.
-RUST_SERVER_WIRE_VERSION = 1
+# Version 2 adds exact abort targets after version 1's generation header.
+# Bump both sides for positional changes; Python and the extension deploy together.
+RUST_SERVER_WIRE_VERSION = 2
 
 
 class RustServer:

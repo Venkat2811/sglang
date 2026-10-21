@@ -34,6 +34,8 @@ def _scheduler_for_typed_config():
     "overrides,kwarg,expected",
     [
         ({}, "grpc_port", 50051),
+        ({}, "rust_server_allow_abort_all", False),
+        ({"rust_server_allow_abort_all": True}, "rust_server_allow_abort_all", True),
         ({"smg_grpc_mode": True}, "grpc_port", None),
         ({"grpc_mode": True}, "grpc_port", None),
         ({"default_priority_value": 5}, "default_priority_value", None),
@@ -45,6 +47,8 @@ def _scheduler_for_typed_config():
     ],
     ids=[
         "native-grpc",
+        "abort-all-default-off",
+        "abort-all-explicit-on",
         "legacy-smg",
         "deprecated-legacy-smg",
         "priority-off",
@@ -72,6 +76,25 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
         )
 
     assert extension.ServerArgs.call_args.kwargs[kwarg] == expected
+
+
+def test_typed_config_constructs_the_compiled_abort_policy():
+    """A mock constructor cannot catch a drifted Python/PyO3 launch schema."""
+    extension = pytest.importorskip("sglang.srt.rust_extensions._server")
+    for enabled in [False, True]:
+        with (
+            get_context().override_server_args(
+                model_path="model",
+                served_model_name="model",
+                rust_server_allow_abort_all=enabled,
+            ),
+            patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+            patch.object(rust_config, "_launch_server_info", return_value="{}"),
+        ):
+            args = rust_config._build_server_args(
+                _scheduler_for_typed_config(), extension=extension
+            )
+        assert type(args) is extension.ServerArgs
 
 
 @pytest.mark.parametrize("enable_metrics", [False, True])

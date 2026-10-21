@@ -576,9 +576,9 @@ mod tests {
         )
     }
 
-    /// An empty abort is harmless; a stopped intake cannot acknowledge cancellation.
+    /// Public selectors must be exact live IDs or long prefixes, with explicit all opt-in.
     #[tokio::test]
-    async fn abort_route_preserves_empty_id_safety_and_reports_unavailable_intake() {
+    async fn abort_route_refuses_short_selectors_and_unapproved_abort_all() {
         let (intake_tx, intake_rx) = flume::unbounded();
         drop(intake_rx);
         let (abort_tx, abort_rx) = flume::unbounded();
@@ -599,11 +599,16 @@ mod tests {
             chat_formatter: None,
         });
         for (body, expected) in [
-            (r#"{}"#, StatusCode::OK),
-            (r#"{"rid":"","abort_all":false}"#, StatusCode::OK),
+            (r#"{}"#, StatusCode::BAD_REQUEST),
+            (r#"{"rid":"","abort_all":false}"#, StatusCode::BAD_REQUEST),
             (
                 r#"{"rid":"target","abort_all":false}"#,
-                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::BAD_REQUEST,
+            ),
+            (r#"{"rid":"","abort_all":true}"#, StatusCode::BAD_REQUEST),
+            (
+                r#"{"rid":"0123456789abcdef0123456789abcdef"}"#,
+                StatusCode::OK,
             ),
         ] {
             let request = Request::builder()

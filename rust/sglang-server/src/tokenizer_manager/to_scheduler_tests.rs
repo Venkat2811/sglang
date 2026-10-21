@@ -24,12 +24,12 @@ fn make_intake() -> (
 }
 
 #[test]
-fn abort_request_uses_prefix_wire_without_registering_a_control_response() {
+fn abort_request_uses_exact_wire_without_registering_a_control_response() {
     let (intake, detok_rx, consumer, tm_tx, _mm_rx) = make_intake();
     let (reply, result) = flume::bounded(1);
     tm_tx
         .send(TmEvent::AbortRequest {
-            rid_prefix: "batch-".into(),
+            rids: [Rid::from("batch-0")].into(),
             abort_all: false,
             reply,
         })
@@ -41,9 +41,10 @@ fn abort_request_uses_prefix_wire_without_registering_a_control_response() {
     assert_eq!(frames.len(), 1);
     let wire = rmpv::decode::read_value(&mut &frames[0].header[..]).unwrap();
     let fields = wire.as_array().unwrap();
-    assert_eq!(fields.len(), 6);
+    assert_eq!(fields.len(), 8);
     assert_eq!(fields[0].as_str(), Some("AbortReq"));
-    assert_eq!(fields[1].as_str(), Some("batch-"));
+    assert_eq!(fields[1].as_str(), Some(""));
+    assert_eq!(fields[7].as_array().unwrap()[0].as_str(), Some("batch-0"));
     assert_eq!(fields[3].as_bool(), Some(false));
     assert!(frames[0].buffers.is_empty());
     assert!(detok_rx.try_recv().is_err());
@@ -55,7 +56,7 @@ fn abort_request_cancels_matching_pool_work_and_preserves_other_requests() {
     for tokenizing in [false, true] {
         let (mut intake, tok_rx, mm_rx, consumer, detok_rx) = make_intake_with_tokenizer(true);
         let mut responses = Vec::new();
-        for name in ["batch-0", "batch-1", "other"] {
+        for name in ["batch-0", "batch-1", "batch-0-neighbor"] {
             let (tx, rx) = mpsc::channel(8);
             let mut request = if tokenizing {
                 mm_generate_req(name)
@@ -69,8 +70,12 @@ fn abort_request_cancels_matching_pool_work_and_preserves_other_requests() {
         let pool = if tokenizing { &tok_rx } else { &mm_rx };
         let requests = (0..3).map(|_| pool.try_recv().unwrap()).collect::<Vec<_>>();
         assert_eq!(detok_rx.try_iter().count(), 3);
-        intake.abort_request("batch-", false).unwrap();
-        intake.abort_request("batch-", false).unwrap();
+        intake
+            .abort_request(&[Rid::from("batch-0"), Rid::from("batch-1")].into(), false)
+            .unwrap();
+        intake
+            .abort_request(&[Rid::from("batch-0"), Rid::from("batch-1")].into(), false)
+            .unwrap();
         for response in &mut responses[..2] {
             let ResponseItem::Done(event) = response
                 .try_recv()
@@ -117,7 +122,7 @@ fn abort_request_cancels_matching_pool_work_and_preserves_other_requests() {
         }
         if tokenizing {
             let mut request = mm_rx.try_recv().expect("only the other request enters mm");
-            assert_eq!(request.rid.as_str(), "other");
+            assert_eq!(request.rid.as_str(), "batch-0-neighbor");
             encode_like_worker(&mut request, vec![5, 6], Vec::new());
             intake.drive(request);
             assert!(mm_rx.try_recv().is_err());
@@ -147,7 +152,7 @@ fn abort_request_backpressure_does_not_claim_or_partially_apply_cancellation() {
         }));
     }
     assert!(matches!(
-        intake.abort_request("batch-", false),
+        intake.abort_request(&[Rid::from("batch-0"), Rid::from("batch-1")].into(), false),
         Err(Error::QueueFull)
     ));
     assert!(response.try_recv().is_err());
@@ -172,7 +177,7 @@ fn abort_request_requires_explicit_abort_all_to_cancel_unrelated_ids() {
         intake.drive(request);
         responses.push(rx);
     }
-    intake.abort_request("", false).unwrap();
+    intake.abort_request(&HashSet::new(), false).unwrap();
     assert!(
         consumer.drain(16).is_empty(),
         "empty rid must not become a wildcard"
@@ -182,7 +187,7 @@ fn abort_request_requires_explicit_abort_all_to_cancel_unrelated_ids() {
             .iter_mut()
             .all(|response| response.try_recv().is_err())
     );
-    intake.abort_request("", true).unwrap();
+    intake.abort_request(&HashSet::new(), true).unwrap();
     assert!(
         responses
             .iter_mut()
