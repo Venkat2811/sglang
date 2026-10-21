@@ -29,7 +29,11 @@ from sglang.srt.configs.moe_model_registry import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    derive_attn_tp_size,
+    get_platform,
+)
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_gfx1250_supported,
@@ -693,13 +697,26 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
             )
 
     graph_bs, tokens_per_req = _decode_graph_dispatch_tokens_per_rank(server_args)
-    graph_tokens = graph_bs * tokens_per_req
+    # Attention DP scatters a group's decode rows across its attention-TP ranks
+    # before dispatch; attention CP does not shard decode rows.
+    scatter_ranks = 1
+    if attn_dp_enabled_of(view):
+        scatter_ranks = max(
+            1,
+            derive_attn_tp_size(
+                tp_size=view.tp_size,
+                attn_cp_size=view.attn_cp_size,
+                attn_dp_size=view.attn_dp_size,
+            ),
+        )
+    graph_tokens = -(-graph_bs * tokens_per_req // scatter_ranks)
     if graph_tokens > capacity:
         raise ValueError(
             "DeepEP v2 per-rank decode CUDA graph exceeds "
             "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "
             f"required={graph_tokens}, capacity={capacity} "
-            f"(requests={graph_bs}, tokens/request={tokens_per_req}). Raise "
+            f"(requests={graph_bs}, tokens/request={tokens_per_req}, "
+            f"attention-TP ranks={scatter_ranks}). Raise "
             "the environment value or lower --cuda-graph-max-bs-decode."
         )
 
