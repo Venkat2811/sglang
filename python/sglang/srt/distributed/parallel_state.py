@@ -1381,8 +1381,21 @@ class GroupCoordinator:
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if self._ablate_xnode:
-            output.zero_()
-            output.view(self.world_size, -1)[self.rank_in_group].copy_(input.reshape(-1))
+            # Every slot gets this rank's rows times a fixed per-slot random +-1 channel mask (own slot exact), so the
+            # gathered batch keeps as many distinct rows as a real gather: routing then touches about as many experts
+            # as real traffic would (zero-filled slots would all route to the same few experts and under-count).
+            dim = input.shape[-1]
+            key = (dim, input.dtype, input.device)
+            masks = _ABLATE_XNODE_MASKS.get(key)
+            if masks is None:
+                g = torch.Generator(device="cpu").manual_seed(4242)
+                masks = (torch.randint(0, 2, (self.world_size, dim), generator=g) * 2 - 1).to(
+                    device=input.device, dtype=input.dtype
+                )
+                _ABLATE_XNODE_MASKS[key] = masks
+            out = output.view(self.world_size, -1, dim)
+            torch.mul(input.reshape(1, -1, dim), masks.unsqueeze(1), out=out)
+            out[self.rank_in_group].copy_(input.reshape(-1, dim))
             return
         if _is_npu or _is_cpu:
             # TODO: add optimized all_gather_into_tensor kernel for cpu
@@ -2337,6 +2350,8 @@ def graph_capture(stream=None):
 
 
 logger = logging.getLogger(__name__)
+
+_ABLATE_XNODE_MASKS: dict = {}  # SGLANG_ABLATE_XNODE_COLLECTIVES (timing-only ablation)
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP = False
