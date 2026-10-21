@@ -196,8 +196,9 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = 0)]
     pub queue_size: usize,
 
-    /// Refill credits per second, in addition to credits returned on completion.
-    /// Refill never bypasses the strict concurrent-request ceiling.
+    /// Accepted for gateway command-line compatibility; currently has no effect.
+    /// Admission is a strict in-flight ceiling: a request is admitted whenever
+    /// fewer than --max-concurrent-requests are in flight, so refill never decides.
     #[arg(long, default_value_t = 0)]
     pub rate_limit_tokens_per_second: u32,
 
