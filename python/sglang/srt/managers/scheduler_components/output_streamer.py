@@ -474,8 +474,15 @@ class _GenerationStreamAccumulator:
         self.prompt_tokens.append(len(req.origin_input_ids))
         self.reasoning_tokens.append(req.reasoning_tokens)
         self.cached_tokens.append(req.cached_tokens)
-        # Both detokenizers consume this column; keep cold None entries aligned.
-        self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+        # Rust retains the first cache metadata while folding later deltas.
+        # Keep per-row alignment in mixed batches without rebuilding fixed
+        # cache-source dictionaries on every streamed decode step.
+        include_cache_details = (
+            not self.rust_server_mode or send_token_offset == 0 or req.finished()
+        )
+        self.cached_tokens_details.append(
+            self.get_cached_tokens_details(req) if include_cache_details else None
+        )
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (
