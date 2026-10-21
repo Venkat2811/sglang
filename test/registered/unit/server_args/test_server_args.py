@@ -3385,6 +3385,40 @@ class TestDeepEPv2Args(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "decode CUDA graph"):
                 validate_deepep_v2_dispatch_token_budget(args)
 
+    def test_dp_attention_decode_graph_divides_by_attention_tp(self):
+        """Under attention DP a rank dispatches only its attention-TP slice of the
+        group's decode graph, so the cap must not have to cover the whole graph."""
+        # TP16 / attention DP2 = attention TP8: a 1024-request graph is 128 rows per rank.
+        args = self._args(
+            disaggregation_mode="decode",
+            max_running_requests=None,
+            tp_size=16,
+            attn_dp_size=2,
+        )
+        args.cuda_graph_config.decode.max_bs = 1024
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
+            validate_deepep_v2_dispatch_token_budget(args)
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(127):
+            with self.assertRaisesRegex(ValueError, "required=128"):
+                validate_deepep_v2_dispatch_token_budget(args)
+
+    def test_dp_attention_decode_graph_is_not_divided_by_attention_cp(self):
+        # Every attention-CP rank holds all decode rows: TP16 / DP2 / CP2 leaves
+        # attention TP4, so 1024 requests are 256 rows per rank, not 128.
+        args = self._args(
+            disaggregation_mode="decode",
+            max_running_requests=None,
+            tp_size=16,
+            attn_dp_size=2,
+            attn_cp_size=2,
+        )
+        args.cuda_graph_config.decode.max_bs = 1024
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(255):
+            with self.assertRaisesRegex(ValueError, "required=256"):
+                validate_deepep_v2_dispatch_token_budget(args)
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(256):
+            validate_deepep_v2_dispatch_token_budget(args)
+
     def test_memory_derived_eager_pool_remains_runtime_validated(self):
         args = self._args(
             disaggregation_mode="decode",
