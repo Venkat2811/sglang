@@ -477,11 +477,9 @@ async fn select_workers(
                         .iter()
                         .find(|m| m.address == url)
                         .map_or(0, |m| m.matched_prefix_blocks);
-                    crate::policies::cache_aware::estimate_matched_prefix_tokens(
-                        request.input_token_count as u64,
-                        signal.unwrap().query_blocks,
-                        blocks,
-                    )
+                    signal
+                        .unwrap()
+                        .matched_tokens(request.input_token_count as u64, url, blocks)
                 })
             };
             let rows=candidates.iter().filter(|w|w.id==prefill.id).chain(candidates.iter().filter(|w|w.id!=prefill.id)).take(64).map(|w| {
@@ -735,6 +733,7 @@ async fn lookup_prefix_matches(
                 outcome,
                 query_blocks,
                 block_hashes: None,
+                local_queries: Default::default(),
             })
         }
         // Without usable indexer inputs, try the in-process radix tree.

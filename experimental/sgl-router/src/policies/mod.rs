@@ -921,6 +921,7 @@ mod tests {
             },
             query_blocks: 8,
             block_hashes: None,
+            local_queries: Default::default(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_request_tokens(Some(&[1, 2, 3, 4, 5, 6, 7, 8]))
@@ -965,6 +966,7 @@ mod tests {
             },
             query_blocks: 8,
             block_hashes: None,
+            local_queries: Default::default(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(8_000)
@@ -1015,6 +1017,7 @@ mod tests {
             },
             query_blocks: 64,
             block_hashes: None,
+            local_queries: Default::default(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(64_000)
@@ -1072,6 +1075,7 @@ mod tests {
             },
             query_blocks: 4,
             block_hashes: None,
+            local_queries: Default::default(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(4_000)
@@ -1124,6 +1128,7 @@ mod tests {
             },
             query_blocks: 8,
             block_hashes: None,
+            local_queries: Default::default(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(80)
@@ -1164,6 +1169,7 @@ mod tests {
             },
             query_blocks: 8,
             block_hashes: None,
+            local_queries: Default::default(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(80)
@@ -1196,6 +1202,7 @@ mod tests {
             },
             query_blocks: 4_125,
             block_hashes: None,
+            local_queries: Default::default(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(4_125)

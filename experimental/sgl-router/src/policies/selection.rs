@@ -32,7 +32,6 @@ use crate::policies::admission::{
     CandidateDomain, CandidateRange, DecisionReason,
 };
 use crate::policies::buckets::{BucketRequest, BucketSelector};
-use crate::policies::cache_aware::estimate_matched_prefix_tokens;
 use crate::policies::decode::{
     resolve_decode_with_capacity_fallback, DecodePolicy, DecodeSelectionContext,
 };
@@ -197,9 +196,9 @@ fn best_reusable_tokens(inputs: &PrefillSelectionInputs<'_>) -> u64 {
                 .any(|worker| worker.url == entry.address)
         })
         .map(|entry| {
-            estimate_matched_prefix_tokens(
+            signal.matched_tokens(
                 inputs.request_sequence_tokens,
-                signal.query_blocks,
+                &entry.address,
                 entry.matched_prefix_blocks,
             )
         })
@@ -979,6 +978,7 @@ mod tests {
             },
             query_blocks,
             block_hashes: None,
+            local_queries: Default::default(),
         }
     }
 

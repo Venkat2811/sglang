@@ -51,6 +51,22 @@ The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
 
+### Worker KV page sizes
+
+The local radix tree subscribes to workers with different `page_size` values.
+Queries hash once per page-size and bigram configuration, then credit only
+workers in that group. Cache costs use each worker's native block size and
+count only complete query pages. DP-rank lookup and pending-prefix placement
+use the selected worker's hashing configuration too.
+
+`sgl_router_kv_worker_block_size{worker_url}` converts each worker's block
+counts to tokens. The fleet-wide `sgl_router_kv_block_size` is zero when page
+sizes differ; aggregate event-block counters cannot then be converted with a
+single multiplier. Remote indexer queries and peer snapshots still require
+one fleet-wide hashing configuration and are unavailable for mixed fleets.
+Tier pricing and recurrent-state checkpoint boundaries are separate from
+page-size matching.
+
 ### LoRA cache identity
 
 LoRA routing requires workers that publish `BlockStored.lora_name`. Requests

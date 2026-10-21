@@ -124,7 +124,7 @@ async fn pd_fixture_consumes_all_three_kv_publishers_and_rotates_decode() {
     let ctx = build_ctx_with_config(cfg, specs);
     let index = KvEventIndex::new();
     let mut publishers = Vec::new();
-    for worker in &workers {
+    for (i, worker) in workers.iter().enumerate() {
         let (publisher, port) = kv_fixture_wire::make_pub_bound().await;
         index
             .add_worker(
@@ -133,7 +133,7 @@ async fn pd_fixture_consumes_all_three_kv_publishers_and_rotates_decode() {
                     host: "127.0.0.1".into(),
                     port_base: port,
                     topic: String::new(),
-                    block_size: 4,
+                    block_size: if i == 0 { 64 } else { 512 },
                     dp_size: 1,
                     load_port_base: None,
                     load_topic: None,
@@ -144,39 +144,39 @@ async fn pd_fixture_consumes_all_three_kv_publishers_and_rotates_decode() {
             .await;
         publishers.push(publisher);
     }
-    let tokens: Vec<u32> = (0..16).collect();
-    let hashes = compute_block_hashes(&tokens, 4);
-    let payload = kv_fixture_wire::encode_event_batch(
-        0.0,
-        vec![kv_fixture_wire::encode_block_stored_event(
-            &hashes, None, &tokens, 4,
-        )],
-        Some(0),
-    );
+    let tokens: Vec<u32> = (0..1024).collect();
+    let hashes: Vec<_> = [64, 512, 512]
+        .into_iter()
+        .map(|size| compute_block_hashes(&tokens, size))
+        .collect();
     tokio::time::timeout(Duration::from_secs(3), async {
         for sequence in 1i64.. {
-            for publisher in &mut publishers {
+            for (i, publisher) in publishers.iter_mut().enumerate() {
+                let size = if i == 0 { 64 } else { 512 };
+                let payload = kv_fixture_wire::encode_event_batch(
+                    0.0,
+                    vec![kv_fixture_wire::encode_block_stored_event(
+                        &hashes[i], None, &tokens, size,
+                    )],
+                    Some(0),
+                );
                 publisher
-                    .send(kv_fixture_wire::build_multipart(sequence, payload.clone()))
+                    .send(kv_fixture_wire::build_multipart(sequence, payload))
                     .await
                     .unwrap();
             }
-            let matched = index.tree().match_prefix(None, &hashes);
-            if matched.matched_blocks == hashes.len()
-                && workers.iter().all(|worker| {
-                    matched.holds(&KvWorkerId {
-                        url: worker.url.clone(),
-                        dp_rank: 0,
-                    })
-                })
-            {
+            if workers.iter().enumerate().all(|(i, worker)| {
+                let matched = index.tree().match_prefix(None, &hashes[i]);
+                matched.matched_blocks == hashes[i].len()
+                    && matched.holds(&KvWorkerId::new(worker.url.clone(), 0))
+            }) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("each P/D worker must have an independent functioning KV subscriber");
+    .expect("mixed-page P/D workers must each have a functioning KV subscriber");
     let app = build_router(ctx);
     for _ in 0..2 {
         assert_eq!(
