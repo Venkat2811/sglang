@@ -14,10 +14,14 @@ use std::{
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Default)]
 pub struct Admission {
-    limit: Option<Arc<Limit>>,
+    limit: Arc<Limit>,
     stats: Arc<AdmissionStats>,
+}
+impl Default for Admission {
+    fn default() -> Self {
+        Self::new(&AdmissionConfig::default())
+    }
 }
 #[derive(Default)]
 struct AdmissionStats {
@@ -26,73 +30,93 @@ struct AdmissionStats {
     rejected: std::sync::atomic::AtomicU64,
 }
 struct Limit {
-    capacity: usize,
     refill: f64,
     state: Mutex<State>,
 }
 struct State {
+    capacity: Option<usize>,
     active: usize,
     credits: f64,
     updated: Instant,
 }
 impl Admission {
     pub fn new(config: &AdmissionConfig) -> Self {
+        let capacity = config.max_concurrent_requests.filter(|c| *c > 0);
         Self {
-            limit: config.max_concurrent_requests.map(|capacity| {
-                Arc::new(Limit {
+            limit: Arc::new(Limit {
+                refill: f64::from(config.refill_per_second),
+                state: Mutex::new(State {
                     capacity,
-                    refill: f64::from(config.refill_per_second),
-                    state: Mutex::new(State {
-                        active: 0,
-                        credits: capacity as f64,
-                        updated: Instant::now(),
-                    }),
-                })
+                    active: 0,
+                    credits: capacity.unwrap_or(0) as f64,
+                    updated: Instant::now(),
+                }),
             }),
             stats: Arc::default(),
         }
     }
     fn enter(&self) -> Result<Option<Permit>, ApiError> {
         use std::sync::atomic::Ordering;
-        if let Some(limit) = &self.limit {
-            let mut state = limit.state.lock().unwrap();
-            let now = Instant::now();
+        let mut state = self.limit.state.lock().unwrap();
+        let now = Instant::now();
+        if let Some(capacity) = state.capacity {
             state.credits = (state.credits
-                + now.duration_since(state.updated).as_secs_f64() * limit.refill)
-                .min(limit.capacity as f64);
-            state.updated = now;
-            if state.active >= limit.capacity || state.credits < 1.0 {
+                + now.duration_since(state.updated).as_secs_f64() * self.limit.refill)
+                .min(capacity as f64);
+            if state.active >= capacity || state.credits < 1.0 {
+                state.updated = now;
                 self.stats.rejected.fetch_add(1, Ordering::Relaxed);
                 return Err(ApiError::AdmissionRejected);
             }
-            state.active += 1;
             state.credits -= 1.0;
         }
+        state.updated = now;
+        state.active += 1;
         self.stats.active.fetch_add(1, Ordering::Relaxed);
         self.stats.accepted.fetch_add(1, Ordering::Relaxed);
         Ok(Some(Permit {
-            limit: self.limit.clone(),
+            limit: Arc::clone(&self.limit),
             stats: Arc::clone(&self.stats),
         }))
     }
     pub fn active(&self) -> usize {
         self.stats.active.load(std::sync::atomic::Ordering::Relaxed)
     }
+    pub fn capacity(&self) -> Option<usize> {
+        self.limit.state.lock().unwrap().capacity
+    }
+    /// Existing requests retain the same accounting owner across all cap changes.
+    /// Lowering the cap drains naturally; it never cancels admitted work.
+    pub fn set_capacity(&self, capacity: Option<usize>) {
+        let capacity = capacity.filter(|c| *c > 0);
+        let mut state = self.limit.state.lock().unwrap();
+        if let Some(new) = capacity {
+            let available = new.saturating_sub(state.active) as f64;
+            state.credits = match state.capacity {
+                Some(old) => (state.credits + new.saturating_sub(old) as f64).min(available),
+                None => available,
+            };
+        } else {
+            state.credits = 0.0;
+        }
+        state.capacity = capacity;
+        state.updated = Instant::now();
+    }
     pub fn render_metrics(&self) -> String {
         use std::sync::atomic::Ordering;
-        format!("# HELP sgl_router_admission_inflight Requests retaining admission through response and worker cleanup.\n# TYPE sgl_router_admission_inflight gauge\nsgl_router_admission_inflight {}\n# HELP sgl_router_admission_capacity Concurrent ceiling; -1 means disabled.\n# TYPE sgl_router_admission_capacity gauge\nsgl_router_admission_capacity {}\n# HELP sgl_router_admission_total Generation admission outcomes.\n# TYPE sgl_router_admission_total counter\nsgl_router_admission_total{{outcome=\"accepted\"}} {}\nsgl_router_admission_total{{outcome=\"rejected\"}} {}\n# HELP sgl_router_admission_queue_length Requests waiting for admission (queueing disabled).\n# TYPE sgl_router_admission_queue_length gauge\nsgl_router_admission_queue_length 0\n",self.active(),self.limit.as_ref().map_or(-1,|l|i64::try_from(l.capacity).unwrap_or(i64::MAX)),self.stats.accepted.load(Ordering::Relaxed),self.stats.rejected.load(Ordering::Relaxed))
+        format!("# HELP sgl_router_admission_inflight Requests retaining admission through response and worker cleanup.\n# TYPE sgl_router_admission_inflight gauge\nsgl_router_admission_inflight {}\n# HELP sgl_router_admission_capacity Concurrent ceiling; -1 means disabled.\n# TYPE sgl_router_admission_capacity gauge\nsgl_router_admission_capacity {}\n# HELP sgl_router_admission_total Generation admission outcomes.\n# TYPE sgl_router_admission_total counter\nsgl_router_admission_total{{outcome=\"accepted\"}} {}\nsgl_router_admission_total{{outcome=\"rejected\"}} {}\n# HELP sgl_router_admission_queue_length Requests waiting for admission (queueing disabled).\n# TYPE sgl_router_admission_queue_length gauge\nsgl_router_admission_queue_length 0\n",self.active(),self.capacity().map_or(-1,|c|i64::try_from(c).unwrap_or(i64::MAX)),self.stats.accepted.load(Ordering::Relaxed),self.stats.rejected.load(Ordering::Relaxed))
     }
 }
 struct Permit {
-    limit: Option<Arc<Limit>>,
+    limit: Arc<Limit>,
     stats: Arc<AdmissionStats>,
 }
 impl Drop for Permit {
     fn drop(&mut self) {
-        if let Some(limit) = &self.limit {
-            let mut state = limit.state.lock().unwrap();
-            state.active -= 1;
-            state.credits = (state.credits + 1.0).min(limit.capacity as f64);
+        let mut state = self.limit.state.lock().unwrap();
+        state.active -= 1;
+        if let Some(capacity) = state.capacity {
+            state.credits = (state.credits + 1.0).min(capacity as f64);
         }
         self.stats
             .active
@@ -133,7 +157,7 @@ impl RequestScope {
                     endpoint,
                     Arc::clone(&ctx.metrics),
                     ctx.admission.active(),
-                    ctx.config.server.admission.max_concurrent_requests,
+                    ctx.admission.capacity(),
                 );
                 Ok(scope)
             }
@@ -270,6 +294,30 @@ impl HttpBody for ClientBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn enabling_and_lowering_cap_keeps_all_preexisting_permits() {
+        let admission = Admission::default();
+        let first = admission.enter().unwrap();
+        let second = admission.enter().unwrap();
+        admission.set_capacity(Some(1));
+        assert!(admission.enter().is_err());
+        drop(first);
+        assert!(admission.enter().is_err());
+        drop(second);
+        let first = admission.enter().unwrap();
+        assert!(admission.enter().is_err());
+        admission.set_capacity(None);
+        let second = admission.enter().unwrap();
+        assert_eq!(admission.active(), 2);
+        admission.set_capacity(Some(2));
+        assert!(admission.enter().is_err());
+        drop(first);
+        assert_eq!(admission.active(), 1);
+        let third = admission.enter().unwrap();
+        drop(second);
+        drop(third);
+        assert_eq!(admission.active(), 0);
+    }
     #[tokio::test(start_paused = true)]
     async fn refill_obeys_the_exact_boundary_and_never_bypasses_active_capacity() {
         let admission = Admission::new(&AdmissionConfig {
@@ -279,33 +327,13 @@ mod tests {
         let permit = admission.enter().unwrap();
         tokio::time::advance(std::time::Duration::from_millis(999)).await;
         assert!(admission.enter().is_err());
-        assert!(
-            admission
-                .limit
-                .as_ref()
-                .unwrap()
-                .state
-                .lock()
-                .unwrap()
-                .credits
-                < 1.0
-        );
+        assert!(admission.limit.state.lock().unwrap().credits < 1.0);
         tokio::time::advance(std::time::Duration::from_millis(1)).await;
         assert!(
             admission.enter().is_err(),
             "refilled credits cannot increase concurrency"
         );
-        assert_eq!(
-            admission
-                .limit
-                .as_ref()
-                .unwrap()
-                .state
-                .lock()
-                .unwrap()
-                .credits,
-            1.0
-        );
+        assert_eq!(admission.limit.state.lock().unwrap().credits, 1.0);
         drop(permit);
         assert!(admission.enter().is_ok());
     }

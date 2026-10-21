@@ -332,6 +332,80 @@ async fn lifecycle_records_late_errors_and_admission_cleanup_with_bounded_metric
         .await
         .unwrap();
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    let adjusted = client
+        .put(format!("{admin_base}/admin/cap"))
+        .json(&json!({"max_concurrent_requests":2}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(adjusted.status(), StatusCode::OK);
+    let config: Value = client
+        .get(format!("{admin_base}/admin/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(config["max_concurrent_requests"], 2);
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let response = client
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&payload("hold"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        held.push(response);
+    }
+    let adjusted = client
+        .put(format!("{admin_base}/admin/cap"))
+        .json(&json!({"max_concurrent_requests":1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(adjusted.status(), StatusCode::OK);
+    assert_eq!(
+        client
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&payload("ok"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let metrics = client
+                .get(format!("http://127.0.0.1:{metrics}/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            if metrics
+                .lines()
+                .any(|l| l == "sgl_router_admission_inflight 0")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let response = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&payload("ok"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.text().await.unwrap();
     process.kill().await.unwrap();
     process.wait().await.unwrap();
     server.abort();

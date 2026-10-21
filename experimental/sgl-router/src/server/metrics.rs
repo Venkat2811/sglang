@@ -489,6 +489,7 @@ pub struct MetricsRegistry {
     input_ids_forwarding_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
     openai_route_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
     cache_tokens_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
+    cache_prediction_error: Mutex<HashMap<String, Histogram>>,
     cache_observations_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
     sampling_contract_rejections_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
@@ -938,6 +939,18 @@ impl MetricsRegistry {
         predicted: Option<u64>,
         actual: Option<u64>,
     ) {
+        if let (Some(predicted), Some(actual)) = (predicted, actual) {
+            self.cache_prediction_error
+                .lock()
+                .entry(model_id.to_owned())
+                .or_insert_with(|| {
+                    Histogram::new(&[
+                        0.0, 1.0, 64.0, 512.0, 2048.0, 8192.0, 32768.0, 131072.0, 524288.0,
+                        1048576.0,
+                    ])
+                })
+                .observe(predicted.abs_diff(actual) as f64);
+        }
         for (outcome, tokens) in [("predicted", predicted), ("actual", actual)] {
             if let Some(tokens) = tokens {
                 let key = ModelOutcomeKey {
@@ -1494,6 +1507,19 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        out.push_str("# HELP sgl_router_cache_prediction_error_tokens Absolute predicted versus reported cached-token error, only for paired known observations.\n# TYPE sgl_router_cache_prediction_error_tokens histogram\n");
+        let guard = self.cache_prediction_error.lock();
+        let mut models: Vec<_> = guard.keys().collect();
+        models.sort();
+        for model in models {
+            render_histogram(
+                &mut out,
+                "sgl_router_cache_prediction_error_tokens",
+                &format!("model_id=\"{}\"", escape_label(model)),
+                &guard[model],
+            );
+        }
+        drop(guard);
         render_model_outcomes(
             &mut out,
             "sgl_router_cache_tokens_total",
@@ -2193,5 +2219,21 @@ mod tests {
                 "status {status} must map to `{want}`",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_observation_tests {
+    #[test]
+    fn paired_cache_error_excludes_unknown_observations() {
+        let metrics = super::MetricsRegistry::new();
+        metrics.record_cache_observation("tiny", Some(900), Some(800));
+        metrics.record_cache_observation("tiny", Some(900), None);
+        metrics.record_cache_observation("tiny", None, Some(800));
+        let rendered = metrics.render();
+        assert!(rendered
+            .contains(r#"sgl_router_cache_prediction_error_tokens_count{model_id="tiny"} 1"#));
+        assert!(rendered
+            .contains(r#"sgl_router_cache_prediction_error_tokens_sum{model_id="tiny"} 100"#));
     }
 }

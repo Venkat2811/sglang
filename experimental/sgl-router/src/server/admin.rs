@@ -18,7 +18,9 @@ pub fn router(ctx: Arc<AppContext>) -> Router {
         .route("/admin/workers", get(workers))
         .route("/admin/config", get(config))
         .route("/admin/index", get(index))
-        .route("/admin/log-level", post(log_level))
+        .route("/admin/policy", get(index))
+        .route("/admin/cap", axum::routing::put(cap))
+        .route("/admin/log-level", post(log_level).put(log_level))
         .layer(axum::extract::DefaultBodyLimit::max(4096))
         .with_state(ctx)
 }
@@ -33,7 +35,7 @@ async fn workers(State(ctx): State<Arc<AppContext>>) -> Json<Value> {
 async fn config(State(ctx): State<Arc<AppContext>>) -> Json<Value> {
     let c = &ctx.config;
     Json(
-        json!({"model_id":c.model.id,"host":c.server.host,"port":c.server.port,"prometheus_port":c.server.prometheus_port,"admin_port":c.server.admin_port,"worker_auth_configured":c.server.worker_auth.is_some(),"max_payload_size":c.server.max_payload_size,"max_concurrent_requests":c.server.admission.max_concurrent_requests,"refill_per_second":c.server.admission.refill_per_second,"queue_size":0,"request_timeout_secs":c.proxy.request_timeout_secs,"health_check_interval_secs":c.server.health_check.interval_secs,"health_check_timeout_secs":c.server.health_check.timeout_secs}),
+        json!({"model_id":c.model.id,"host":c.server.host,"port":c.server.port,"prometheus_port":c.server.prometheus_port,"admin_port":c.server.admin_port,"worker_auth_configured":c.server.worker_auth.is_some(),"max_payload_size":c.server.max_payload_size,"max_concurrent_requests":ctx.admission.capacity(),"refill_per_second":c.server.admission.refill_per_second,"queue_size":0,"request_timeout_secs":c.proxy.request_timeout_secs,"health_check_interval_secs":c.server.health_check.interval_secs,"health_check_timeout_secs":c.server.health_check.timeout_secs}),
     )
 }
 #[derive(Deserialize)]
@@ -67,4 +69,18 @@ fn redact_url(url: &str) -> String {
     parsed.set_query(None);
     parsed.set_fragment(None);
     parsed.to_string()
+}
+
+#[derive(Deserialize)]
+struct Cap {
+    max_concurrent_requests: usize,
+}
+async fn cap(State(ctx): State<Arc<AppContext>>, Json(body): Json<Cap>) -> Json<Value> {
+    let previous = ctx.admission.capacity();
+    ctx.admission
+        .set_capacity(Some(body.max_concurrent_requests));
+    tracing::info!(previous_capacity=?previous,capacity=?ctx.admission.capacity(),inflight=ctx.admission.active(),"admission cap changed");
+    Json(
+        json!({"max_concurrent_requests":ctx.admission.capacity(),"inflight":ctx.admission.active()}),
+    )
 }
