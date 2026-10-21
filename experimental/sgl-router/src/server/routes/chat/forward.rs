@@ -67,11 +67,6 @@ pub(super) async fn forward_request(
     request_started_at: Instant,
     duration: &Arc<RequestDurationGuard>,
 ) -> Result<HttpDispatched, ApiError> {
-    if let Some(scope) = &request.scope {
-        let mut proof = vec![Arc::clone(&workers.prefill)];
-        proof.extend(workers.decode.iter().cloned());
-        scope.life.bind_generation_workers(proof);
-    }
     let dispatched = dispatch(
         Http,
         ctx,
@@ -184,6 +179,11 @@ async fn dispatch<T: Transport>(
         decode,
         track_dispatch_timestamps,
     } = workers;
+    if let Some(scope) = &request.scope {
+        let mut proof = vec![Arc::clone(&prefill)];
+        proof.extend(decode.iter().cloned());
+        scope.life.bind_generation_workers(proof);
+    }
     let decode_url_header = decode
         .as_ref()
         .and_then(|worker| parse_decode_url_header(&worker.url));
@@ -628,10 +628,21 @@ impl<R> Clone for Grpc<R> {
 impl<R: EngineRpc> Transport for Grpc<R> {
     type Response = GrpcResponse<R::Reply>;
     async fn respond(
-        _request: &mut PreparedRequest,
-        response: Self::Response,
+        request: &mut PreparedRequest,
+        mut response: Self::Response,
         _streaming: bool,
     ) -> Self::Response {
+        if let Some(scope) = &request.scope {
+            let scope = Arc::downgrade(scope);
+            response.replies = response
+                .replies
+                .inspect(move |reply| {
+                    if let (Some(scope), Ok(reply)) = (scope.upgrade(), reply) {
+                        scope.life.observe_generation(R::generation_evidence(reply));
+                    }
+                })
+                .boxed();
+        }
         response
     }
 

@@ -137,7 +137,8 @@ impl Lifecycle {
         let mut observation = self.observation.lock().unwrap();
         observation.finish();
         let error = observation.error;
-        let generated = observation.total(|t| t.completion).is_some_and(|n| n > 0);
+        let generated =
+            observation.generated || observation.total(|t| t.completion).is_some_and(|n| n > 0);
         drop(observation);
         if error {
             self.fail("response_error_event");
@@ -165,6 +166,14 @@ impl Lifecycle {
         let mut o = self.observation.lock().unwrap();
         o.feed(data);
         if o.error {
+            self.fail("response_error_event");
+        }
+    }
+    pub fn observe_generation(&self, evidence: crate::proxy::grpc::GenerationEvidence) {
+        let mut observation = self.observation.lock().unwrap();
+        observation.generated |= evidence.generated;
+        observation.error |= evidence.failed;
+        if observation.error {
             self.fail("response_error_event");
         }
     }
@@ -242,6 +251,7 @@ struct Observation {
     error: bool,
     overflow: bool,
     finished: bool,
+    generated: bool,
 }
 impl Observation {
     fn feed(&mut self, data: &[u8]) {
@@ -284,6 +294,7 @@ impl Observation {
         }
     }
     fn value(&mut self, value: &Value) {
+        self.generated |= generated_output(value);
         if let Some(items) = value.as_array() {
             for (index, item) in items.iter().enumerate().take(4096) {
                 self.items.entry(index as u64).or_default().update(item);
@@ -345,8 +356,38 @@ fn cached(value: &Value) -> Option<u64> {
         .or_else(|| value["meta_info"]["cached_tokens"].as_u64())
 }
 
-fn is_error(value: &Value) -> bool {
+pub(crate) fn is_error(value: &Value) -> bool {
     !value["error"].is_null() || value["meta_info"]["finish_reason"]["type"] == "abort"
+}
+
+pub(crate) fn generated_output(value: &Value) -> bool {
+    let nonempty = |v: &Value| v.as_str().is_some_and(|s| !s.is_empty());
+    value["usage"]["completion_tokens"]
+        .as_u64()
+        .is_some_and(|n| n > 0)
+        || value["meta_info"]["completion_tokens"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
+        || value["output_ids"]
+            .as_array()
+            .is_some_and(|ids| !ids.is_empty())
+        || nonempty(&value["text"])
+        || value["choices"].as_array().is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                [&choice["delta"], &choice["message"]]
+                    .iter()
+                    .any(|message| {
+                        nonempty(&message["content"])
+                            || nonempty(&message["reasoning_content"])
+                            || message["tool_calls"].as_array().is_some_and(|calls| {
+                                calls.iter().any(|call| {
+                                    nonempty(&call["function"]["name"])
+                                        || nonempty(&call["function"]["arguments"])
+                                })
+                            })
+                    })
+            })
+        })
 }
 
 #[cfg(test)]
@@ -403,6 +444,47 @@ mod tests {
 #[cfg(test)]
 mod generation_proof_tests {
     use super::*;
+
+    #[test]
+    fn streaming_health_proof_uses_output_without_usage_but_excludes_errors_and_role_only() {
+        for (delta, error, expected) in [
+            (json!({"role":"assistant"}), false, false),
+            (json!({"content":""}), false, false),
+            (json!({"content":"hello"}), false, true),
+            (json!({"reasoning_content":"thinking"}), false, true),
+            (
+                json!({"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}),
+                false,
+                true,
+            ),
+            (json!({"content":"hello"}), true, false),
+        ] {
+            let worker = Arc::new(crate::workers::Worker::new(Default::default()));
+            let life = Lifecycle::default();
+            life.bind_generation_workers(vec![Arc::clone(&worker)]);
+            life.route(None, "engine", None, vec![], true, None);
+            let frame = format!(
+                "data: {}\n\n",
+                json!({"choices":[{"index":0,"delta":delta}]})
+            );
+            for bytes in frame.as_bytes().chunks(3) {
+                life.observe(bytes);
+            }
+            if error {
+                life.observe(b"data: {\"error\":{\"message\":\"failed\"}}\n\n");
+            } else {
+                life.observe(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+            }
+            assert!(!worker.recently_generated(std::time::Duration::from_secs(1)));
+            life.complete();
+            assert_eq!(
+                worker.recently_generated(std::time::Duration::from_secs(1)),
+                expected,
+                "delta={delta}, error={error}"
+            );
+        }
+    }
+
     #[test]
     fn generation_proof_requires_positive_tokens_and_successful_completion() {
         for (body, abort, expected) in [

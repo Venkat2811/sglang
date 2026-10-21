@@ -364,8 +364,17 @@ impl Default for ServerConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum HealthCheckMode {
+    Generation,
+    #[default]
+    Http,
+    Off,
+}
+
 #[derive(Debug, Clone)]
 pub struct HealthCheckConfig {
+    pub mode: HealthCheckMode,
     pub interval_secs: u64,
     pub timeout_secs: u64,
     pub failure_threshold: u32,
@@ -374,6 +383,7 @@ pub struct HealthCheckConfig {
 impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {
+            mode: HealthCheckMode::Http,
             interval_secs: 60,
             timeout_secs: 5,
             failure_threshold: 3,

@@ -175,7 +175,11 @@ pub struct ServerArgs {
     #[arg(long, conflicts_with = "retry_max_attempts")]
     pub disable_retries: bool,
 
-    /// Seconds between active worker status and real generation checks.
+    /// Worker probes: HTTP status, full-path generation, or disabled.
+    #[arg(long, value_enum, default_value = "http")]
+    pub health_check_mode: super::HealthCheckMode,
+
+    /// Seconds between active worker check cycles.
     #[arg(long, default_value_t = 60)]
     pub health_check_interval_secs: u64,
     /// Timeout for each worker status or full-path generation probe.
@@ -727,6 +731,7 @@ impl Cli {
                 prometheus_port: self.server.prometheus_port,
                 admin_port: self.server.admin_port,
                 health_check: super::HealthCheckConfig {
+                    mode: self.server.health_check_mode,
                     interval_secs: self.server.health_check_interval_secs,
                     timeout_secs: self.server.health_check_timeout_secs,
                     failure_threshold: self.server.health_failure_threshold,
@@ -1310,6 +1315,37 @@ mod tests {
         DiscoveryBackend, ScoreTermKind, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
         MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
     };
+
+    #[test]
+    fn accepts_explicit_health_check_modes_and_rejects_unknown_modes() {
+        let base = [
+            "router",
+            "--model-id",
+            "tiny",
+            "--worker-urls",
+            "http://localhost:30000",
+        ];
+        for mode in ["generation", "http", "off"] {
+            assert!(
+                Cli::try_parse_from(base.into_iter().chain(["--health-check-mode", mode])).is_ok(),
+                "{mode}"
+            );
+        }
+        assert_eq!(
+            Cli::try_parse_from(base)
+                .unwrap()
+                .into_config()
+                .unwrap()
+                .server
+                .health_check
+                .mode,
+            super::super::HealthCheckMode::Http
+        );
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain(["--health-check-mode", "unknown"]))
+                .is_err()
+        );
+    }
 
     #[test]
     fn chat_routing_selects_policy_implementation_without_another_config() {

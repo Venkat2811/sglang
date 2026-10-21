@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Active HTTP health, proved by bounded generation through each usable role pair.
+//! Thresholded health for individual worker instances and compatible role pairs.
 
 use crate::{
-    config::HealthCheckConfig,
+    config::{HealthCheckConfig, HealthCheckMode},
     discovery::{ModelId, WorkerMode},
     server::app_context::AppContext,
     workers::Worker,
@@ -22,33 +22,13 @@ pub struct ActiveHealth {
 }
 #[derive(Default)]
 struct HealthState {
-    topology: Vec<String>,
-    proven: bool,
-    streaks: HashMap<String, Streak>,
+    streaks: HashMap<u64, Streak>,
 }
 #[derive(Default)]
 struct Streak {
     successes: u32,
     failures: u32,
-}
-
-fn topology(workers: &[Arc<Worker>]) -> Vec<String> {
-    let mut ids: Vec<_> = workers
-        .iter()
-        .map(|w| {
-            format!(
-                "{}|{}|{:?}|{:?}|{:?}|{}",
-                w.id.0,
-                w.url,
-                w.mode(),
-                w.bootstrap_port(),
-                w.version_group(),
-                w.health_instance()
-            )
-        })
-        .collect();
-    ids.sort();
-    ids
+    proven: bool,
 }
 
 impl ActiveHealth {
@@ -64,7 +44,26 @@ impl ActiveHealth {
             .registry
             .workers_for(&ModelId(ctx.config.model.id.clone()));
         let state = self.state.lock().unwrap();
-        state.proven && state.topology == topology(&workers)
+        let proven = |worker: &Arc<Worker>| {
+            worker.is_healthy()
+                && !worker.awaiting_bootstrap_port()
+                && state
+                    .streaks
+                    .get(&worker.health_instance())
+                    .is_some_and(|s| s.proven)
+        };
+        workers.iter().any(|worker| {
+            proven(worker)
+                && match worker.mode() {
+                    WorkerMode::Plain => true,
+                    WorkerMode::Prefill => workers.iter().any(|decode| {
+                        decode.mode() == WorkerMode::Decode
+                            && decode.version_group() == worker.version_group()
+                            && proven(decode)
+                    }),
+                    WorkerMode::Decode => false,
+                }
+        })
     }
 
     pub async fn run(ctx: Arc<AppContext>) {
@@ -85,11 +84,17 @@ impl ActiveHealth {
         let workers = ctx
             .registry
             .workers_for(&ModelId(ctx.config.model.id.clone()));
-        let current = topology(&workers);
         let timeout = Duration::from_secs(self.config.timeout_secs);
-        // A cheap GET is necessary but cannot prove that generation works.
+        let freshness = Duration::from_secs(
+            self.config
+                .interval_secs
+                .saturating_add(self.config.timeout_secs),
+        );
         let live: HashSet<_> = stream::iter(workers.iter().cloned())
             .map(|worker| async move {
+                if worker.recently_generated(freshness) {
+                    return Some(worker.health_instance());
+                }
                 let mut request = ctx
                     .proxy
                     .client_for(worker.protocol())
@@ -99,23 +104,69 @@ impl ActiveHealth {
                     request = request.header(reqwest::header::AUTHORIZATION, auth);
                 }
                 let ok = request.send().await.is_ok_and(|r| r.status().is_success());
-                (worker.id.0.clone(), ok)
+                ok.then_some(worker.health_instance())
             })
             .buffer_unordered(16)
-            .filter_map(|(id, ok)| async move { ok.then_some(id) })
+            .filter_map(std::future::ready)
             .collect()
             .await;
+        let proven = if self.config.mode == HealthCheckMode::Http {
+            live
+        } else {
+            self.generation_checks(ctx, &workers, &live, timeout, freshness)
+                .await
+        };
+        let current: HashSet<_> = ctx
+            .registry
+            .workers_for(&ModelId(ctx.config.model.id.clone()))
+            .iter()
+            .map(|worker| worker.health_instance())
+            .collect();
+        let mut state = self.state.lock().unwrap();
+        state.streaks.retain(|id, _| current.contains(id));
+        for worker in workers {
+            let id = worker.health_instance();
+            if !current.contains(&id) {
+                continue;
+            }
+            let streak = state.streaks.entry(id).or_default();
+            if proven.contains(&id) {
+                streak.failures = 0;
+                streak.successes = streak.successes.saturating_add(1);
+                if streak.successes >= self.config.success_threshold {
+                    streak.proven = true;
+                    worker.set_active_healthy(true);
+                }
+            } else {
+                streak.successes = 0;
+                streak.failures = streak.failures.saturating_add(1);
+                if streak.failures >= self.config.failure_threshold {
+                    streak.proven = false;
+                    worker.set_active_healthy(false);
+                }
+            }
+        }
+    }
+
+    async fn generation_checks(
+        &self,
+        ctx: &AppContext,
+        workers: &[Arc<Worker>],
+        live: &HashSet<u64>,
+        timeout: Duration,
+        freshness: Duration,
+    ) -> HashSet<u64> {
         let mut pairs = Vec::new();
-        for worker in &workers {
-            if !live.contains(&worker.id.0) || worker.awaiting_bootstrap_port() {
+        for worker in workers {
+            if !live.contains(&worker.health_instance()) || worker.awaiting_bootstrap_port() {
                 continue;
             }
             match worker.mode() {
                 WorkerMode::Plain => pairs.push((Arc::clone(worker), None)),
                 WorkerMode::Prefill => {
-                    for decode in &workers {
+                    for decode in workers {
                         if decode.mode() == WorkerMode::Decode
-                            && live.contains(&decode.id.0)
+                            && live.contains(&decode.health_instance())
                             && decode.version_group() == worker.version_group()
                         {
                             pairs.push((Arc::clone(worker), Some(Arc::clone(decode))));
@@ -128,11 +179,6 @@ impl ActiveHealth {
         let mut proven = HashSet::new();
         let mut probes = stream::iter(pairs)
             .map(|(prefill, decode)| async move {
-                let freshness = Duration::from_secs(
-                    self.config
-                        .interval_secs
-                        .saturating_add(self.config.timeout_secs),
-                );
                 // Completed positive-token client responses prove service without queuing another probe behind them.
                 let recent = prefill.recently_generated(freshness)
                     && decode
@@ -154,44 +200,13 @@ impl ActiveHealth {
             .buffer_unordered(8);
         while let Some((prefill, decode, ok)) = probes.next().await {
             if ok {
-                proven.insert(prefill.id.0.clone());
+                proven.insert(prefill.health_instance());
                 if let Some(decode) = decode {
-                    proven.insert(decode.id.0.clone());
+                    proven.insert(decode.health_instance());
                 }
             }
         }
-        // Discovery changed under the requests: none of that evidence proves the new topology.
-        if current
-            != topology(
-                &ctx.registry
-                    .workers_for(&ModelId(ctx.config.model.id.clone())),
-            )
-        {
-            self.state.lock().unwrap().proven = false;
-            return;
-        }
-        let mut state = self.state.lock().unwrap();
-        if state.topology != current {
-            state.streaks.clear();
-        }
-        state.topology = current;
-        state.proven = !proven.is_empty();
-        for worker in workers {
-            let streak = state.streaks.entry(worker.id.0.clone()).or_default();
-            if proven.contains(&worker.id.0) {
-                streak.failures = 0;
-                streak.successes = streak.successes.saturating_add(1);
-                if streak.successes >= self.config.success_threshold {
-                    worker.set_active_healthy(true);
-                }
-            } else {
-                streak.successes = 0;
-                streak.failures = streak.failures.saturating_add(1);
-                if streak.failures >= self.config.failure_threshold {
-                    worker.set_active_healthy(false);
-                }
-            }
-        }
+        proven
     }
 }
 
@@ -199,6 +214,176 @@ impl ActiveHealth {
 mod tests {
     use super::*;
     use crate::discovery::{WorkerId, WorkerSpec};
+    use axum::{
+        extract::State,
+        http::StatusCode,
+        routing::{get, post},
+        Json,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct ProbeState {
+        hang: AtomicBool,
+        health_calls: AtomicUsize,
+    }
+
+    struct Fixture {
+        ctx: Arc<AppContext>,
+        health: Arc<ActiveHealth>,
+        worker: Arc<Worker>,
+        probe: Arc<ProbeState>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn fixture() -> Fixture {
+        let probe = Arc::new(ProbeState::default());
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                get(|State(probe): State<Arc<ProbeState>>| async move {
+                    probe.health_calls.fetch_add(1, Ordering::Relaxed);
+                    if probe.hang.load(Ordering::Relaxed) {
+                        std::future::pending::<()>().await;
+                    }
+                    StatusCode::OK
+                }),
+            )
+            .route(
+                "/generate",
+                post(|| async {
+                    Json(serde_json::json!({"text":"OK","meta_info":{"completion_tokens":1}}))
+                }),
+            )
+            .with_state(Arc::clone(&probe));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut ctx = AppContext::stub();
+        ctx.policies =
+            Arc::new(crate::policies::factory::build_registry_with_defaults(&ctx.config).unwrap());
+        ctx.registry.require_active_health();
+        ctx.registry
+            .add(WorkerSpec {
+                id: WorkerId("original".into()),
+                url,
+                model_ids: vec![ModelId(ctx.config.model.id.clone())],
+                ..Default::default()
+            })
+            .unwrap();
+        let health = Arc::new(ActiveHealth::new(HealthCheckConfig {
+            mode: HealthCheckMode::Generation,
+            interval_secs: 1,
+            timeout_secs: 1,
+            failure_threshold: 3,
+            success_threshold: 1,
+        }));
+        ctx.active_health = Some(Arc::clone(&health));
+        ctx.mark_ready();
+        let ctx = Arc::new(ctx);
+        health.check(&ctx).await;
+        assert_eq!(
+            crate::server::routes::health::readyz(State(Arc::clone(&ctx))).await,
+            StatusCode::OK
+        );
+        let worker = Arc::clone(&ctx.registry.all()[0]);
+        Fixture {
+            ctx,
+            health,
+            worker,
+            probe,
+            server,
+        }
+    }
+
+    async fn expire_generation_proof() {
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::time::resume();
+    }
+
+    fn add_unproved_worker(ctx: &AppContext) {
+        ctx.registry
+            .add(WorkerSpec {
+                id: WorkerId("new".into()),
+                url: "http://127.0.0.1:1".into(),
+                model_ids: vec![ModelId(ctx.config.model.id.clone())],
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn all_probe_timeouts_preserve_readiness_until_failure_threshold() {
+        let f = fixture().await;
+        f.probe.hang.store(true, Ordering::Relaxed);
+        expire_generation_proof().await;
+        for cycle in 1..=3 {
+            f.health.check(&f.ctx).await;
+            let status = crate::server::routes::health::readyz(State(Arc::clone(&f.ctx))).await;
+            assert_eq!(
+                status,
+                if cycle < 3 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+                "cycle {cycle}"
+            );
+        }
+        f.probe.hang.store(false, Ordering::Relaxed);
+        f.health.check(&f.ctx).await;
+        assert!(
+            f.health.ready(&f.ctx),
+            "successful recovery restores readiness"
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_unproved_worker_preserves_existing_readiness() {
+        let f = fixture().await;
+        add_unproved_worker(&f.ctx);
+        assert_eq!(
+            crate::server::routes::health::readyz(State(Arc::clone(&f.ctx))).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn topology_change_preserves_surviving_workers_failure_streak() {
+        let f = fixture().await;
+        f.probe.hang.store(true, Ordering::Relaxed);
+        expire_generation_proof().await;
+        f.health.check(&f.ctx).await;
+        f.health.check(&f.ctx).await;
+        assert!(f.worker.active_health_passes());
+        add_unproved_worker(&f.ctx);
+        f.health.check(&f.ctx).await;
+        assert!(
+            !f.worker.active_health_passes(),
+            "adding an endpoint must not postpone exclusion of a failing survivor"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_generation_proof_skips_http_health_gate() {
+        let f = fixture().await;
+        f.worker.record_generation_success();
+        f.probe.hang.store(true, Ordering::Relaxed);
+        let calls = f.probe.health_calls.load(Ordering::Relaxed);
+        f.health.check(&f.ctx).await;
+        assert_eq!(f.probe.health_calls.load(Ordering::Relaxed), calls);
+        assert!(f.health.ready(&f.ctx));
+    }
+
     #[test]
     fn topology_proof_does_not_survive_removal_and_readdition_of_the_same_endpoint() {
         let ctx = AppContext::stub();
@@ -214,10 +399,13 @@ mod tests {
         let health = ActiveHealth::new(HealthCheckConfig::default());
         {
             let mut state = health.state.lock().unwrap();
-            state.proven = true;
-            state.topology = topology(
-                &ctx.registry
-                    .workers_for(&ModelId(ctx.config.model.id.clone())),
+            state.streaks.insert(
+                ctx.registry.all()[0].health_instance(),
+                Streak {
+                    successes: 2,
+                    failures: 0,
+                    proven: true,
+                },
             );
         }
         assert!(health.ready(&ctx));

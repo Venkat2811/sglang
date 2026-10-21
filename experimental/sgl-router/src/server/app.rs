@@ -211,7 +211,7 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/liveness", get(crate::server::routes::health::healthz))
         .route("/readiness", get(crate::server::routes::health::readyz))
-        .route("/health", get(crate::server::routes::health::readyz))
+        .route("/health", get(crate::server::routes::health::healthz))
         .route(
             "/health_generate",
             get(crate::server::routes::health::readyz),

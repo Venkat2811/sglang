@@ -258,11 +258,31 @@ connections leave the pool after 3 s, under SGLang's default 5 s keep-alive.
 Each worker has a circuit breaker: after `--cb-threshold` (default 3)
 consecutive failures the worker is taken out of routing until a request already
 sent to it succeeds or, once `--cb-cool-down-secs` (default 30) has passed, a
-probe request does. Under `--worker-urls` it is the only thing that takes a
-dead or hung worker out of routing, since there is no active health check.
+probe request does. Active health checks independently exclude workers.
 `--disable-circuit-breaker` turns it off, for example when one worker serves a
-role and an open breaker would reject all of that role's requests; a worker
-that stops answering then keeps its share of traffic.
+role and an open breaker would reject all of that role's requests.
+
+### Health checks and readiness
+
+`--health-check-mode http` is the default: workers must pass `GET /health`.
+`generation` also requires a bounded one-token generation through a plain
+worker or a compatible prefill/decode pair. `off` disables active probes;
+worker discovery and the optional circuit breaker still apply. Generation
+checks must be enabled explicitly for deployments that require full-path proof.
+
+The interval, per-probe timeout, failure threshold and success threshold are
+configured by `--health-check-interval-secs`, `--health-check-timeout-secs`,
+`--health-failure-threshold` and `--health-success-threshold`. A failed cycle
+does not exclude a proven worker before its failure threshold. Adding or
+removing a worker preserves surviving workers' evidence and streaks; a new
+worker instance must qualify independently. Completed client generations,
+including usage-free streams and gRPC output, supply recent proof and avoid
+queuing another probe behind busy engines.
+
+`/health`, `/healthz` and `/liveness` report router liveness. `/readiness` and
+`/readyz` require completed startup, a usable worker or compatible role pair,
+and settled KV bootstrap; they reject traffic during shutdown drain. In an
+active health mode, the usable workers must have passed its configured checks.
 
 ### Engines with `--api-key`
 

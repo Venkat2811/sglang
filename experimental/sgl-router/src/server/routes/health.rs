@@ -84,6 +84,23 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
+    async fn health_is_liveness_while_readiness_aliases_reject_an_empty_pool() {
+        let app = crate::server::app::build_router(test_ctx(true, false));
+        for (path, expected) in [
+            ("/health", StatusCode::OK),
+            ("/readiness", StatusCode::SERVICE_UNAVAILABLE),
+            ("/readyz", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
+    }
+
+    #[tokio::test]
     async fn healthz_always_200() {
         let app = crate::server::app::build_router(test_ctx(false, false));
         let res = app

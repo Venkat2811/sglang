@@ -141,7 +141,9 @@ async fn main() -> Result<()> {
 
     // Discovery feeds worker changes to the manager, which maintains this routing catalog.
     let worker_registry = Arc::new(WorkerRegistry::default());
-    worker_registry.require_active_health();
+    if config.server.health_check.mode != sgl_router::config::HealthCheckMode::Off {
+        worker_registry.require_active_health();
+    }
     let (discovery_handle, worker_manager_handle) = start_worker_discovery_and_manager(
         &config,
         &worker_registry,
@@ -161,14 +163,18 @@ async fn main() -> Result<()> {
         external_kv_indexer_client,
     )?;
     app_context.chat_routing = chat_routing;
-    app_context.active_health = Some(Arc::new(sgl_router::health::active::ActiveHealth::new(
-        config.server.health_check.clone(),
-    )));
+    if config.server.health_check.mode != sgl_router::config::HealthCheckMode::Off {
+        app_context.active_health = Some(Arc::new(sgl_router::health::active::ActiveHealth::new(
+            config.server.health_check.clone(),
+        )));
+    }
     let app_context = Arc::new(app_context);
     app_context.mark_ready();
-    let health_handle = tokio::spawn(sgl_router::health::active::ActiveHealth::run(Arc::clone(
-        &app_context,
-    )));
+    let health_handle = app_context.active_health.as_ref().map(|_| {
+        tokio::spawn(sgl_router::health::active::ActiveHealth::run(Arc::clone(
+            &app_context,
+        )))
+    });
 
     // Serve HTTP requests until shutdown, allowing in-flight requests to finish.
     tracing::info!("listening on {listen_addr}");
@@ -214,7 +220,9 @@ async fn main() -> Result<()> {
         handle.abort();
     }
     metrics_handle.abort();
-    health_handle.abort();
+    if let Some(handle) = health_handle {
+        handle.abort();
+    }
 
     // Stop background tasks once the HTTP server has finished draining.
     discovery_handle.abort();

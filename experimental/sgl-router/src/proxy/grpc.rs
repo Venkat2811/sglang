@@ -34,6 +34,12 @@ pub struct GrpcResponse<T> {
     pub replies: Replies<T>,
 }
 
+#[derive(Default)]
+pub struct GenerationEvidence {
+    pub generated: bool,
+    pub failed: bool,
+}
+
 /// One engine RPC, sent with the body the router prepared for its HTTP sibling.
 pub trait EngineRpc: Send + Sync + 'static {
     type Reply: PumpItem;
@@ -50,6 +56,10 @@ pub trait EngineRpc: Send + Sync + 'static {
     /// The HTTP status a reply carries, for RPCs that report one.
     fn status(_reply: &Self::Reply) -> Option<StatusCode> {
         None
+    }
+
+    fn generation_evidence(_reply: &Self::Reply) -> GenerationEvidence {
+        GenerationEvidence::default()
     }
 }
 
@@ -121,6 +131,16 @@ impl EngineRpc for OpenAiRpc {
 
     fn status(reply: &Self::Reply) -> Option<StatusCode> {
         reply.status_code.and_then(http_status)
+    }
+
+    fn generation_evidence(reply: &Self::Reply) -> GenerationEvidence {
+        serde_json::from_slice::<Value>(&reply.json_chunk).map_or_else(
+            |_| GenerationEvidence::default(),
+            |value| GenerationEvidence {
+                generated: crate::server::request_log::generated_output(&value),
+                failed: crate::server::request_log::is_error(&value),
+            },
+        )
     }
 }
 
@@ -195,12 +215,20 @@ pub trait TypedRpc: Clone + Send + Sync + 'static {
     fn trace_headers(&mut self) -> &mut HashMap<String, String>;
 
     fn send(self, client: SglangServiceClient<Channel>) -> RpcFuture<Self::Reply>;
+
+    fn generation_evidence(_reply: &Self::Reply) -> GenerationEvidence {
+        GenerationEvidence::default()
+    }
 }
 
 type RpcFuture<T> = BoxFuture<'static, Result<Replies<T>, Status>>;
 
 impl<T: TypedRpc> EngineRpc for T {
     type Reply = T::Reply;
+
+    fn generation_evidence(reply: &Self::Reply) -> GenerationEvidence {
+        T::generation_evidence(reply)
+    }
 
     fn call(
         &self,
@@ -281,6 +309,14 @@ fn apply_generation(
 impl TypedRpc for proto::GenerateRequest {
     type Reply = proto::GenerateResponse;
 
+    fn generation_evidence(reply: &Self::Reply) -> GenerationEvidence {
+        native_generation_evidence(
+            &reply.meta_info,
+            !reply.output_ids.is_empty()
+                || reply.text.as_ref().is_some_and(|text| !text.is_empty()),
+        )
+    }
+
     fn view(&self) -> RoutingView<'_> {
         RoutingView {
             input_ids: &self.input_ids,
@@ -313,6 +349,10 @@ impl TypedRpc for proto::GenerateRequest {
 impl TypedRpc for proto::TextGenerateRequest {
     type Reply = proto::TextGenerateResponse;
 
+    fn generation_evidence(reply: &Self::Reply) -> GenerationEvidence {
+        native_generation_evidence(&reply.meta_info, !reply.text.is_empty())
+    }
+
     fn view(&self) -> RoutingView<'_> {
         RoutingView {
             input_ids: &[],
@@ -339,6 +379,20 @@ impl TypedRpc for proto::TextGenerateRequest {
 
     fn send(self, mut client: SglangServiceClient<Channel>) -> RpcFuture<Self::Reply> {
         Box::pin(async move { Ok(client.text_generate(self).await?.into_inner().boxed()) })
+    }
+}
+
+fn native_generation_evidence(meta: &HashMap<String, String>, output: bool) -> GenerationEvidence {
+    GenerationEvidence {
+        generated: output
+            || meta
+                .get("completion_tokens")
+                .and_then(|n| n.parse::<u64>().ok())
+                .is_some_and(|n| n > 0),
+        failed: meta
+            .get("finish_reason")
+            .and_then(|reason| serde_json::from_str::<Value>(reason).ok())
+            .is_some_and(|reason| reason["type"] == "abort"),
     }
 }
 

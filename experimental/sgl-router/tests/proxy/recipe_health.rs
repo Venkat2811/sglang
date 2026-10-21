@@ -24,6 +24,8 @@ struct Engine {
     works: AtomicBool,
     delay_ms: AtomicU64,
     probe_delay_ms: AtomicU64,
+    health_calls: AtomicU64,
+    generation_calls: AtomicU64,
 }
 
 async fn generate(
@@ -31,6 +33,7 @@ async fn generate(
     uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
+    engine.generation_calls.fetch_add(1, Ordering::Relaxed);
     let delay = engine.delay_ms.load(Ordering::Relaxed)
         + if headers.contains_key("x-sgl-router-probe") {
             engine.probe_delay_ms.load(Ordering::Relaxed)
@@ -114,6 +117,8 @@ async fn recipe_health_requires_generation_and_recovers_while_infra_routes_remai
             &metrics.to_string(),
             "--disable-retries",
             "--disable-circuit-breaker",
+            "--health-check-mode",
+            "generation",
             "--health-check-interval-secs",
             "1",
             "--health-check-timeout-secs",
@@ -251,9 +256,16 @@ async fn fake_engine(
         works: AtomicBool::new(works),
         delay_ms: AtomicU64::new(delay_ms),
         probe_delay_ms: AtomicU64::new(0),
+        ..Default::default()
     });
     let app = axum::Router::new()
-        .route("/health", get(|| async { StatusCode::OK }))
+        .route(
+            "/health",
+            get(|State(engine): State<Arc<Engine>>| async move {
+                engine.health_calls.fetch_add(1, Ordering::Relaxed);
+                StatusCode::OK
+            }),
+        )
         .route(
             "/server_info",
             get(|| async { Json(json!({"served_model_name":"tiny","model_path":"fixture"})) }),
@@ -268,6 +280,69 @@ async fn fake_engine(
         axum::serve(listener, app).await.unwrap();
     });
     (engine, url, task)
+}
+
+#[tokio::test]
+async fn default_http_and_off_modes_do_not_probe_generation() {
+    for mode in [None, Some("off")] {
+        let (engine, worker, server) = fake_engine(false, 0).await;
+        let http = port();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sgl-router"));
+        command.args([
+            "--model-id",
+            "tiny",
+            "--no-tokenizer",
+            "--worker-urls",
+            &worker,
+            "--policy",
+            "round_robin",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &http.to_string(),
+            "--prometheus-port",
+            "0",
+            "--disable-circuit-breaker",
+            "--health-success-threshold",
+            "1",
+            "--health-check-interval-secs",
+            "1",
+            "--shutdown-drain-secs",
+            "0",
+        ]);
+        if let Some(mode) = mode {
+            command.args(["--health-check-mode", mode]);
+        }
+        let mut process = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{http}");
+        wait_status(&client, &base, "/readiness", StatusCode::OK).await;
+        assert_eq!(
+            engine.generation_calls.load(Ordering::Relaxed),
+            0,
+            "mode={mode:?}"
+        );
+        if mode.is_some() {
+            assert_eq!(
+                engine.health_calls.load(Ordering::Relaxed),
+                0,
+                "off disables active HTTP probes too"
+            );
+        } else {
+            assert!(
+                engine.health_calls.load(Ordering::Relaxed) > 0,
+                "HTTP mode checks status"
+            );
+        }
+        process.kill().await.unwrap();
+        process.wait().await.unwrap();
+        server.abort();
+    }
 }
 
 #[tokio::test]
@@ -302,6 +377,8 @@ async fn pd_health_keeps_a_slow_prefill_and_excludes_a_decode_that_cannot_genera
             "0",
             "--disable-retries",
             "--disable-circuit-breaker",
+            "--health-check-mode",
+            "generation",
             "--health-check-interval-secs",
             "1",
             "--health-check-timeout-secs",
@@ -454,6 +531,8 @@ async fn recent_successful_generation_keeps_busy_workers_ready_without_masking_s
             &port().to_string(),
             "--disable-retries",
             "--disable-circuit-breaker",
+            "--health-check-mode",
+            "generation",
             "--health-check-interval-secs",
             "1",
             "--health-check-timeout-secs",
