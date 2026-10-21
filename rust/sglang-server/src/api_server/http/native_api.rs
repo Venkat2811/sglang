@@ -79,7 +79,30 @@ impl RequestTiming {
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/generate", post(generate))
+        .route("/abort_request", post(abort_request))
         .merge(health_routes())
+}
+
+#[derive(serde::Deserialize)]
+struct AbortRequest {
+    #[serde(default)]
+    rid: String,
+    #[serde(default)]
+    abort_all: bool,
+}
+
+async fn abort_request(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<AbortRequest>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(error) => return native_error(StatusCode::BAD_REQUEST, &error.to_string(), false),
+    };
+    match state.core.abort_request(body.rid, body.abort_all).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => native_core_error(error, false),
+    }
 }
 
 /// native api error response: unary → `code` plus the JSON `body`,
@@ -551,6 +574,52 @@ mod tests {
                 e2e_latency: None,
             },
         )
+    }
+
+    /// An empty abort is harmless; a stopped intake cannot acknowledge cancellation.
+    #[tokio::test]
+    async fn abort_route_preserves_empty_id_safety_and_reports_unavailable_intake() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        drop(intake_rx);
+        let (abort_tx, abort_rx) = flume::unbounded();
+        let state = Arc::new(AppState {
+            core: crate::api_server::core::CoreHandle::new(
+                intake_tx,
+                abort_tx,
+                crate::api_server::core::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    metadata: Default::default(),
+                },
+            ),
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            chat_formatter: None,
+        });
+        for (body, expected) in [
+            (r#"{}"#, StatusCode::OK),
+            (r#"{"rid":"","abort_all":false}"#, StatusCode::OK),
+            (
+                r#"{"rid":"target","abort_all":false}"#,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/abort_request")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let response = routes()
+                .with_state(state.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "abort body {body}");
+        }
+        assert!(abort_rx.try_recv().is_err());
     }
 
     #[tokio::test]

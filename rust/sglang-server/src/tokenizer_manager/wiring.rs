@@ -39,6 +39,12 @@ pub enum TmEvent {
     /// shm) set on it, or `Failed` (bad media URL, unsupported modality,
     /// preprocess error, ...).
     Encoded(Request),
+    /// Ordered with intake and pool returns so cancellation cannot miss accepted work.
+    AbortRequest {
+        rid_prefix: String,
+        abort_all: bool,
+        reply: flume::Sender<Result<(), crate::utils::error::Error>>,
+    },
 }
 
 const ADMISSION_PENDING: u8 = 0;

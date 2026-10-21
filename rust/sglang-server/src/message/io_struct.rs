@@ -83,7 +83,7 @@ wire_struct! {
 control_messages! {
     /// The scheduler's `AbortReq`: stop generating for one rid.
     AbortReq {
-        /// This server never aborts the whole queue — only the one rid.
+        /// True only for an explicit abort-all operation, never for a dropped call.
         abort_all: bool,
         finished_reason: (),
         abort_message: (),

@@ -133,6 +133,38 @@ impl CoreHandle {
         self.inner.startup_ready.store(true, Ordering::Release);
     }
 
+    pub(crate) async fn abort_request(
+        &self,
+        rid_prefix: String,
+        abort_all: bool,
+    ) -> Result<(), CoreError> {
+        if rid_prefix.is_empty() && !abort_all {
+            return Ok(());
+        }
+        if rid_prefix.len() > crate::tokenizer_manager::to_scheduler::MAX_RID_LEN {
+            return Err(CoreError::InvalidArgument("abort rid is too long".into()));
+        }
+        let (reply, result) = flume::bounded(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            self.inner
+                .intake_tx
+                .send_async(TmEvent::AbortRequest {
+                    rid_prefix,
+                    abort_all,
+                    reply,
+                })
+                .await
+                .map_err(|_| CoreError::Unavailable)?;
+            result
+                .recv_async()
+                .await
+                .map_err(|_| CoreError::Unavailable)?
+                .map_err(translate_runtime_error)
+        })
+        .await
+        .map_err(|_| CoreError::Unavailable)?
+    }
+
     fn response_activity(&self) -> u64 {
         self.inner.response_activity.load(Ordering::Relaxed)
     }
@@ -766,6 +798,47 @@ mod tests {
                 abort_rx,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn abort_request_requires_intake_acknowledgement_and_preserves_failure() {
+        for (prefix, all, outcome) in [("batch-", false, Ok(())), ("", true, Err(Error::QueueFull))]
+        {
+            let harness = Harness::unbounded(8);
+            let handle = harness.handle.clone();
+            let task = tokio::spawn(async move { handle.abort_request(prefix.into(), all).await });
+            let TmEvent::AbortRequest {
+                rid_prefix,
+                abort_all,
+                reply,
+            } = harness.intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("abort must enter the ordered intake lane");
+            };
+            assert_eq!(rid_prefix, prefix);
+            assert_eq!(abort_all, all);
+            assert!(
+                !task.is_finished(),
+                "sending a command is not acknowledgement"
+            );
+            let expected_success = outcome.is_ok();
+            reply.send(outcome).unwrap();
+            let result = task.await.unwrap();
+            if expected_success {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result.unwrap_err().kind(), CoreErrorKind::ResourceExhausted);
+            }
+            assert!(harness.abort_rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_request_rejects_overlong_prefix_before_intake() {
+        let harness = Harness::unbounded(8);
+        let result = harness.handle.abort_request("x".repeat(129), false).await;
+        assert_eq!(result.unwrap_err().kind(), CoreErrorKind::InvalidArgument);
+        assert!(harness.intake_rx.try_recv().is_err());
     }
 
     fn test_handle(
