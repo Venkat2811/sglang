@@ -226,6 +226,7 @@ def handle_shared_experts_tp(server_args: Any):
         raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
     if cfg.moe_a2a_backend not in (
         "deepep",
+        "deepep_v2",
         "megamoe",
         "mooncake",
         "ascend_fuseep",
@@ -233,7 +234,7 @@ def handle_shared_experts_tp(server_args: Any):
     ):
         raise ValueError(
             "--shared-experts-tp-size requires an expert-parallel all-to-all "
-            "backend (deepep, megamoe, mooncake, ascend_fuseep or mori)."
+            "backend (deepep, deepep_v2, megamoe, mooncake, ascend_fuseep or mori)."
         )
 
 
