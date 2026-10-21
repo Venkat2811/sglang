@@ -225,7 +225,11 @@ fn json_error(status: StatusCode, message: &str) -> Response {
 /// Status: `200 OK` when every worker flushed successfully (or the fleet is
 /// empty); `502 BAD_GATEWAY` when at least one worker failed. The JSON body
 /// always carries the full breakdown so a partial failure is actionable.
-pub async fn flush_cache(State(ctx): State<Arc<AppContext>>, headers: HeaderMap) -> Response {
+pub async fn flush_cache(
+    State(ctx): State<Arc<AppContext>>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    headers: HeaderMap,
+) -> Response {
     let workers = ctx.registry.all();
     let total_workers = workers.len();
 
@@ -246,6 +250,7 @@ pub async fn flush_cache(State(ctx): State<Arc<AppContext>>, headers: HeaderMap)
         ctx.proxy.admin_client(),
         ctx.proxy.request_timeout,
         headers.get(header::AUTHORIZATION),
+        query.as_deref(),
     )
     .await;
 
@@ -289,6 +294,7 @@ async fn fan_out_flush(
     client: &Client,
     timeout: Duration,
     auth: Option<&HeaderValue>,
+    query: Option<&str>,
 ) -> (Vec<String>, Vec<FailedWorker>) {
     // Snapshot the URLs into owned Strings up front so the per-worker stream
     // does not borrow the `workers` slice across the await points.
@@ -296,9 +302,12 @@ async fn fan_out_flush(
 
     let outcomes = stream::iter(urls)
         .map(|url| {
-            let mut request = client
-                .post(format!("{}/flush_cache", url.trim_end_matches('/')))
-                .timeout(timeout);
+            let mut target = format!("{}/flush_cache", url.trim_end_matches('/'));
+            if let Some(query) = query {
+                target.push('?');
+                target.push_str(query);
+            }
+            let mut request = client.post(target).timeout(timeout);
             if let Some(auth) = auth {
                 request = request.header(header::AUTHORIZATION, auth);
             }
@@ -401,6 +410,55 @@ mod tests {
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         (status, body)
+    }
+
+    #[tokio::test]
+    async fn flush_forwards_the_callers_timeout_query_to_workers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handler_seen = seen.clone();
+        let worker = Router::new().route(
+            "/flush_cache",
+            post(
+                move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
+                    let seen = handler_seen.clone();
+                    async move {
+                        seen.lock().unwrap().push(query);
+                        StatusCode::OK
+                    }
+                },
+            ),
+        );
+        let (stop, stopped) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, worker)
+                .with_graceful_shutdown(async move {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        let app = crate::server::app::build_router(ctx_with_workers(&[&url]));
+        for timeout in ["0", "17.25"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/flush_cache?timeout={timeout}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some("timeout=0".into()), Some("timeout=17.25".into())]
+        );
+        drop(stop);
     }
 
     #[tokio::test]

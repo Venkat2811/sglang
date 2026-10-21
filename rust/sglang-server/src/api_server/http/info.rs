@@ -112,7 +112,7 @@ struct FlushCacheQuery {
 }
 
 fn default_flush_timeout() -> f64 {
-    5.0
+    0.0
 }
 
 /// `GET|POST /flush_cache?timeout=<s>` — the scheduler flushes its caches in
@@ -140,21 +140,9 @@ async fn flush_cache(
             return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
         }
     };
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs_f64(timeout + 1.0),
-        state.core.flush_cache(timeout),
-    )
-    .await;
-    let result = match result {
-        Ok(result) => result,
-        Err(_) => {
-            return native_error(
-                StatusCode::GATEWAY_TIMEOUT,
-                "flush cache scheduler response timed out",
-                false,
-            );
-        }
-    };
+    // The scheduler owns the wait budget. A separate HTTP timer can expire
+    // before a busy scheduler sees the command, abandoning a queued flush.
+    let result = state.core.flush_cache(timeout).await;
     let outcome = match result {
         Ok(outcome) => outcome,
         Err(CoreError::Unavailable) => {
@@ -925,9 +913,9 @@ mod tests {
             );
         }
     }
-    /// A normal post-completion flush gets a bounded drain budget by default.
+    /// Python defaults to an immediate scheduler decision, including repeated flushes.
     #[tokio::test]
-    async fn regression_flush_default_waits_for_idle_and_repeated_flush_succeeds() {
+    async fn flush_defaults_to_zero_and_repeated_flush_succeeds() {
         let (state, intake, _abort) = test_state(ServerArgs::default());
         for _ in 0..2 {
             let response = tokio::spawn(
@@ -949,10 +937,7 @@ mod tests {
             let header = control.encode().unwrap();
             let header = rmpv::decode::read_value(&mut &header[..]).unwrap();
             let timeout = header[3].as_f64().unwrap();
-            assert!(
-                timeout > 0.0 && timeout <= 5.0,
-                "default must permit scheduler cleanup: {timeout}"
-            );
+            assert_eq!(timeout, 0.0, "default must match Python's scheduler budget");
             request
                 .sink
                 .try_send(ResponseItem::Control(Bytes::from(
@@ -964,8 +949,8 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn flush_without_scheduler_reply_expires_and_invalid_budgets_never_dispatch() {
-        let (state, intake, _abort) = test_state(ServerArgs::default());
+    async fn flush_waits_for_scheduler_outcome_and_invalid_budgets_never_dispatch() {
+        let (state, intake, abort) = test_state(ServerArgs::default());
         let app = routes().with_state(state);
         for value in ["NaN", "inf", "-1", "3601"] {
             let response = app
@@ -991,19 +976,32 @@ mod tests {
                     .unwrap(),
             ),
         );
-        let TmEvent::Intake {
-            request: _request,
-            admission,
-        } = intake.recv_async().await.unwrap()
-        else {
+        let TmEvent::Intake { request, admission } = intake.recv_async().await.unwrap() else {
             panic!("expected intake");
         };
         assert!(admission.try_accept());
+        // The scheduler may be occupied before it can even observe its budget.
+        // Returning a separate HTTP timeout here leaves its flush queued.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(
+            !response.is_finished(),
+            "must await the queued flush outcome"
+        );
+        assert!(
+            abort.try_recv().is_err(),
+            "HTTP must not abandon the queued control"
+        );
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({"success":true,"message":""})).unwrap(),
+            )))
+            .unwrap();
         let response = tokio::time::timeout(std::time::Duration::from_secs(3), response)
             .await
-            .expect("flush must not wait indefinitely for a scheduler reply")
+            .expect("a completed scheduler flush must finish the response")
             .unwrap()
             .unwrap();
-        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
