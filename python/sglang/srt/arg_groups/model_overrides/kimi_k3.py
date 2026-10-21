@@ -185,6 +185,22 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 
 
 @_register_for("KimiK3ForConditionalGeneration")
+def _kimi_k3_batch_overlap_guard(server_args: Any, hf_config: Any) -> dict:
+    cfg = resolving_view(server_args)
+    if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
+        # The K3 decoder has no operations strategy and never reads the SBO
+        # flags; TBO would still split every batch and capture TBO-only graphs.
+        raise ValueError(
+            "Kimi-K3 does not implement two-batch or single-batch overlap yet; "
+            "its forward would ignore them while two-batch overlap still splits "
+            "every batch. Under an EP all-to-all backend Kimi-K3 already runs "
+            "its shared experts on a side stream beside the dispatch. Remove "
+            "--enable-two-batch-overlap / --enable-single-batch-overlap."
+        )
+    return {}
+
+
+@_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # MoE runner default, independent of the attention-backend gate above.
     # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode

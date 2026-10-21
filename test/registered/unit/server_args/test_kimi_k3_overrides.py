@@ -40,5 +40,26 @@ class TestKimiK3MoeRunnerOverride(CustomTestCase):
         self.assertIsNone(self.runner_for(a2a="deepep", runner="flashinfer_mxfp4"))
 
 
+class TestKimiK3BatchOverlapGuard(CustomTestCase):
+    def test_batch_overlap_is_refused_until_the_model_implements_it(self):
+        """K3's forward ignored both flags (no operations strategy, no SBO
+        reads) while two-batch overlap still split and padded every batch."""
+        for tbo, sbo in ((True, False), (False, True)):
+            server_args = SimpleNamespace(
+                enable_two_batch_overlap=tbo, enable_single_batch_overlap=sbo
+            )
+            with (
+                self.subTest(tbo=tbo, sbo=sbo),
+                self.assertRaisesRegex(ValueError, "two-batch or single-batch overlap"),
+            ):
+                k3_overrides._kimi_k3_batch_overlap_guard(server_args, None)
+        server_args = SimpleNamespace(
+            enable_two_batch_overlap=False, enable_single_batch_overlap=False
+        )
+        self.assertEqual(
+            k3_overrides._kimi_k3_batch_overlap_guard(server_args, None), {}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
