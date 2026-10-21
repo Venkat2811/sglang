@@ -116,7 +116,7 @@ async fn serve_http(
     let scope =
         crate::server::admission::RequestScope::enter_request(&ctx, endpoint.path(), &headers)?;
     let client = scope.client();
-    let (mut request, routing) = prepare(&ctx, endpoint, &headers, body, false)
+    let (mut request, routing) = prepare(&ctx, endpoint, &headers, body, false, &scope)
         .await
         .inspect_err(|e| scope.life.fail(e.error_code()))?;
     request.scope = Some(Arc::clone(&scope));
@@ -131,7 +131,7 @@ async fn serve_http(
 /// A gRPC call whose request is `endpoint`'s HTTP body, sent to the engine as `rpc`.
 /// The log context is `None` when the call failed before dispatch.
 pub async fn route_grpc<R: EngineRpc>(
-    ctx: &AppContext,
+    ctx: &Arc<AppContext>,
     endpoint: Endpoint,
     rpc: R,
     headers: HeaderMap,
@@ -148,7 +148,7 @@ pub async fn route_grpc<R: EngineRpc>(
             Err(error) => return (Err(error), None),
         };
     let client = scope.client();
-    match prepare(ctx, endpoint, &headers, body, true).await {
+    match prepare(ctx, endpoint, &headers, body, true, &scope).await {
         Ok((mut request, routing)) => {
             request.scope = Some(Arc::clone(&scope));
             let (result, log) =
@@ -173,7 +173,7 @@ pub async fn route_grpc<R: EngineRpc>(
 
 /// [`route_grpc`] for a typed request, prepared from its fields as `endpoint` prepares a body.
 pub async fn route_typed<R: TypedRpc>(
-    ctx: &AppContext,
+    ctx: &Arc<AppContext>,
     endpoint: Endpoint,
     request: R,
     headers: HeaderMap,
@@ -181,26 +181,87 @@ pub async fn route_typed<R: TypedRpc>(
     Result<GrpcResponse<R::Reply>, ApiError>,
     Option<RequestLogContext>,
 ) {
-    let start = Instant::now();
-    let scope =
-        match crate::server::admission::RequestScope::enter_request(ctx, endpoint.path(), &headers)
-        {
-            Ok(scope) => scope,
-            Err(error) => return (Err(error), None),
-        };
-    let client = scope.client();
-    let prepared = async {
+    let admitted = match AdmittedRequest::enter(ctx, endpoint.path(), &headers) {
+        Ok(admitted) => admitted,
+        Err(error) => return (Err(error), None),
+    };
+    route_typed_admitted(ctx, endpoint, request, headers, admitted).await
+}
+
+pub(crate) struct AdmittedRequest {
+    scope: Arc<crate::server::admission::RequestScope>,
+    client: crate::server::admission::ClientLifetime,
+    start: Instant,
+}
+
+impl AdmittedRequest {
+    fn enter(
+        ctx: &AppContext,
+        endpoint: &'static str,
+        headers: &HeaderMap,
+    ) -> Result<Self, ApiError> {
+        let start = Instant::now();
+        let scope = crate::server::admission::RequestScope::enter_request(ctx, endpoint, headers)?;
+        let client = scope.client();
+        Ok(Self {
+            scope,
+            client,
+            start,
+        })
+    }
+    pub(crate) fn response(self, response: Response<Body>) -> Response<Body> {
+        let successful = response.status().is_success();
+        response.map(|body| self.client.body(body, successful))
+    }
+}
+
+pub(crate) async fn admit_and_prepare<T: Send + 'static>(
+    ctx: &Arc<AppContext>,
+    endpoint: &'static str,
+    headers: &HeaderMap,
+    work: impl FnOnce(&AppContext) -> Result<T, ApiError> + Send + 'static,
+) -> Result<(AdmittedRequest, T), ApiError> {
+    let admitted = AdmittedRequest::enter(ctx, endpoint, headers)?;
+    let prepared = prepare_cpu(ctx, &admitted.scope, work)
+        .await
+        .inspect_err(|error| admitted.scope.life.fail(error.error_code()))?;
+    Ok((admitted, prepared))
+}
+
+pub(crate) async fn route_typed_admitted<R: TypedRpc>(
+    ctx: &Arc<AppContext>,
+    endpoint: Endpoint,
+    request: R,
+    headers: HeaderMap,
+    admitted: AdmittedRequest,
+) -> (
+    Result<GrpcResponse<R::Reply>, ApiError>,
+    Option<RequestLogContext>,
+) {
+    let AdmittedRequest {
+        scope,
+        client,
+        start,
+    } = admitted;
+    let prepared = prepare_cpu(ctx, &scope, move |ctx| {
         let model = ModelId(ctx.config.model.id.clone());
-        let routing = ModelRouting::lookup(ctx, &model)?;
+        ModelRouting::lookup(ctx, &model)?;
         let path = endpoint.path();
         if path != GENERATE_PATH {
             require_plain_workers(ctx, &model, path)?;
         }
         let prepared = PreparedRequest::typed(ctx, path, model, &request.view())?;
-        Ok::<_, ApiError>((prepared, routing))
-    };
+        Ok((request, prepared))
+    });
     match prepared.await {
-        Ok((mut prepared, routing)) => {
+        Ok((request, mut prepared)) => {
+            let routing = match ModelRouting::lookup(ctx, &prepared.model) {
+                Ok(routing) => routing,
+                Err(error) => {
+                    scope.life.fail(error.error_code());
+                    return (Err(error), None);
+                }
+            };
             prepared.scope = Some(Arc::clone(&scope));
             let (result, log) =
                 forward_request_grpc(request, ctx, &mut prepared, &routing, headers, start).await;
@@ -231,7 +292,7 @@ pub fn prompt_ids(ctx: &AppContext, endpoint: Endpoint, text: &str) -> Option<Ve
 }
 
 impl Endpoint {
-    fn path(self) -> &'static str {
+    pub(crate) fn path(self) -> &'static str {
         match self {
             Endpoint::Chat => CHAT_PATH,
             Endpoint::Completions => COMPLETIONS_PATH,
@@ -245,14 +306,56 @@ impl Endpoint {
 
 /// Validate the body and resolve its routing policy, as `endpoint` does over HTTP.
 async fn prepare<'a>(
-    ctx: &'a AppContext,
+    ctx: &'a Arc<AppContext>,
     endpoint: Endpoint,
     headers: &HeaderMap,
     body: Bytes,
     grpc: bool,
+    scope: &Arc<crate::server::admission::RequestScope>,
 ) -> Result<(PreparedRequest, ModelRouting<'a>), ApiError> {
+    let headers = headers.clone();
+    let request = prepare_cpu(ctx, scope, move |ctx| {
+        prepare_sync(ctx, endpoint, &headers, body, grpc)
+    })
+    .await?;
+    let routing = ModelRouting::lookup(ctx, &request.model)?;
+    Ok((request, routing))
+}
+
+async fn prepare_cpu<T: Send + 'static>(
+    ctx: &Arc<AppContext>,
+    scope: &Arc<crate::server::admission::RequestScope>,
+    work: impl FnOnce(&AppContext) -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    let ctx = Arc::clone(ctx);
+    let scope = Arc::clone(scope);
+    tokio::task::spawn_blocking(move || {
+        // Dropping the client future cannot release admission while this CPU work remains.
+        let _scope = scope;
+        if _scope.cancelled.is_cancelled() {
+            return Err(ApiError::Internal(
+                std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "request cancelled before preparation",
+                )
+                .into(),
+            ));
+        }
+        work(&ctx)
+    })
+    .await
+    .map_err(|error| ApiError::Internal(error.into()))?
+}
+
+fn prepare_sync(
+    ctx: &AppContext,
+    endpoint: Endpoint,
+    headers: &HeaderMap,
+    body: Bytes,
+    grpc: bool,
+) -> Result<PreparedRequest, ApiError> {
     let served_model = || ModelId(ctx.config.model.id.clone());
-    let (routing, request) = match endpoint {
+    let (_routing, request) = match endpoint {
         Endpoint::Chat | Endpoint::Completions => {
             let mut fields = parse_routing_fields(&body)?;
             let model = fields.model.take();
@@ -294,7 +397,7 @@ async fn prepare<'a>(
             (routing, PreparedRequest::rerank(model, body)?)
         }
     };
-    Ok((request, routing))
+    Ok(request)
 }
 
 /// Prefill and decode engines serve generation only.
@@ -859,8 +962,7 @@ pub(crate) async fn generation_probe(
     // A single explicit token avoids chat-template overhead and minimizes cache footprint.
     // Use an ordinary unique rid: engine health-special ids can skip generation when busy.
     let body = Bytes::from(serde_json::json!({"input_ids":[1],"stream":false,"sampling_params":{"max_new_tokens":1,"temperature":0}}).to_string());
-    let Ok((mut request, _routing)) = prepare(ctx, Endpoint::Generate, &headers, body, false).await
-    else {
+    let Ok(mut request) = prepare_sync(ctx, Endpoint::Generate, &headers, body, false) else {
         return false;
     };
     request.scope = Some(scope);
