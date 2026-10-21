@@ -137,6 +137,33 @@ def test_deepep_v2_quant_contract_rejects_incompatible_methods(_moe_flags):
         _validate_deepep_v2_quant_method(object.__new__(W4AFp8MoEMethod))
 
 
+@pytest.mark.parametrize(
+    ("use_deep_gemm", "use_mega_moe", "accepted"),
+    [(True, False, True), (False, False, False), (True, True, False)],
+)
+def test_deepep_v2_quant_contract_takes_mxfp4_experts_only_on_deep_gemm(
+    _moe_flags, use_deep_gemm, use_mega_moe, accepted
+):
+    """MXFP4 experts (Kimi-K3) reach DeepGEMM's fp8 x fp4 GEMM from the FP8
+    per-128 dispatch; no other runner consumes DeepEP v2 output for them."""
+    from sglang.srt.layers.moe.fused_moe_triton.layer import (
+        _deepep_v2_experts_are_fp8,
+        _validate_deepep_v2_quant_method,
+    )
+    from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+    _moe_flags.a2a_backend = MoeA2ABackend.DEEPEP_V2
+    method = object.__new__(Mxfp4MoEMethod)
+    method.use_deep_gemm = use_deep_gemm
+    method.use_mega_moe = use_mega_moe
+    assert _deepep_v2_experts_are_fp8(method) is True
+    if accepted:
+        _validate_deepep_v2_quant_method(method)
+    else:
+        with pytest.raises(ValueError, match="deep_gemm"):
+            _validate_deepep_v2_quant_method(method)
+
+
 def test_deepep_v2_quant_contract_does_not_affect_other_backends(_moe_flags):
     from sglang.srt.layers.moe.fused_moe_triton.layer import (
         _validate_deepep_v2_quant_method,

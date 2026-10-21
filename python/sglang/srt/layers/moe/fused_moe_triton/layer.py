@@ -266,6 +266,18 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
     if isinstance(quant_method, UnquantizedFusedMoEMethod):
         return
 
+    from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+    # MXFP4 experts on DeepGEMM's fp8 x fp4 grouped GEMM take the same FP8
+    # per-128 activations as blockwise FP8 experts (recipes (1,128)/(1,32)).
+    if isinstance(quant_method, Mxfp4MoEMethod):
+        if quant_method.use_deep_gemm and not quant_method.use_mega_moe:
+            return
+        raise ValueError(
+            "--moe-a2a-backend deepep_v2 feeds MXFP4 experts only through "
+            "--moe-runner-backend deep_gemm."
+        )
+
     config = (
         quant_method.quant_config if isinstance(quant_method, Fp8MoEMethod) else None
     )
