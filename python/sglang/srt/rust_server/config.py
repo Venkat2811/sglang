@@ -99,6 +99,7 @@ def _build_server_args(
             else None
         ),
         rust_server_allow_abort_all=get_serving().rust_server_allow_abort_all,
+        enable_cache_report=get_serving().enable_cache_report,
         enable_request_header_overrides=envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get(),
         incremental_streaming_output=get_serving().incremental_streaming_output,
         disaggregation_mode=disaggregation_mode,

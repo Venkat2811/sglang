@@ -147,6 +147,8 @@ pub struct ServerArgs {
     pub enable_request_header_overrides: bool,
     /// Explicit opt-in for the public abort-all operation.
     pub rust_server_allow_abort_all: bool,
+    /// Include cache-hit information in OpenAI usage.
+    pub enable_cache_report: bool,
     /// Streamed `/generate` frames carry per-step deltas instead of cumulative
     /// text. Matches the Python `TokenizerManager`.
     pub incremental_streaming_output: bool,
@@ -222,6 +224,7 @@ impl ServerArgs {
         health_generate_headers,
         default_priority_value,
         rust_server_allow_abort_all,
+        enable_cache_report,
         enable_request_header_overrides,
         incremental_streaming_output,
         disaggregation_mode,
@@ -267,6 +270,7 @@ impl ServerArgs {
         health_generate_headers: BTreeMap<String, String>,
         default_priority_value: Option<i64>,
         rust_server_allow_abort_all: bool,
+        enable_cache_report: bool,
         enable_request_header_overrides: bool,
         incremental_streaming_output: bool,
         disaggregation_mode: DisaggregationMode,
@@ -310,6 +314,7 @@ impl ServerArgs {
             health_generate_headers,
             default_priority_value,
             rust_server_allow_abort_all,
+            enable_cache_report,
             enable_request_header_overrides,
             incremental_streaming_output,
             disaggregation_mode,
@@ -361,6 +366,7 @@ impl Default for ServerArgs {
             health_generate_headers: BTreeMap::new(),
             default_priority_value: None,
             rust_server_allow_abort_all: false,
+            enable_cache_report: false,
             enable_request_header_overrides: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
