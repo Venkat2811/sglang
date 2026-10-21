@@ -42,6 +42,9 @@ def start_disagg_service():
         kv_bootstrap_server_class = get_kv_class(
             transfer_backend, KVClassType.BOOTSTRAP_SERVER
         )
+        if kv_bootstrap_server_class is None:
+            # The fake backend has no bootstrap server (synthetic prefill-only runs).
+            return None
         bootstrap_server = kv_bootstrap_server_class(
             host=get_serving().host,
             port=get_disagg().disaggregation_bootstrap_port,
