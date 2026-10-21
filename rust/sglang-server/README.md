@@ -2,6 +2,19 @@
 
 `sglang-server` is SGLang's Rust HTTP frontend and request-processing pipeline. It exchanges typed requests and responses with the Python scheduler while keeping latency-sensitive work outside Python.
 
+## Python and extension compatibility
+
+Deploy the Python scheduler code and `_server` extension from the same revision.
+Their `RUST_SERVER_WIRE_VERSION` values must agree; version 1 includes the
+19-column generation header. Python checks the loaded extension before launching
+the frontend, and extension import checks the Python producer. An unversioned or
+mismatched pair fails with a wire protocol error before accepting generation.
+Increment both versions when making an incompatible positional-wire change.
+
+Stop the entire engine before replacing either side. Install the matching Python
+files and extension, verify import, and then restart. Never overwrite an extension
+that is still mapped by a running process.
+
 ## Code review principles
 
 1. **Use strongly typed boundaries.** Model every supported protocol shape with structs, enums, and validated newtypes; avoid opaque values such as `serde_json::Value` and `rmpv::Value` in production paths.

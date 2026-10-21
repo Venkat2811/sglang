@@ -134,6 +134,9 @@ def test_dp_leaders_reuse_node_local_ports(
         patch.object(rust_server, "_partition_cores", return_value=(None, None)),
         patch.object(rust_server, "_build_server_args"),
     ):
+        extension.return_value.RUST_SERVER_WIRE_VERSION = (
+            rust_server.RUST_SERVER_WIRE_VERSION
+        )
         parallel = get_parallel()
         ports = []
         for dp_rank, tp_rank in enumerate(ranks):
