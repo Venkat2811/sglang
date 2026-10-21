@@ -666,11 +666,6 @@ def _decode_graph_dispatch_tokens_per_rank(server_args: Any) -> tuple[int, int]:
     if view.max_running_requests is not None:
         per_rank_pool_bs = max(1, view.max_running_requests // view.attn_dp_size)
         graph_bs = min(graph_bs, per_rank_pool_bs)
-    if os.environ.get("SGLANG_CEILING_V2_SCATTERED_BUDGET") == "1":
-        # Timing only: count the decode graph's rows per attention-TP rank (the
-        # MoE input is scattered across the DP group's attention-TP ranks before
-        # dispatch), so the per-rank buffer can be sized to the rows a rank sends.
-        graph_bs = -(-graph_bs // max(1, view.tp_size // view.attn_dp_size))
     tokens_per_req = (
         max_speculative_num_draft_tokens(server_args) or 1
         if view.speculative_algorithm

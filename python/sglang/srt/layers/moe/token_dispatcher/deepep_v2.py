@@ -30,13 +30,6 @@ from sglang.srt.runtime_context import (
 logger = logging.getLogger(__name__)
 
 _SCALE_BLOCK_SIZE = 128
-# ABLATION (timing only, outputs are wrong by design; never for serving or correctness):
-# SGLANG_ABLATE_DEEPEP_COMM=1 makes masked (decode) DeepEP v2 dispatch/combine local no-ops after the first real
-# masked dispatch on this rank. Dispatch returns that first receive buffer (stale contents) with expert prefix sums
-# built from this rank's own routing (global expert id mod local experts, so the expert GEMMs see about as many rows
-# as a real exchange delivers); combine returns zeros. Bounds what hiding or removing the exchange buys.
-_ABLATE_DEEPEP_COMM = os.environ.get("SGLANG_ABLATE_DEEPEP_COMM", "0") == "1"
-_ABLATE_TEMPLATE: dict = {}
 # Must match DeepGEMM's contiguous expert alignment.
 _EXPERT_ALIGNMENT = 128
 _deepep_v2_import_error: Optional[BaseException] = None
@@ -360,8 +353,6 @@ class _DeepEPv2Impl:
         if use_masked:
             do_cpu_sync_val = False
 
-        if _ABLATE_DEEPEP_COMM and use_masked and "out" in _ABLATE_TEMPLATE:
-            return self._ablated_dispatch(hidden_states.shape[0], topk_ids)
         buffer = self._get_buffer()
         recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
             dispatch_x,
@@ -423,11 +414,6 @@ class _DeepEPv2Impl:
             masked_max_m = self.num_max_dispatch_tokens_per_rank * ep_group_size
             total_expanded = recv_capacity
 
-        if _ABLATE_DEEPEP_COMM and use_masked and "out" not in _ABLATE_TEMPLATE:
-            _ABLATE_TEMPLATE["out"] = (
-                recv_hidden_states, recv_hidden_states_scale, local_topk_ids,
-                recv_topk_weights, expected_m, masked_max_m, total_expanded,
-            )
         # Publish ownership only after the returned metadata is validated.
         self._handle = handle
         return DeepEPv2DispatchOutput(
@@ -445,44 +431,10 @@ class _DeepEPv2Impl:
             activation_scale_block_size=self.activation_scale_block_size,
         )
 
-    def _ablated_dispatch(self, num_local_tokens: int, topk_ids: torch.Tensor):
-        recv_x, recv_scale, local_ids, recv_w, _, masked_max_m, total = _ABLATE_TEMPLATE["out"]
-        num_local = self.num_local_experts
-        valid = topk_ids >= 0
-        ids = torch.where(valid, topk_ids % num_local, torch.zeros_like(topk_ids))
-        counts = (
-            torch.nn.functional.one_hot(ids, num_local)
-            .masked_fill(~valid.unsqueeze(-1), 0)
-            .sum(dim=(0, 1))
-            .to(torch.int32)
-        )
-        aligned = (counts + _EXPERT_ALIGNMENT - 1) // _EXPERT_ALIGNMENT * _EXPERT_ALIGNMENT
-        psum = (torch.cumsum(aligned, 0) - aligned + counts).to(torch.int32)
-        ep_group_size = max(1, self.num_experts // self.num_local_experts)
-        expected_m = max(
-            1,
-            (num_local_tokens * ep_group_size * self.router_topk + self.num_experts)
-            // self.num_experts,
-        )
-        self._handle = "ablated"
-        self._ablated_rows = num_local_tokens
-        return DeepEPv2DispatchOutput(
-            recv_x, recv_scale, local_ids, recv_w, psum, True, True, expected_m,
-            masked_max_m, total, _EXPERT_ALIGNMENT,
-            activation_scale_block_size=self.activation_scale_block_size,
-        )
-
     def combine(self, combine_input: DeepEPv2CombineInput) -> torch.Tensor:
         if self._handle is None:
             raise RuntimeError(
                 "DeepEP v2 combine called without a valid dispatch handle"
-            )
-        if isinstance(self._handle, str):
-            self._handle = None
-            return torch.zeros(
-                (self._ablated_rows, combine_input.hidden_states.shape[-1]),
-                dtype=torch.bfloat16,
-                device=combine_input.hidden_states.device,
             )
         # Release the single-use handle even when combine fails.
         try:
