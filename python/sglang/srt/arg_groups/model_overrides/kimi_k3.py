@@ -198,6 +198,14 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
         return {}
     if not _is_mxfp4_pack_quantized(hf_config):
         return {}
+    if cfg.moe_a2a_backend in ("deepep", "deepep_v2"):
+        # DeepEP outputs reach MXFP4 experts only through DeepGEMM's fp8 x fp4
+        # GEMM; flashinfer_mxfp4 has no DeepEP fused function.
+        logger.info(
+            "Kimi-K3 MXFP4 with --moe-a2a-backend %s: moe_runner_backend=deep_gemm.",
+            cfg.moe_a2a_backend,
+        )
+        return {"moe_runner_backend": "deep_gemm"}
     logger.info(
         "Kimi-K3 on SM100/SM103/SM107: moe_runner_backend=flashinfer_mxfp4 "
         "(FlashInfer SiTU kernels)."
