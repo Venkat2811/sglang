@@ -563,7 +563,10 @@ pub(super) fn completion_event_stream(
             prompt_tokens_by_prompt
                 .entry(prompt_indexes[index])
                 .or_insert(output.prompt_tokens);
-            cached_tokens_by_prompt.entry(prompt_indexes[index]).and_modify(|cached|*cached=(*cached).max(output.cached_tokens)).or_insert(output.cached_tokens);
+            cached_tokens_by_prompt
+                .entry(prompt_indexes[index])
+                .and_modify(|cached| *cached = (*cached).max(output.cached_tokens))
+                .or_insert(output.cached_tokens);
             completion_tokens_by_choice[index] = completion_tokens_by_choice[index]
                 .saturating_add(output.completion_tokens);
             let first = std::mem::replace(&mut first_chunks[index], false);
@@ -616,7 +619,10 @@ pub(super) fn completion_event_stream(
                 usage: Some(completion_usage(
                     prompt_tokens,
                     u32::try_from(completion_tokens).unwrap_or(u32::MAX),
-                    cached_tokens_by_prompt.values().copied().fold(0u32,u32::saturating_add),
+                    cached_tokens_by_prompt
+                        .values()
+                        .copied()
+                        .fold(0u32, u32::saturating_add),
                 )),
             };
             yield completion_response_value(final_chunk, &[]).to_string();
