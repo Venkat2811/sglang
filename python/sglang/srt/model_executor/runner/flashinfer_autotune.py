@@ -285,6 +285,53 @@ def _drop_diverged_autotune_cache(
     cache_path.unlink(missing_ok=True)
 
 
+
+def _pin_moe_decode_tile8(cache_path: Path) -> bool:
+    """Decode buckets of the routed trtllm-gen FP4 MoE: at 16 to 32 tokens each
+    local expert sees well under one token, yet the tuner (cold-L2 graph
+    profiling) can pick a 16- or 32-token tile that runs fc1 20 to 35 percent
+    slower in the engine on B300 (Kimi-K3). Re-pin buckets of up to N tokens
+    that tuned to a tile above 8 to the tile-8 tactic the tuner chose for the
+    largest bucket of at most 8 tokens."""
+    import ast
+    import os
+
+    max_tokens = int(os.environ.get("SGLANG_MOE_DECODE_TILE8_MAX_TOKENS", "0"))
+    if max_tokens <= 8 or not cache_path.is_file():
+        return False
+    configs = json.loads(cache_path.read_text())
+    op = "flashinfer::trtllm_fp4_block_scale_moe"
+    parsed = {}
+    for key, value in configs.items():
+        if key.startswith("_") or op not in key:
+            continue
+        try:
+            k = ast.literal_eval(key)
+            parsed[key] = (k[2][0][0], (k[1], k[3]), value)
+        except (ValueError, SyntaxError, IndexError, TypeError):
+            continue
+    # Reference: per MoE config, the tile-8 tactic the tuner chose for the
+    # largest bucket of at most 8 tokens.
+    ref = {}
+    for _, (m, ident, value) in parsed.items():
+        tac = value[1]
+        if m <= 8 and isinstance(tac, list) and tac[0] == 8:
+            if ident not in ref or m > ref[ident][0]:
+                ref[ident] = (m, tac)
+    changed = False
+    for key, (m, ident, value) in parsed.items():
+        tac = value[1]
+        if ident in ref and m <= max_tokens and isinstance(tac, list) and tac[0] > 8:
+            value[1] = list(ref[ident][1])
+            changed = True
+    if changed:
+        cache_path.write_text(json.dumps(configs))
+        logger.info(
+            "FlashInfer autotune: routed MoE buckets up to %d tokens pinned to "
+            "tile 8", max_tokens,
+        )
+    return changed
+
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
     # The gate below decides on the same inputs load_configs does.
@@ -361,6 +408,9 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             yield
         if reuse_cache:
             tuner.save_configs(str(autotune_cache))
+            if _pin_moe_decode_tile8(autotune_cache):
+                tuner.clear_cache()
+                tuner.load_configs(str(autotune_cache))
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")
 
