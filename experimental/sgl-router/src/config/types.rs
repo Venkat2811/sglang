@@ -321,7 +321,7 @@ pub struct ServerConfig {
     pub worker_startup_timeout_secs: u64,
     pub admission: AdmissionConfig,
     pub max_payload_size: usize,
-    pub prometheus_port: u16,
+    pub prometheus_port: Option<u16>,
     pub admin_port: Option<u16>,
     pub health_check: HealthCheckConfig,
 }
@@ -360,7 +360,7 @@ impl Default for ServerConfig {
             worker_startup_timeout_secs: 1800,
             admission: AdmissionConfig::default(),
             max_payload_size: 32 << 20,
-            prometheus_port: 29000,
+            prometheus_port: None,
             admin_port: None,
             health_check: HealthCheckConfig::default(),
         }

@@ -25,6 +25,7 @@ mod h2c_forward;
 mod header_forwarding;
 mod inbound_h2c;
 mod messages_api;
+mod metrics_opt_in;
 mod observability;
 mod openai_generate;
 mod pd_bootstrap_injection;

@@ -167,9 +167,9 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = 32 << 20)]
     pub max_payload_size: usize,
 
-    /// Prometheus HTTP port, on --host. 0 asks the OS for a free port.
-    #[arg(long, default_value_t = 29000)]
-    pub prometheus_port: u16,
+    /// Enable a Prometheus listener on --host at this port; 0 chooses a free port.
+    #[arg(long)]
+    pub prometheus_port: Option<u16>,
 
     /// Optional admin port, bound only on IPv4 loopback (0 chooses a free port).
     #[arg(long)]

@@ -189,18 +189,23 @@ async fn main() -> Result<()> {
         }
         None => None,
     };
-    let metrics_addr = format!("{}:{}", config.server.host, config.server.prometheus_port);
-    let metrics_listener = TcpListener::bind(&metrics_addr)
-        .await
-        .with_context(|| format!("bind metrics {metrics_addr}"))?;
-    let metrics_app = axum::Router::new()
-        .route(
-            "/metrics",
-            axum::routing::get(sgl_router::server::routes::metrics::metrics),
-        )
-        .with_state(Arc::clone(&app_context));
-    let metrics_handle =
-        tokio::spawn(async move { axum::serve(metrics_listener, metrics_app).await });
+    let metrics_handle = if let Some(port) = config.server.prometheus_port {
+        let metrics_addr = format!("{}:{port}", config.server.host);
+        let metrics_listener = TcpListener::bind(&metrics_addr)
+            .await
+            .with_context(|| format!("bind metrics {metrics_addr}"))?;
+        let metrics_app = axum::Router::new()
+            .route(
+                "/metrics",
+                axum::routing::get(sgl_router::server::routes::metrics::metrics),
+            )
+            .with_state(Arc::clone(&app_context));
+        Some(tokio::spawn(async move {
+            axum::serve(metrics_listener, metrics_app).await
+        }))
+    } else {
+        None
+    };
     let admin_handle = if let Some(port) = config.server.admin_port {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
             .await
@@ -219,7 +224,9 @@ async fn main() -> Result<()> {
     if let Some(handle) = admin_handle {
         handle.abort();
     }
-    metrics_handle.abort();
+    if let Some(handle) = metrics_handle {
+        handle.abort();
+    }
     if let Some(handle) = health_handle {
         handle.abort();
     }
