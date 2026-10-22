@@ -33,17 +33,37 @@ if TYPE_CHECKING:
     )
 
 
+def _uniform_rows() -> bool:
+    """Whether every EP rank dispatches at most as many tokens as this one.
+
+    True inside decode graph capture and the FlashInfer autotune pass when the
+    DP groups replay one synchronized bucket (or there is one DP group: equal
+    SP-MoE shards). Eager forwards keep the static slab bound.
+    """
+    forced = envs.SGLANG_DEEPEP_MXFP4_UNIFORM_ROWS.get()
+    if forced is not None:
+        return forced
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        _flashinfer_autotune_active,
+    )
+    from sglang.srt.utils.common import require_mlp_tp_gather
+
+    if not (torch.cuda.is_current_stream_capturing() or _flashinfer_autotune_active()):
+        return False
+    return not get_parallel().attn_dp_enabled or require_mlp_tp_gather()
+
+
 def _compact_rows(*, slab_rows: int, num_local_experts: int, top_k: int, local_tokens: int) -> int:
     """Static bound on valid (expert, slot) pairs on this rank.
 
     Each dispatched token occupies at most min(top_k, E) local expert slots, and
-    the slab holds R = cap * num_ranks token slots per expert. With
-    SGLANG_DEEPEP_MXFP4_UNIFORM_ROWS every rank dispatches at most as many
-    tokens as this one (one DP group, equal SP-MoE shards), which tightens R.
+    the slab holds R = cap * num_ranks token slots per expert. When no rank
+    dispatches more tokens than this one (_uniform_rows), R tightens to
+    num_ranks * local_tokens.
     """
     per_token = min(top_k, num_local_experts)
     rows = slab_rows * per_token
-    if envs.SGLANG_DEEPEP_MXFP4_UNIFORM_ROWS.get() and local_tokens > 0:
+    if local_tokens > 0 and _uniform_rows():
         num_ranks = get_parallel().moe_ep_size
         rows = min(rows, num_ranks * local_tokens * per_token)
     return max(16, -(-rows // 16) * 16)
