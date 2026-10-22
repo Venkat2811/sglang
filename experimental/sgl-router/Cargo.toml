@@ -151,3 +151,7 @@ path = "benches/tree_lookup.rs"
 name = "policy_select"
 harness = false
 path = "benches/policy_select.rs"
+
+[patch.crates-io]
+# Keep the tokenizer shared by direct and renderer dependencies on one pinned revision.
+dynamo-tokenizers = { git = "https://github.com/Venkat2811/frontend-crates.git", rev = "a847081c30e44a7406dadbb29f4c2cd96ab46b90" }
