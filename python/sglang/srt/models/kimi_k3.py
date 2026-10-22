@@ -1347,7 +1347,13 @@ class KimiK3MoE(nn.Module):
         # The front hands routed_input over as a strided view of the merged
         # front output; MegaMoE's pre-dispatch wants dense bf16 rows (also for
         # an empty block, which ranks past the last row get at small batches).
-        block = routed_input[start:end].to(torch.bfloat16).contiguous()
+        if end > start:
+            block = routed_input[start:end].to(torch.bfloat16).contiguous()
+        else:
+            # torch treats an empty view as contiguous and keeps its strides
+            block = routed_input.new_empty(
+                (0, routed_input.shape[1]), dtype=torch.bfloat16
+            )
         y = self._forward_mega_experts(block, shard)
         latent.zero_()
         if end > start:
