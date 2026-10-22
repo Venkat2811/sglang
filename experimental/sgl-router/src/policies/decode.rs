@@ -5,8 +5,7 @@
 
 use crate::config::DecodePolicyKind;
 use crate::policies::admission::{
-    compare_decode_engines, resolve_decode, CandidateDomain, DecisionReason, FinalDecision,
-    RoutingStage,
+    compare_decode_engines, resolve_decode, CandidateDomain, FinalDecision,
 };
 use crate::policies::registry::select_decode_with_affinity;
 use crate::policies::{ProposalKind, SelectionProposal};
@@ -82,41 +81,14 @@ impl DecodePolicy for DecodeRoundRobinPolicy {
     }
 }
 
-/// Resolves decode admission and degrades to Power-of-Two when capacity is exhausted.
+/// Compatibility entry point: decode capacity is scheduled by the engine.
 pub fn resolve_decode_with_capacity_fallback(
     domain: &CandidateDomain,
     proposal: &SelectionProposal,
     request_kv_tokens: u64,
     snapshot: &EngineReportedLoadSnapshot,
 ) -> Option<FinalDecision> {
-    if let Some(decision) = resolve_decode(domain, proposal, request_kv_tokens, snapshot) {
-        return Some(decision);
-    }
-    if domain.stage != RoutingStage::Decode
-        || !domain
-            .workers
-            .iter()
-            .any(|worker| worker.id == proposal.primary.id)
-    {
-        return None;
-    }
-
-    let fallback = DecodePowerOfTwoPolicy::new().propose(
-        domain,
-        &DecodeSelectionContext::new().with_load_snapshot(snapshot),
-    )?;
-    Some(FinalDecision {
-        selected: fallback.primary,
-        primary: Arc::clone(&proposal.primary),
-        backup: proposal
-            .backup
-            .as_ref()
-            .filter(|backup| domain.workers.iter().any(|worker| worker.id == backup.id))
-            .cloned(),
-        reason: DecisionReason::CapacityFallbackPowerOfTwo,
-        candidate_range_id: domain.id.clone(),
-        load_snapshot_version: snapshot.version,
-    })
+    resolve_decode(domain, proposal, request_kv_tokens, snapshot)
 }
 
 /// Samples two workers from a decode domain and orders them by decode pressure.
