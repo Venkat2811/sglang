@@ -37,7 +37,7 @@ from sglang.srt.runtime_context import (
     override_platform,
     reset_context,
 )
-from sglang.srt.server_args import _declared_default
+from sglang.srt.server_args import ServerArgs, _declared_default
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -4002,6 +4002,33 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(updates, {})
         self.assertEqual(envs.SGLANG_VLM_CACHE_SIZE_MB.get(), 512)
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
+
+
+class TestKimiK3BatchOverlapGuard(CustomTestCase):
+    def test_batch_overlap_flags_are_refused_at_startup(self):
+        """Kimi-K3's forward runs neither overlap, while two-batch overlap
+        still splits every batch; either flag must stop the launch."""
+
+        def declarations(architecture, **flags):
+            return collect_model_override_declarations(
+                architecture,
+                ServerArgs(model_path="dummy", device="cpu", **flags),
+                hf_config=SimpleNamespace(quantization_config=None),
+            )
+
+        for architecture in (
+            "KimiK3ForConditionalGeneration",
+            "KimiK3LinearForCausalLM",
+        ):
+            for flag in ("enable_two_batch_overlap", "enable_single_batch_overlap"):
+                with (
+                    self.subTest(architecture=architecture, flag=flag),
+                    self.assertRaisesRegex(
+                        ValueError, "two-batch or single-batch overlap"
+                    ),
+                ):
+                    declarations(architecture, **{flag: True})
+            declarations(architecture)
 
 
 if __name__ == "__main__":
