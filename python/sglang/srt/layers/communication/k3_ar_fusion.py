@@ -135,7 +135,10 @@ def _max_buffer_rows() -> int:
     schedule = ctx.get_schedule()
     chunked = schedule.chunked_prefill_size
     if chunked is not None and chunked > 0:
-        return int(chunked)
+        # Under attention DP the MoE all-reduce runs on every DP group's rows
+        # gathered together, so the buffer needs chunk x attn_dp_size rows.
+        attn_dp_size = int(getattr(ctx.get_parallel(), "attn_dp_size", 1) or 1)
+        return int(chunked) * max(1, attn_dp_size)
     return int(schedule.max_prefill_tokens or 0)
 
 
