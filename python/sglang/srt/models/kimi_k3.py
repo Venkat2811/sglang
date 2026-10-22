@@ -76,6 +76,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import route_quant_handoff
+from sglang.srt.models import kimi_k3_expert_perm as _k3_perm
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import (
@@ -465,6 +466,11 @@ class KimiK3MoE(nn.Module):
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
         self.alt_stream = alt_stream
+        self._num_hidden_layers = config.num_hidden_layers
+        self._num_routed_experts = getattr(
+            config, "n_routed_experts", config.num_experts
+        )
+        self._mask_pad_routing = _k3_perm.mask_pad_routing_enabled()
 
         self.use_latent_moe = _uses_latent_moe(config)
         # Merged front weight ([H, gate_up + E + latent]), built after weight
@@ -1295,11 +1301,28 @@ class KimiK3MoE(nn.Module):
             and self.experts.moe_runner_config.activation == "situ"
         )
 
+    def _stage_route_quant(self, routed_input):
+        route_quant_handoff.stage(
+            routed_input,
+            num_valid=(
+                _k3_perm.num_token_non_padded() if self._mask_pad_routing else None
+            ),
+        )
+
+    def _record_routing(self, topk_output):
+        _k3_perm.maybe_record(
+            self.layer_idx,
+            self._num_hidden_layers,
+            self._num_routed_experts,
+            getattr(topk_output, "topk_ids", None),
+        )
+
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
         if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input)
+            self._stage_route_quant(routed_input)
         try:
             topk_output = self.topk(hidden_states, router_logits)
+            self._record_routing(topk_output)
             with zero_copy_context.set_moe_output(latent):
                 expert_output = self.experts(routed_input, topk_output)
         finally:
@@ -1313,9 +1336,10 @@ class KimiK3MoE(nn.Module):
         expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
         all-reduce."""
         if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input)
+            self._stage_route_quant(routed_input)
         try:
             topk_output = self.topk(hidden_states, router_logits)
+            self._record_routing(topk_output)
             return self.experts.forward_deferred_finalize(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
@@ -2811,6 +2835,7 @@ class KimiK3LinearModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        _k3_perm.set_forward_ctx(forward_batch)
         if get_parallel().pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -3264,6 +3289,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 )
                 if expert_entry is not None:
                     param_name, weight_name, expert_id, shard_id = expert_entry
+                    expert_id = _k3_perm.slot_of(layer_id, expert_id)
                     name = name.replace(weight_name, param_name)
                     # Skip experts of layers outside a truncated config (e.g.
                     # num_hidden_layers override), mirroring the non-expert
@@ -3388,6 +3414,8 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer, PPMissingLayer):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
+                # Before the merge: the merged front views the gate rows.
+                _k3_perm.permute_router_(layer.mlp, layer.mlp.layer_idx)
                 layer.mlp._merge_front_weights()
                 # Convert the correction bias to fp32 once so the per-call
                 # .to(float32) in topk is a no-op, not one upcast kernel per
@@ -3398,6 +3426,12 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
+        # The routing counter's buffers must exist before CUDA-graph capture.
+        if self.config.is_moe:
+            _k3_perm.recorder(
+                self.config.num_hidden_layers,
+                getattr(self.config, "n_routed_experts", self.config.num_experts),
+            )
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(

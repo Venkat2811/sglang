@@ -37,6 +37,8 @@ import torch
 class _Handoff(msgspec.Struct):
     # staged by the model layer: the activation rows the runner will quantize
     request_x: Optional[torch.Tensor] = None
+    # staged with it: rows at and past this device scalar are graph padding
+    request_num_valid: Optional[torch.Tensor] = None
     # published by the routing dispatch, keyed by the staged activations
     produced_x: Optional[torch.Tensor] = None
     packed: Optional[torch.Tensor] = None
@@ -47,15 +49,18 @@ class _Handoff(msgspec.Struct):
 _handoff = _Handoff()
 
 
-def stage(x: torch.Tensor) -> None:
+def stage(x: torch.Tensor, num_valid: Optional[torch.Tensor] = None) -> None:
     """Publish the routed activations for the upcoming topk call. Caller pairs
-    this with clear() after the experts call (try/finally)."""
+    this with clear() after the experts call (try/finally). ``num_valid`` masks
+    padded rows out of the routing (id -1, weight 0)."""
     _handoff.request_x = x
+    _handoff.request_num_valid = num_valid
     _handoff.produced_x = None
 
 
 def clear() -> None:
     _handoff.request_x = None
+    _handoff.request_num_valid = None
     _handoff.produced_x = None
     _handoff.packed = None
     _handoff.x_q = None
@@ -97,8 +102,10 @@ def try_route_quant_fused(
             routed_scaling_factor if routed_scaling_factor is not None else 1.0
         ),
         apply_scale=apply_routed_scaling_factor_on_output,
+        num_valid=_handoff.request_num_valid,
     )
     _handoff.request_x = None
+    _handoff.request_num_valid = None
     _handoff.produced_x = x
     _handoff.packed = packed
     _handoff.x_q = x_q

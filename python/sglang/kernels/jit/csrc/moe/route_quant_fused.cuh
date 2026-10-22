@@ -74,7 +74,9 @@ struct RouteQuantFusedKernel {
       int64_t topk,
       double routed_scaling_factor,
       bool renormalize,
-      bool apply_scale) {
+      bool apply_scale,
+      const tvm::ffi::TensorView num_valid,
+      bool has_num_valid) {
     using namespace host;
     using Trait = RouteQuantTrait;
 
@@ -117,7 +119,10 @@ struct RouteQuantFusedKernel {
     const auto M = static_cast<uint32_t>(M_.unwrap());
     if (M == 0) return;
 
-    const auto params = RouteQuantFusedParams{
+    if (has_num_valid) {
+      TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(num_valid);
+    }
+    auto params = RouteQuantFusedParams{
         .route =
             {scores.data_ptr(),
              static_cast<const fp32_t*>(bias.data_ptr()),
@@ -135,6 +140,7 @@ struct RouteQuantFusedKernel {
              /*sorted=*/0},
         .quant = quant_params,
     };
+    if (has_num_valid) params.route.num_valid = static_cast<const int32_t*>(num_valid.data_ptr());
 
 #define SGL_ROUTE_QUANT_LAUNCH(TS, TX)                                    \
   LaunchKernel(2 * M, LargeRouterRadixTrait::kBlockSize, device.unwrap()) \
