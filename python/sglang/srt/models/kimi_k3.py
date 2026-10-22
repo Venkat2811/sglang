@@ -1344,7 +1344,11 @@ class KimiK3MoE(nn.Module):
             topk_ids=topk_output.topk_ids[start:end],
             topk_weights=topk_output.topk_weights[start:end],
         )
-        y = self._forward_mega_experts(routed_input[start:end], shard)
+        # The front hands routed_input over as a strided view of the merged
+        # front output; MegaMoE's pre-dispatch wants dense bf16 rows (also for
+        # an empty block, which ranks past the last row get at small batches).
+        block = routed_input[start:end].to(torch.bfloat16).contiguous()
+        y = self._forward_mega_experts(block, shard)
         latent.zero_()
         if end > start:
             latent[start:end].copy_(y)
