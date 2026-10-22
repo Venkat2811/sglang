@@ -52,7 +52,7 @@ def launch_context(server_cls):
         patch.object(
             server_module,
             "get_serving",
-            return_value=SimpleNamespace(host="::", port=30000),
+            return_value=SimpleNamespace(host="::", port=30000, enable_cache_report=True),
         ),
         patch.object(
             server_module, "_build_server_args", return_value=sentinel.args
@@ -62,6 +62,31 @@ def launch_context(server_cls):
 
 
 class TestRustServerExtension(CustomTestCase):
+    def test_launch_requires_cache_reporting_before_binding(self):
+        """A serving process must not silently omit cached-token billing data."""
+        extension = ModuleType("cache_server")
+        extension.Server = Mock()
+        extension.RUST_SERVER_WIRE_VERSION = server_module.RUST_SERVER_WIRE_VERSION
+
+        class CacheServer(RustServer):
+            @classmethod
+            def _load_extension(cls):
+                return extension
+
+        scheduler = SimpleNamespace(model_config=SimpleNamespace(is_multimodal=False))
+        for serving in [
+            SimpleNamespace(host="::", port=30000),
+            SimpleNamespace(host="::", port=30000, enable_cache_report=False),
+        ]:
+            with (
+                self.subTest(serving=serving),
+                launch_context(CacheServer),
+                patch.object(server_module, "get_serving", return_value=serving),
+                self.assertRaisesRegex(RuntimeError, "--enable-cache-report"),
+            ):
+                CacheServer.launch(scheduler)
+        extension.Server.assert_not_called()
+
     def test_launch_refuses_an_unversioned_or_incompatible_extension(self):
         """A mixed Python/extension pair must fail before accepting generation."""
         for version in [None, 0, 999]:

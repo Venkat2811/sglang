@@ -163,6 +163,12 @@ class RustServer:
                 "Install the matching Python code and Rust extension together."
             )
 
+        if not getattr(get_serving(), "enable_cache_report", False):
+            raise RuntimeError(
+                "The Rust server requires --enable-cache-report to include "
+                "cached_tokens in response usage."
+            )
+
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 

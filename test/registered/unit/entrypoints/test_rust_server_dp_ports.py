@@ -164,6 +164,7 @@ def test_dp_leaders_reuse_node_local_ports(
             ep_join_mode=ep_join_mode,
             host="0.0.0.0",
             port=30000,
+            enable_cache_report=True,
         ),
         patch.object(rust_extensions, "load_rust_extension") as extension,
         patch.object(rust_server, "_partition_cores", return_value=(None, None)),
