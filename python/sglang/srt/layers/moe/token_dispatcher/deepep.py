@@ -953,6 +953,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 **overlap_args_dict,
+                **(
+                    dict(use_logfmt=True)
+                    if envs.SGLANG_DEEPEP_LL_COMBINE_LOGFMT.get()
+                    else {}
+                ),
             )
 
         self.packed_recv_count = self.handle = None

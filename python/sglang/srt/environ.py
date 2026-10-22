@@ -1333,6 +1333,9 @@ class Envs:
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
     SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND = EnvBool(None)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
+    # Timing experiment: DeepEP low-latency combine in DeepEP's LogFMT wire format (10 bits per value,
+    # dynamic per-64-channel cast) instead of bf16. Off by default; accuracy is model dependent.
+    SGLANG_DEEPEP_LL_COMBINE_LOGFMT = EnvBool(False)
     # A5 DSV4 FP4 + DeepEP low-latency dispatch wire format. This is read only
     # by the model-specific dispatcher configuration; all other paths retain
     # their existing behavior.
