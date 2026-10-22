@@ -173,6 +173,7 @@ pub struct SelectionContext<'a> {
     prefill_cache_bucket: Option<(&'a BucketSelector, BucketRequest)>,
     affinity_lookup_enabled: bool,
     affinity_assignment_enabled: bool,
+    pub(crate) round_robin: Arc<round_robin::RequestRotation>,
 }
 
 impl<'a> SelectionContext<'a> {
@@ -191,6 +192,7 @@ impl<'a> SelectionContext<'a> {
             prefill_cache_bucket: None,
             affinity_lookup_enabled: true,
             affinity_assignment_enabled: true,
+            round_robin: Arc::default(),
         }
     }
 
@@ -213,7 +215,16 @@ impl<'a> SelectionContext<'a> {
             prefill_cache_bucket: None,
             affinity_lookup_enabled: true,
             affinity_assignment_enabled: true,
+            round_robin: Arc::default(),
         }
+    }
+
+    pub(crate) fn with_round_robin_rotation(
+        mut self,
+        rotation: Arc<round_robin::RequestRotation>,
+    ) -> Self {
+        self.round_robin = rotation;
+        self
     }
 
     /// Attaches ingress-computed routing tokens.

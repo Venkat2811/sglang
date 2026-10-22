@@ -12,13 +12,14 @@ use crate::policies::registry::select_decode_with_affinity;
 use crate::policies::{ProposalKind, SelectionProposal};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use rand::Rng;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 #[derive(Debug, Default)]
 pub struct DecodeSelectionContext<'a> {
     load_snapshot: Option<&'a EngineReportedLoadSnapshot>,
     prefill_url: Option<&'a str>,
+    rotation: super::round_robin::RequestRotation,
 }
 
 impl<'a> DecodeSelectionContext<'a> {
@@ -26,6 +27,7 @@ impl<'a> DecodeSelectionContext<'a> {
         Self {
             load_snapshot: None,
             prefill_url: None,
+            rotation: Default::default(),
         }
     }
 
@@ -67,7 +69,7 @@ impl DecodePolicy for DecodeRoundRobinPolicy {
     fn propose(
         &self,
         domain: &CandidateDomain,
-        _ctx: &DecodeSelectionContext<'_>,
+        ctx: &DecodeSelectionContext<'_>,
     ) -> Option<SelectionProposal> {
         if domain.workers.is_empty() {
             return None;
@@ -75,7 +77,7 @@ impl DecodePolicy for DecodeRoundRobinPolicy {
         // Registry iteration order must not change the rotation between requests.
         let mut workers: Vec<_> = domain.workers.iter().collect();
         workers.sort_unstable_by(|a, b| a.id.0.cmp(&b.id.0));
-        let index = self.counter.fetch_add(1, Ordering::Relaxed) % workers.len();
+        let index = ctx.rotation.ticket(&self.counter) % workers.len();
         Some(SelectionProposal::primary(Arc::clone(workers[index])))
     }
 }

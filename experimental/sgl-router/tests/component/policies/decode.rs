@@ -60,6 +60,7 @@ fn recipe_round_robin_decode_cycles_independently_of_load_and_iteration_order() 
         .propose(&CandidateDomain::global_decode(&[]), &context)
         .is_none());
     for i in 0..8 {
+        let context = DecodeSelectionContext::new();
         let candidates = if i % 2 == 0 {
             vec![first.clone(), second.clone()]
         } else {
@@ -203,4 +204,28 @@ fn decode_all_capacity_rejected_falls_back_to_power_of_two_within_domain() {
 
     assert_eq!(decision.selected.id, primary.id);
     assert_eq!(decision.reason, DecisionReason::CapacityFallbackPowerOfTwo);
+}
+
+#[test]
+fn decode_rung_proposals_advance_once_per_request() {
+    use sgl_router::policies::decode::DecodeRoundRobinPolicy;
+    let policy = DecodeRoundRobinPolicy::default();
+    let workers = vec![worker("d0"), worker("d1")];
+    let domain = CandidateDomain::global_decode(&workers);
+    let request = DecodeSelectionContext::new();
+    for _ in 0..3 {
+        assert_eq!(
+            policy.propose(&domain, &request).unwrap().primary.id.0,
+            "d0"
+        );
+    }
+    assert_eq!(
+        policy
+            .propose(&domain, &DecodeSelectionContext::new())
+            .unwrap()
+            .primary
+            .id
+            .0,
+        "d1"
+    );
 }

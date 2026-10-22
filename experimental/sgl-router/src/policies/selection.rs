@@ -167,6 +167,7 @@ pub(crate) fn select_prefill_worker(
         },
         failure_reason: PolicySelectionFailureReason::ProposalEmpty,
         cache_gate_audit: None,
+        round_robin: Arc::default(),
         // E: the input beyond the longest prefix any prefill worker can reuse.
         // None (cold) when nothing is reusable.
         uncached_tokens: inputs
@@ -211,6 +212,7 @@ fn best_reusable_tokens(inputs: &PrefillSelectionInputs<'_>) -> u64 {
 /// the last rung to record any gave — a rung that returns `None` without
 /// recording leaves the previous reason standing.
 struct Selector<'a> {
+    round_robin: Arc<super::round_robin::RequestRotation>,
     inputs: &'a PrefillSelectionInputs<'a>,
     bucket_request: BucketRequest,
     failure_reason: PolicySelectionFailureReason,
@@ -425,6 +427,7 @@ impl<'a> Selector<'a> {
     fn base_context(&self, candidate_range_id: &'a str) -> SelectionContext<'a> {
         let inputs = self.inputs;
         SelectionContext::with_routing_key(inputs.model_id, inputs.body, inputs.routing_key)
+            .with_round_robin_rotation(Arc::clone(&self.round_robin))
             .with_session_id(inputs.session_id)
             .with_candidate_range_id(candidate_range_id)
             .with_input_tokens(inputs.request_input_tokens)
@@ -1065,6 +1068,64 @@ mod tests {
             tps_slo: None,
             session_affinity_mode: SessionAffinityMode::Bucket,
         }
+    }
+
+    #[test]
+    fn prefill_capacity_fallback_retains_one_round_robin_ticket() {
+        #[derive(Debug, Default)]
+        struct SharedRoundRobin(crate::policies::round_robin::RoundRobinPolicy);
+        impl Policy for SharedRoundRobin {
+            fn select(
+                &self,
+                workers: &[Arc<Worker>],
+                context: &crate::policies::SelectionContext<'_>,
+            ) -> Option<Arc<Worker>> {
+                self.0.select(workers, context)
+            }
+            fn uses_shared_prefill_admission(&self) -> bool {
+                true
+            }
+        }
+        let policy = SharedRoundRobin::default();
+        let first = worker("p0");
+        let second = worker("p1");
+        let workers = vec![first.clone(), second.clone()];
+        let full = snapshot(&[(&first, 100, 100), (&second, 100, 100)]);
+        let free = snapshot(&[(&first, 0, 10000), (&second, 0, 10000)]);
+        let buckets = BucketSelector::new(None);
+        let metrics = MetricsRegistry::new();
+        let model = ModelId("model".into());
+        let mut inputs = prefill_inputs(
+            &policy,
+            &buckets,
+            &metrics,
+            &model,
+            &workers,
+            Some(&full),
+            1000,
+        );
+        inputs.policy_kind = PolicyKind::RoundRobin;
+        assert!(select_prefill_worker(&inputs).is_ok());
+        inputs.load_snapshot = Some(&free);
+        assert_eq!(select_prefill_worker(&inputs).unwrap().id.0, "p1");
+    }
+
+    #[test]
+    fn decode_capacity_fallback_does_not_skip_the_next_round_robin_request() {
+        let policy = crate::policies::decode::DecodeRoundRobinPolicy::default();
+        let first = worker("d0");
+        let second = worker("d1");
+        let workers = vec![first.clone(), second.clone()];
+        let full = snapshot(&[(&first, 100, 100), (&second, 100, 100)]);
+        let free = snapshot(&[(&first, 0, 10000), (&second, 0, 10000)]);
+        let buckets = BucketSelector::new(None);
+        let model = ModelId("model".into());
+        let mut inputs = decode_inputs(&buckets, &model, &workers, Some(&full), 1000);
+        inputs.decode_policy = &policy;
+        inputs.decode_policy_kind = DecodePolicyKind::RoundRobin;
+        assert!(select_decode_peer(&inputs).is_some());
+        inputs.load_snapshot = Some(&free);
+        assert_eq!(select_decode_peer(&inputs).unwrap().id.0, "d1");
     }
 
     fn decode_inputs<'a>(
