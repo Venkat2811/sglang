@@ -1290,6 +1290,10 @@ class Envs:
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # DeepEP LL -> flashinfer_mxfp4 adapter: bound the compacted rows by this
+    # rank's token count (safe only when every EP rank dispatches at most as many
+    # tokens, e.g. one DP group with equal SP-MoE shards).
+    SGLANG_DEEPEP_MXFP4_UNIFORM_ROWS = EnvBool(False)
     # Per-rank buffer capacity, not a model token limit.
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.

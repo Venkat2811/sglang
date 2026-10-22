@@ -136,6 +136,14 @@ class DeepEPMoE(FusedMoE):
             # route through the modern FusedMoE runner (Mxfp4MoEMethod.apply).
             self.deprecate_flag = True
         elif (
+            get_moe_runner_backend().is_flashinfer_mxfp4()
+            and quant_config is not None
+            and quant_config.get_name() == "mxfp4"
+        ):
+            # MXFP4 experts on the trtllm-gen runner: Mxfp4MoEMethod.apply runs the
+            # DeepEP LL adapter (flashinfer_mxfp4_deepep).
+            self.deprecate_flag = True
+        elif (
             quant_config is None
             and self.w13_weight.dtype == torch.bfloat16
             and get_moe_runner_backend().is_deep_gemm()

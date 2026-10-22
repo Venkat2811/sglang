@@ -1553,12 +1553,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             FlashInferTrtllmGenMxfp4MoeQuantInfo,
         )
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         routing_bias = layer._situ_routing_bias_bf16
-        topk_output = dispatch_output.topk_output
+        # DeepEP outputs carry topk_ids / topk_weights, not a topk_output.
+        topk_output = (
+            None
+            if DispatchOutputChecker.format_is_deepep(dispatch_output)
+            else dispatch_output.topk_output
+        )
         if (
-            self.moe_runner_config.activation == "situ"
+            topk_output is not None
+            and self.moe_runner_config.activation == "situ"
             and routing_bias is None
             and TopKOutputChecker.format_is_bypassed(topk_output)
         ):
@@ -1622,6 +1629,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # topk_ids/topk_weights directly and have no `.topk_output` to unpack.
         if _use_aiter and DispatchOutputChecker.format_is_deepep(dispatch_output):
             return self._apply_aiter(layer, dispatch_output)
+        if self._fi_kernel == "trtllm_sm100" and DispatchOutputChecker.format_is_deepep(
+            dispatch_output
+        ):
+            return self._apply_sm100_trtllm_gen(layer, dispatch_output)
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output

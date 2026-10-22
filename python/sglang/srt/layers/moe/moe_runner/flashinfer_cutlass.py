@@ -29,6 +29,10 @@ from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.base import (
+        CombineInput,
+        DispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
         FlashinferDispatchOutput,
@@ -396,6 +400,35 @@ def fused_experts_none_to_flashinfer_mxfp4(
         )
     raise TypeError(
         f"Unexpected quant_info type for flashinfer_mxfp4: {type(quant_info)}"
+    )
+
+
+@register_fused_func("deepep", "flashinfer_mxfp4")
+def fused_experts_deepep_to_flashinfer_mxfp4(
+    dispatch_output: DispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> CombineInput:
+    """DeepEP low-latency dispatch into the SM100 trtllm-gen MXFP4 experts."""
+    from sglang.srt.layers.moe.moe_runner.flashinfer_mxfp4_deepep import (
+        fused_experts_deepep_ll_to_flashinfer_mxfp4,
+    )
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        FlashInferTrtllmGenMxfp4MoeQuantInfo,
+    )
+    from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+    if not DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+        raise NotImplementedError(
+            "flashinfer_mxfp4 with DeepEP supports only the low_latency dispatch; "
+            "pass --deepep-mode low_latency."
+        )
+    if not isinstance(quant_info, FlashInferTrtllmGenMxfp4MoeQuantInfo):
+        raise TypeError(
+            f"DeepEP + flashinfer_mxfp4 needs the SM100 trtllm-gen path, got {type(quant_info)}"
+        )
+    return fused_experts_deepep_ll_to_flashinfer_mxfp4(
+        dispatch_output, quant_info, runner_config
     )
 
 
