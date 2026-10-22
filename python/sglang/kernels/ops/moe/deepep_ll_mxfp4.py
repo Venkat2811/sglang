@@ -118,12 +118,107 @@ def _deepep_ll_scatter_kernel(
         tl.store(out_ptr + r.to(tl.int64) * H + ho, v, mask=hm)
 
 
+@triton.jit
+def _deepep_ll_gather_mxfp8_by_expert_kernel(
+    x_ptr,
+    xs_ptr,
+    cnt_ptr,
+    xc_ptr,
+    sc_ptr,
+    ids_ptr,
+    rowmap_ptr,
+    stride_xe,
+    stride_xr,
+    stride_se,
+    stride_sr,
+    stride_sg,
+    R,
+    num_rows,
+    invalid_packed,
+    E: tl.constexpr,
+    E_PAD: tl.constexpr,
+    H: tl.constexpr,
+    H_PAD: tl.constexpr,
+    NSF: tl.constexpr,
+    NSF_PAD: tl.constexpr,
+    WEIGHT_BITS: tl.constexpr,
+    FILL_BLOCK: tl.constexpr,
+):
+    # programs [0, E): copy expert e's valid slots; programs [E, ...): write the padding ids
+    pid = tl.program_id(0)
+    eo = tl.arange(0, E_PAD)
+    cnt = tl.load(cnt_ptr + eo, mask=eo < E, other=0)
+    cnt = tl.minimum(tl.maximum(cnt, 0), R)
+    incl = tl.cumsum(cnt, axis=0)
+    if pid < E:
+        n = tl.sum(tl.where(eo == pid, cnt, 0), axis=0)
+        start = tl.sum(tl.where(eo == pid, incl - cnt, 0), axis=0)
+        ho = tl.arange(0, H_PAD)
+        hm = ho < H
+        co = tl.arange(0, NSF_PAD)
+        cm = co < NSF
+        q = co // 4
+        for s in range(0, n):
+            j = start + s
+            if j < num_rows:
+                src = x_ptr + pid.to(tl.int64) * stride_xe + s.to(tl.int64) * stride_xr
+                v = tl.load(src + ho, mask=hm)
+                tl.store(xc_ptr + j.to(tl.int64) * H + ho, v, mask=hm)
+                w = tl.load(
+                    xs_ptr + pid * stride_se + s * stride_sr + (q // 4) * stride_sg,
+                    mask=cm,
+                    other=0,
+                )
+                b = (w >> ((q % 4) * 8)) & 0xFF
+                tl.store(sc_ptr + j.to(tl.int64) * NSF + co, b.to(tl.uint8), mask=cm)
+                tl.store(ids_ptr + j, (pid << 16) | WEIGHT_BITS)
+                tl.store(rowmap_ptr + j, pid * R + s)
+    else:
+        total = tl.sum(cnt, axis=0)
+        fo = (pid - E) * FILL_BLOCK + tl.arange(0, FILL_BLOCK)
+        fm = (fo >= total) & (fo < num_rows)
+        tl.store(ids_ptr + fo, tl.full([FILL_BLOCK], 0, tl.int32) + invalid_packed, mask=fm)
+        tl.store(rowmap_ptr + fo, tl.full([FILL_BLOCK], -1, tl.int32), mask=fm)
+
+
+@triton.jit
+def _deepep_ll_scatter_by_expert_kernel(
+    src_ptr,
+    perm_ptr,
+    cnt_ptr,
+    out_ptr,
+    stride_src,
+    R,
+    num_rows,
+    E: tl.constexpr,
+    E_PAD: tl.constexpr,
+    H: tl.constexpr,
+    H_PAD: tl.constexpr,
+):
+    e = tl.program_id(0)
+    eo = tl.arange(0, E_PAD)
+    cnt = tl.load(cnt_ptr + eo, mask=eo < E, other=0)
+    cnt = tl.minimum(tl.maximum(cnt, 0), R)
+    incl = tl.cumsum(cnt, axis=0)
+    n = tl.sum(tl.where(eo == e, cnt, 0), axis=0)
+    start = tl.sum(tl.where(eo == e, incl - cnt, 0), axis=0)
+    ho = tl.arange(0, H_PAD)
+    hm = ho < H
+    for s in range(0, n):
+        j = start + s
+        if j < num_rows:
+            p = tl.load(perm_ptr + j)
+            v = tl.load(src_ptr + p.to(tl.int64) * stride_src + ho, mask=hm)
+            tl.store(out_ptr + (e * R + s).to(tl.int64) * H + ho, v, mask=hm)
+
+
 def deepep_ll_gather_mxfp8(
     x: torch.Tensor,
     x_scale_packed: torch.Tensor,
     masked_m: torch.Tensor,
     num_rows: int,
     invalid_id: int,
+    by_row: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compact DeepEP LL FP8 slab rows into trtllm-gen MXFP8 rows.
 
@@ -144,6 +239,35 @@ def deepep_ll_gather_mxfp8(
     ids = torch.empty((num_rows, 1), dtype=torch.int32, device=dev)
     row_map = torch.empty((num_rows,), dtype=torch.int32, device=dev)
     invalid_packed = (invalid_id << 16) | _BF16_ONE_BITS
+    if not by_row:
+        fill_block = 1024
+        _deepep_ll_gather_mxfp8_by_expert_kernel[(E + triton.cdiv(num_rows, fill_block),)](
+            x.view(torch.uint8),
+            x_scale_packed,
+            masked_m,
+            xc.view(torch.uint8),
+            sc,
+            ids,
+            row_map,
+            x.stride(0),
+            x.stride(1),
+            x_scale_packed.stride(0),
+            x_scale_packed.stride(1),
+            x_scale_packed.stride(2),
+            R,
+            num_rows,
+            invalid_packed,
+            E=E,
+            E_PAD=triton.next_power_of_2(E),
+            H=H,
+            H_PAD=triton.next_power_of_2(H),
+            NSF=nsf,
+            NSF_PAD=triton.next_power_of_2(nsf),
+            WEIGHT_BITS=_BF16_ONE_BITS,
+            FILL_BLOCK=fill_block,
+            num_warps=4,
+        )
+        return xc, sc.view(torch.float8_e4m3fn), ids, row_map
     _deepep_ll_gather_mxfp8_kernel[(num_rows,)](
         x.view(torch.uint8),
         x_scale_packed,
@@ -176,13 +300,32 @@ def deepep_ll_scatter(
     row_map: torch.Tensor,
     out: torch.Tensor,
     perm: Optional[torch.Tensor] = None,
+    masked_m: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """out.view(-1, H)[row_map[j]] = src[perm[j] if perm is not None else j]
-    for every compact row j with row_map[j] >= 0."""
+    for every compact row j with row_map[j] >= 0. With masked_m (and perm), one
+    program per expert walks only its valid slots."""
     H = out.shape[-1]
     assert out.is_contiguous() and src.shape[-1] == H and src.stride(-1) == 1
     assert src.dtype == out.dtype
     n = row_map.shape[0]
+    if masked_m is not None and perm is not None:
+        E, R, _ = out.shape
+        _deepep_ll_scatter_by_expert_kernel[(E,)](
+            src,
+            perm,
+            masked_m,
+            out,
+            src.stride(0),
+            R,
+            n,
+            E=E,
+            E_PAD=triton.next_power_of_2(E),
+            H=H,
+            H_PAD=triton.next_power_of_2(H),
+            num_warps=4,
+        )
+        return out
     _deepep_ll_scatter_kernel[(n,)](
         src,
         perm if perm is not None else row_map,
