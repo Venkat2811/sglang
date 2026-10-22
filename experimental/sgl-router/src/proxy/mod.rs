@@ -127,6 +127,7 @@ pub struct Proxy {
     pub request_timeout: Duration,
     /// Maximum silence between streamed upstream chunks; `None` waits forever.
     pub stream_idle_timeout: Option<Duration>,
+    forward_request_headers: Vec<HeaderName>,
 }
 
 /// Build a forwarding client for `protocol`, sharing pool/connect tuning
@@ -196,7 +197,17 @@ impl Proxy {
             h2c_client: build_client(WireProtocol::H2c)?,
             request_timeout,
             stream_idle_timeout: None,
+            forward_request_headers: Vec::new(),
         })
+    }
+
+    pub fn with_forward_request_headers(mut self, headers: Vec<HeaderName>) -> Self {
+        self.forward_request_headers = headers;
+        self
+    }
+
+    fn forwards_header(&self, name: &HeaderName) -> bool {
+        should_forward_request_header(name) || self.forward_request_headers.contains(name)
     }
 
     pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
@@ -287,7 +298,7 @@ impl Proxy {
         })?;
         let mut req = self.client_for(protocol).post(url.clone()).body(body);
         for (k, v) in headers {
-            if should_forward_request_header(k) {
+            if self.forwards_header(k) {
                 req = req.header(k, v);
             }
         }
@@ -388,7 +399,7 @@ impl Proxy {
         })?;
         let mut req = self.client_for(protocol).post(url.clone()).body(body);
         for (k, v) in headers {
-            if should_forward_request_header(k) {
+            if self.forwards_header(k) {
                 req = req.header(k, v);
             }
         }

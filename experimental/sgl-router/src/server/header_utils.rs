@@ -17,8 +17,6 @@ pub fn should_forward_request_header(name: &HeaderName) -> bool {
             | "traceparent"
             | "tracestate"
             | "x-attempt-id"
-            | "x-maas-backend"
-            | "x-maas-admission"
             | "x-dynamo-session-id"
             // Set by `--dp-aware`; chat dispatch strips the client's copy.
             | "x-data-parallel-rank"
@@ -144,12 +142,7 @@ mod tests {
 mod gateway_tests {
     #[test]
     fn gateway_correlation_headers_are_forwarded() {
-        for name in [
-            "x-attempt-id",
-            "x-maas-backend",
-            "x-maas-admission",
-            "x-dynamo-session-id",
-        ] {
+        for name in ["x-attempt-id", "x-dynamo-session-id"] {
             assert!(
                 super::should_forward_request_header(&axum::http::HeaderName::from_static(name)),
                 "{name}"

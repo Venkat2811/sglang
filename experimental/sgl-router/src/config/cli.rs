@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::Parser;
-use reqwest::header::HeaderValue;
+use reqwest::header::{HeaderName, HeaderValue};
 use std::num::NonZeroU32;
 
 use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
@@ -154,6 +154,10 @@ pub struct ServerArgs {
     /// `/model_info`). Set it to the engines' `--api-key`.
     #[arg(long)]
     pub worker_api_key: Option<String>,
+
+    /// Additional client header to forward to workers; repeat for each name.
+    #[arg(long = "forward-request-header", value_name = "HEADER")]
+    pub forward_request_headers: Vec<HeaderName>,
 
     /// Startup budget for resolving the served model from static workers.
     #[arg(long, default_value_t = 1800)]
@@ -724,6 +728,7 @@ impl Cli {
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
                 worker_auth,
+                forward_request_headers: self.server.forward_request_headers,
                 infer_model_from_workers,
                 worker_startup_timeout_secs: self.server.worker_startup_timeout_secs,
                 admission,
@@ -1149,7 +1154,7 @@ impl AffinityArgs {
             .session_id_header
             .clone()
             .unwrap_or(defaults.session_id_header);
-        axum::http::HeaderName::try_from(session_id_header.as_str()).map_err(|e| {
+        HeaderName::try_from(session_id_header.as_str()).map_err(|e| {
             anyhow!(
                 "--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}"
             )
@@ -1261,7 +1266,7 @@ impl AffinityArgs {
         }
         let defaults = StickyConfig::default();
         let header_name = self.routing_key_header.unwrap_or(defaults.header_name);
-        axum::http::HeaderName::try_from(header_name.as_str()).map_err(|e| {
+        HeaderName::try_from(header_name.as_str()).map_err(|e| {
             anyhow!("--routing-key-header {header_name:?} is not a valid HTTP header name: {e}")
         })?;
         let fallback_policy = self
@@ -3507,5 +3512,40 @@ mod tests {
             err.contains("cache candidate tuning flags require --policy cache_aware"),
             "got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod forward_header_tests {
+    use super::*;
+    #[test]
+    fn configured_forward_headers_are_validated_and_repeatable() {
+        let cli = Cli::try_parse_from([
+            "sgl-router",
+            "--model-id",
+            "m",
+            "--no-tokenizer",
+            "--forward-request-header",
+            "X-Client-Context",
+            "--forward-request-header",
+            "x-client-zone",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.server.forward_request_headers,
+            [
+                HeaderName::from_static("x-client-context"),
+                HeaderName::from_static("x-client-zone")
+            ]
+        );
+        assert!(Cli::try_parse_from([
+            "sgl-router",
+            "--model-id",
+            "m",
+            "--no-tokenizer",
+            "--forward-request-header",
+            "invalid header"
+        ])
+        .is_err());
     }
 }

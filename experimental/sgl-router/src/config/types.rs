@@ -1,5 +1,5 @@
 use crate::config::sampling::SamplingOverrides;
-use reqwest::header::HeaderValue;
+use reqwest::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
 use std::num::NonZeroU32;
 
@@ -314,6 +314,8 @@ pub struct ServerConfig {
     pub termination_grace_secs: Option<u64>,
     /// `Authorization` for the router's own requests to workers, from `--worker-api-key`.
     pub worker_auth: Option<HeaderValue>,
+    /// Additional client headers forwarded to workers.
+    pub forward_request_headers: Vec<HeaderName>,
     /// Resolve an omitted served-model name from worker metadata before loading the tokenizer.
     pub infer_model_from_workers: bool,
     pub worker_startup_timeout_secs: u64,
@@ -353,6 +355,7 @@ impl Default for ServerConfig {
             shutdown_drain_secs: default_shutdown_drain_secs(),
             termination_grace_secs: None,
             worker_auth: None,
+            forward_request_headers: Vec::new(),
             infer_model_from_workers: false,
             worker_startup_timeout_secs: 1800,
             admission: AdmissionConfig::default(),

@@ -132,6 +132,8 @@ async fn lifecycle_records_late_errors_and_admission_cleanup_with_bounded_metric
             &admin.to_string(),
             "--worker-api-key",
             "test-secret-value",
+            "--forward-request-header",
+            "x-client-context",
         ])
         .stdout(Stdio::from(log.as_file().try_clone().unwrap()))
         .stderr(Stdio::from(log.as_file().try_clone().unwrap()))
@@ -148,6 +150,8 @@ async fn lifecycle_records_late_errors_and_admission_cleanup_with_bounded_metric
         .header("traceparent", trace)
         .header("x-attempt-id", "attempt-unchanged")
         .header("x-dynamo-session-id", "session-unchanged")
+        .header("x-client-context", "context-unchanged")
+        .header("x-private-context", "must-not-forward")
         .json(&payload("late"))
         .send()
         .await
@@ -273,7 +277,10 @@ async fn lifecycle_records_late_errors_and_admission_cleanup_with_bounded_metric
                 && h.get("x-attempt-id")
                     .is_some_and(|v| v == "attempt-unchanged")
                 && h.get("x-dynamo-session-id")
-                    .is_some_and(|v| v == "session-unchanged")));
+                    .is_some_and(|v| v == "session-unchanged")
+                && h.get("x-client-context")
+                    .is_some_and(|v| v == "context-unchanged")
+                && !h.contains_key("x-private-context")));
     }
     let admin_base = format!("http://127.0.0.1:{admin}");
     assert_eq!(

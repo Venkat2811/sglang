@@ -11,7 +11,7 @@ use crate::config::SamplingField;
 use crate::server::error::{router_grpc_status, ApiError};
 use crate::server::header_utils::should_forward_request_header;
 use crate::workers::Worker;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, StatusCode};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
@@ -613,10 +613,10 @@ impl Drop for AbortOnDrop {
 }
 
 /// The headers the HTTP path forwards; the engine reads these as request headers.
-fn trace_headers(headers: &HeaderMap) -> HashMap<String, String> {
+fn trace_headers(headers: &HeaderMap, extra: &[HeaderName]) -> HashMap<String, String> {
     headers
         .iter()
-        .filter(|(name, _)| should_forward_request_header(name))
+        .filter(|(name, _)| should_forward_request_header(name) || extra.contains(name))
         .filter_map(|(name, value)| Some((name.to_string(), value.to_str().ok()?.to_owned())))
         .collect()
 }
@@ -651,7 +651,12 @@ impl Proxy {
         })?;
         let mut abort = AbortOnDrop::new(&client, abort_rid);
         abort.guards = stream_guards;
-        let call = rpc.call(client, body, additions, trace_headers(headers));
+        let call = rpc.call(
+            client,
+            body,
+            additions,
+            trace_headers(headers, &self.forward_request_headers),
+        );
         let failed = |status: &Status| status_breaker_outcome(status.code()).record(breaker);
         let respond = |status, replies: Vec<_>, mut abort: AbortOnDrop| {
             breaker_outcome(status).record(breaker);
@@ -733,6 +738,26 @@ impl Proxy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grpc_headers_include_only_standard_and_configured_names() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-client-context", "configured".parse().unwrap());
+        headers.insert("x-private-context", "unconfigured".parse().unwrap());
+        headers.insert("traceparent", "trace".parse().unwrap());
+        let extra = [HeaderName::from_static("x-client-context")];
+        let forwarded = trace_headers(&headers, &extra);
+        assert_eq!(
+            forwarded.get("x-client-context").map(String::as_str),
+            Some("configured")
+        );
+        assert_eq!(
+            forwarded.get("traceparent").map(String::as_str),
+            Some("trace")
+        );
+        assert!(!forwarded.contains_key("x-private-context"));
+        assert!(!trace_headers(&headers, &[]).contains_key("x-client-context"));
+    }
+
     use super::*;
 
     #[test]
