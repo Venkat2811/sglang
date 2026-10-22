@@ -54,14 +54,14 @@ impl ProxyConfig {
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
-    300
+    1800
 }
 
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
-            stream_idle_timeout_secs: 180,
+            stream_idle_timeout_secs: default_proxy_request_timeout_secs(),
             max_attempts: NonZeroU32::MIN,
             initial_backoff_ms: 50,
             max_backoff_ms: 2000,
@@ -71,7 +71,7 @@ impl Default for ProxyConfig {
     }
 }
 
-/// Request-tracking timeout; defaults above the proxy timeout.
+/// Request-tracking timeout; defaults to the proxy request budget.
 #[derive(Debug, Clone, Copy)]
 pub struct InflightLoadConfig {
     /// Maximum request-entry lifetime before cancellation with 504 `stale_request_expired`.
@@ -79,7 +79,7 @@ pub struct InflightLoadConfig {
 }
 
 pub fn default_stale_request_timeout_secs() -> u64 {
-    600
+    default_proxy_request_timeout_secs()
 }
 
 impl Default for InflightLoadConfig {

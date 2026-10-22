@@ -242,6 +242,12 @@ request's `--stale-request-timeout-secs` deadline, and none starts after it. Whe
 every eligible worker has failed, the client gets the last failure.
 `sgl_router_retries_total` counts the retried attempts.
 
+The request timeout defaults to 1800 seconds. Unless explicitly set,
+`--stream-idle-timeout-secs` and `--stale-request-timeout-secs` inherit that
+request timeout, including a caller's longer override. A long prefill or stream
+therefore does not encounter an independent, shorter default deadline. Explicit
+idle and lifetime budgets remain independent of the upstream header timeout.
+
 Each retry first waits out a jittered exponential backoff: a random delay in
 `[d/2, d]`, where `d` starts at `--retry-initial-backoff-ms` (default 50),
 doubles per retry, and is capped at `--retry-max-backoff-ms` (default 2000).

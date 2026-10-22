@@ -12,14 +12,14 @@ use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
 use crate::config::types::is_selector_empty;
 use crate::config::{
     default_cb_cool_down, default_cb_threshold, default_host, default_port,
-    default_proxy_request_timeout_secs, default_shutdown_drain_secs,
-    default_stale_request_timeout_secs, resolve_mode, AffinityConfig, AffinityMode, BalancedBy,
-    CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig, Config,
-    DecodePolicyKind, DiscoveryBackend, DpRankPolicy, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat,
-    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
-    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
-    DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    default_proxy_request_timeout_secs, default_shutdown_drain_secs, resolve_mode, AffinityConfig,
+    AffinityMode, BalancedBy, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind,
+    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, DpRankPolicy,
+    EligibilityConfig, FilterKind, FusedTerm, InflightLoadConfig, K8sDiscoveryConfig,
+    K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig,
+    StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig, DEFAULT_FUSE,
+    DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
 use crate::policies_reorg::admission::AdmissionLimits;
 use crate::policies_reorg::factory::AffinitySpec;
@@ -217,8 +217,9 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
     pub request_timeout_secs: u64,
     /// Maximum silence between upstream stream chunks, in seconds.
-    #[arg(long, default_value_t = ProxyConfig::default().stream_idle_timeout_secs)]
-    pub stream_idle_timeout_secs: u64,
+    /// Defaults to --request-timeout-secs unless explicitly overridden.
+    #[arg(long)]
+    pub stream_idle_timeout_secs: Option<u64>,
 
     /// Dispatch attempts per request, including the first. A request that fails
     /// before any response reaches the client (transport error, 5xx, 429) is
@@ -246,8 +247,9 @@ pub struct ServerArgs {
     /// Maximum in-flight request lifetime in seconds, including streaming responses.
     /// Expiry returns 504 `stale_request_expired` before response headers are sent;
     /// after streaming starts, it aborts the body without changing the HTTP status.
-    #[arg(long, default_value_t = default_stale_request_timeout_secs())]
-    pub stale_request_timeout_secs: u64,
+    /// Defaults to --request-timeout-secs unless explicitly overridden.
+    #[arg(long)]
+    pub stale_request_timeout_secs: Option<u64>,
 
     /// Default tracing level (overridden by `RUST_LOG`).
     #[arg(long, default_value = "info")]
@@ -779,7 +781,10 @@ impl Cli {
             discovery,
             proxy: ProxyConfig {
                 request_timeout_secs: self.server.request_timeout_secs,
-                stream_idle_timeout_secs: self.server.stream_idle_timeout_secs,
+                stream_idle_timeout_secs: self
+                    .server
+                    .stream_idle_timeout_secs
+                    .unwrap_or(self.server.request_timeout_secs),
                 max_attempts: if self.server.disable_retries {
                     NonZeroU32::new(1).unwrap()
                 } else {
@@ -791,7 +796,10 @@ impl Cli {
                 stream_after_prefill: self.server.pd_stream_after_prefill,
             },
             router_inflight_load: InflightLoadConfig {
-                stale_request_timeout_secs: self.server.stale_request_timeout_secs,
+                stale_request_timeout_secs: self
+                    .server
+                    .stale_request_timeout_secs
+                    .unwrap_or(self.server.request_timeout_secs),
             },
         };
         config.validate()?;
@@ -1599,14 +1607,72 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_timeout_defaults_follow_the_request_budget() {
+        for seconds in ["1800", "7200"] {
+            let c = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://worker:30000",
+                "--request-timeout-secs",
+                seconds,
+            ]))
+            .unwrap();
+            let seconds: u64 = seconds.parse().unwrap();
+            assert_eq!(c.proxy.stream_idle_timeout_secs, seconds);
+            assert_eq!(c.router_inflight_load.stale_request_timeout_secs, seconds);
+        }
+    }
+
+    #[test]
+    fn default_request_budget_matches_the_gateway() {
+        let c = into_config_owned(with_model(&["--worker-urls", "http://worker:30000"])).unwrap();
+        assert_eq!(c.proxy.request_timeout_secs, 1800);
+        assert_eq!(c.proxy.stream_idle_timeout_secs, 1800);
+        assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 1800);
+    }
+
+    #[test]
+    fn configured_request_survives_the_former_stale_deadline() {
+        use crate::state::load_monitor::router_inflight_load::{
+            MockClock, RouterInflightLoadRegistry,
+        };
+        use std::{sync::Arc, time::Duration};
+
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://worker:30000",
+            "--request-timeout-secs",
+            "7200",
+        ]))
+        .unwrap();
+        let clock = Arc::new(MockClock::new(std::time::Instant::now()));
+        let registry = RouterInflightLoadRegistry::new(
+            clock.clone(),
+            Duration::from_secs(c.router_inflight_load.stale_request_timeout_secs),
+        );
+        let guard = registry.register(
+            crate::discovery::WorkerId("worker".into()),
+            "http://worker:30000",
+            1,
+            1,
+        );
+        clock.advance(Duration::from_secs(601));
+        assert_eq!(registry.sweep_stale(), 0);
+        assert_eq!(registry.inflight_count(), 1);
+        clock.advance(Duration::from_secs(7200 - 601));
+        assert_eq!(registry.sweep_stale(), 1);
+        drop(guard);
+        assert_eq!(registry.inflight_count(), 0);
+    }
+
+    #[test]
     fn defaults_host_port_and_policy() {
         let c = into_config_owned(with_model(&["--worker-urls", "http://10.0.0.1:30000"])).unwrap();
         assert_eq!(c.server.host, "127.0.0.1");
         assert_eq!(c.server.port, 30000);
         assert_eq!(c.model.policy, PolicyKind::RoundRobin);
         assert_eq!(c.model.id, "qwen3-0.6b");
-        assert_eq!(c.proxy.request_timeout_secs, 300);
-        assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 600);
+        assert_eq!(c.proxy.request_timeout_secs, 1800);
+        assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 1800);
         assert_eq!(c.server.shutdown_drain_secs, 30);
     }
 
@@ -2459,9 +2525,12 @@ mod tests {
             "120",
             "--stale-request-timeout-secs",
             "240",
+            "--stream-idle-timeout-secs",
+            "60",
         ]))
         .unwrap();
         assert_eq!(c.proxy.request_timeout_secs, 120);
+        assert_eq!(c.proxy.stream_idle_timeout_secs, 60);
         assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 240);
     }
 

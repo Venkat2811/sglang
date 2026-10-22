@@ -142,6 +142,22 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
     );
 }
 
+#[test]
+fn app_context_preserves_the_configured_request_lifetime() {
+    let mut cfg = config("");
+    cfg.proxy.request_timeout_secs = 7200;
+    cfg.router_inflight_load.stale_request_timeout_secs = 7200;
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(Duration::from_secs(7200)).unwrap());
+    let ctx = AppContext::new(cfg, tokenizers, proxy, registry, policies);
+    assert_eq!(
+        ctx.router_inflight_load.stale_request_timeout(),
+        Duration::from_secs(7200)
+    );
+}
+
 /// Plain workers at `urls` behind a router whose upstream timeout is 200 ms.
 fn hanging_ctx(urls: &[&str], max_attempts: u32) -> Arc<AppContext> {
     let mut cfg = config("");

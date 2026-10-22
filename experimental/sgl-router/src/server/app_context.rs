@@ -101,19 +101,23 @@ impl AppContext {
         registry: Arc<WorkerRegistry>,
         policies: Arc<PolicyRegistry>,
     ) -> Self {
+        let router_inflight_load = RouterInflightLoadRegistry::new(
+            Arc::new(crate::state::load_monitor::router_inflight_load::SystemTimeClock),
+            std::time::Duration::from_secs(config.router_inflight_load.stale_request_timeout_secs),
+        );
         Self::with_router_inflight_load(
             config,
             tokenizers,
             proxy,
             registry,
             policies,
-            RouterInflightLoadRegistry::with_defaults(),
+            router_inflight_load,
         )
     }
 
     /// Construct an [`AppContext`] with an explicit [`RouterInflightLoadRegistry`].
-    /// Production wires the default (5-minute timeout, SystemTimeClock)
-    /// via [`Self::new`]; tests that exercise the janitor pass a registry
+    /// [`Self::new`] uses the configured budget and a system clock;
+    /// tests that exercise the janitor pass a registry
     /// built with a `MockClock`.
     pub fn with_router_inflight_load(
         config: Config,
