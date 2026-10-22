@@ -1204,6 +1204,8 @@ class HiCacheController:
         """
         Auxiliary function conducting IO operations for prefetching.
         """
+        if str(self.device).startswith("cuda"):
+            torch.cuda.set_device(self.device)
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
@@ -1402,6 +1404,8 @@ class HiCacheController:
         """
         Manage backup operations from host memory to storage backend.
         """
+        if str(self.device).startswith("cuda"):
+            torch.cuda.set_device(self.device)
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
