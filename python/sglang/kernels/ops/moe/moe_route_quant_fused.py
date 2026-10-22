@@ -96,13 +96,20 @@ def route_quant_fused(
     renormalize: bool,
     routed_scaling_factor: float,
     apply_scale: bool,
+    num_valid: "torch.Tensor | None" = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns ``(weights [M, topk] fp32, ids [M, topk] int32, packed [M, topk]
     int32, x_q [M, 3584] fp8_e4m3, x_s [M, 28] int32 row-major packed UE8M0)``.
     Caller must have checked covered(). Winners come out in expert-id-ascending
-    order (the standalone production dispatch's sorted=False)."""
+    order (the standalone production dispatch's sorted=False). ``num_valid``
+    (int32 [1] device scalar) masks rows at and past it: id -1, weight 0."""
     M = scores.shape[0]
     device = scores.device
+    if num_valid is not None:
+        # The graph buffer is int32 [1]; an eager batch may carry a 0-d scalar.
+        num_valid = num_valid.reshape(1)
+        if num_valid.dtype != torch.int32:
+            num_valid = num_valid.to(torch.int32)
     out_w = torch.empty((M, topk), dtype=torch.float32, device=device)
     out_i = torch.empty((M, topk), dtype=torch.int32, device=device)
     out_packed = torch.empty((M, topk), dtype=torch.int32, device=device)
@@ -121,5 +128,7 @@ def route_quant_fused(
         float(routed_scaling_factor),
         bool(renormalize),
         bool(apply_scale),
+        num_valid if num_valid is not None else out_s,
+        num_valid is not None,
     )
     return out_w, out_i, out_packed, out_q, out_s

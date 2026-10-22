@@ -112,6 +112,9 @@ struct RouteRadixParams {
   int renormalize;
   int apply_scale;
   int sorted;
+  // Optional device scalar: rows >= *num_valid (CUDA-graph padding) get id -1
+  // and weight 0 (packed 0xFFFF0000), which no EP rank treats as local.
+  const int32_t* __restrict__ num_valid = nullptr;
 };
 
 // Whole-CTA routing body, callable from other kernels (the fused
@@ -313,13 +316,18 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
     const auto norm = (sum > 0.0f) ? sum : 1.0f;
     if (params.renormalize) w = w / norm;
     if (params.apply_scale) w = w * params.routed_scaling_factor;
+    int32_t out_id = id;
+    if (params.num_valid != nullptr && static_cast<int>(bx) >= *params.num_valid) {
+      out_id = -1;
+      w = 0.0f;
+    }
     params.out_w[bx * params.out_w_stride + rank] = w;
-    params.out_i[bx * params.out_i_stride + rank] = id;
+    params.out_i[bx * params.out_i_stride + rank] = out_id;
     if (params.out_packed != nullptr) {
       // (id << 16) | bf16(w) bits -- RN float->bf16 matches the triton pack.
       const auto bits = static_cast<uint32_t>(__bfloat16_as_ushort(__float2bfloat16_rn(w)));
       params.out_packed[bx * params.out_packed_stride + rank] =
-          static_cast<int32_t>((static_cast<uint32_t>(id) << 16) | bits);
+          static_cast<int32_t>((static_cast<uint32_t>(out_id) << 16) | bits);
     }
   }
 }
