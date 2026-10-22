@@ -27,6 +27,7 @@ s depends only on (B, C) (graph-safe); pieces are at least MIN_PIECE_TILES x 128
 from __future__ import annotations
 
 import functools
+import logging
 import os
 from typing import Optional
 
@@ -35,6 +36,8 @@ import triton
 import triton.language as tl
 
 TILE_KV = 128
+logger = logging.getLogger(__name__)
+_logged: set = set()
 MIN_PIECE_TILES = int(os.environ.get("SGLANG_K3_MLA_WAVE_MIN_PIECE_TILES", "2"))
 
 
@@ -124,9 +127,9 @@ def _merge_kernel(o_ptr, lse_ptr, H, QC, B, S, D: tl.constexpr, BLOCK_S: tl.cons
 
 @functools.lru_cache(maxsize=None)
 def _clusters(device_index: int) -> int:
-    from flashinfer.cute_dsl.utils import get_max_active_clusters
-
-    return get_max_active_clusters(2)
+    """Resident 2-CTA clusters of the MLA kernel: one CTA per SM (it takes ~227 KB of shared memory), so SMs // 2.
+    (cutlass' get_max_active_clusters(2) answers for a trivial kernel and returned 148 on B300 in a fresh process.)"""
+    return torch.cuda.get_device_properties(device_index).multi_processor_count // 2
 
 
 def mla_decode(
@@ -155,6 +158,9 @@ def mla_decode(
     cap = int(os.environ.get("SGLANG_K3_MLA_WAVE_MAX_SPLIT", "32"))
     n_sat = int(os.environ.get("SGLANG_K3_MLA_WAVE_SAT_CLUSTERS", "32"))
     qn, r, s, Bv = plan_rows(B, C, cap, n_sat)
+    if (B, C) not in _logged:
+        _logged.add((B, C))
+        logger.info(f"k3_mla_splits: B={B} clusters={C} full_waves={qn} overflow={r} pieces={s} launch_rows={Bv}")
 
     def stock(qq, bt, sl, gl):
         return M.cute_dsl_mla_decode(
