@@ -546,6 +546,9 @@ class KimiK3MoE(nn.Module):
                 )
                 # mega pre-dispatch consumes raw topk_ids/topk_weights
                 or get_moe_a2a_backend().is_megamoe()
+                # DeepGEMM resolves auto to STANDARD at run time; stating it
+                # here lets the merged EP front (_ep_front) take the routing.
+                or get_moe_runner_backend().is_deep_gemm()
                 else None
             ),
         )
