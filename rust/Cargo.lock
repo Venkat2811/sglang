@@ -995,7 +995,7 @@ dependencies = [
 [[package]]
 name = "dynamo-tokenizers"
 version = "3.1.0"
-source = "git+https://github.com/Venkat2811/frontend-crates.git?rev=a847081c30e44a7406dadbb29f4c2cd96ab46b90#a847081c30e44a7406dadbb29f4c2cd96ab46b90"
+source = "git+https://github.com/Venkat2811/frontend-crates.git?rev=34e5627943637971f1a118973e54022ad12f819f#34e5627943637971f1a118973e54022ad12f819f"
 dependencies = [
  "aho-corasick",
  "anyhow",
