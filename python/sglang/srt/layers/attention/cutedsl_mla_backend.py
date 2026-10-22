@@ -28,6 +28,7 @@ from sglang.kernels.ops.attention.utils import (
     mla_quantize_without_rope_for_fp8,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention import k3_mla_splits
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
@@ -110,6 +111,31 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 "MLA decode."
             )
         bmm1_scale = self._compute_decode_bmm1_scale(layer)
+        if (
+            k3_mla_splits.enabled()
+            and query.dim() == 4
+            and query.shape[1] == 1
+            and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get() is None
+        ):
+            # Same FlashInfer kernel; once the batch exceeds one wave of 2-CTA
+            # clusters the overflow requests run as KV pieces (virtual rows) that
+            # fill the second wave, merged afterwards. Off by default.
+            return k3_mla_splits.mla_decode(
+                query,
+                kv_cache,
+                self.workspace_buffer,
+                block_tables,
+                seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32),
+                max_seq_len,
+                bmm1_scale,
+                (
+                    causal_seqs
+                    if causal_seqs.dtype == torch.int32
+                    else causal_seqs.to(torch.int32)
+                ),
+                cp_world,
+                cp_rank,
+            )
         raw_out, lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
