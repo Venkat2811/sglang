@@ -430,6 +430,27 @@ def _uses_latent_moe(config: KimiLinearConfig) -> bool:
     return config.routed_expert_hidden_size is not None
 
 
+# SGLANG_K3_MEGA_TP=1: run MegaMoE as the routed-expert kernel inside the plain
+# TP path instead of as an EP all-to-all. Every rank keeps every row (attention
+# all-reduce), the fused front, the fused [latent | shared] all-reduce + norm and
+# the gemm_ag up-projection stay as without an a2a backend; each rank feeds
+# MegaMoE one contiguous 1/TP block of the rows and writes the combined latent
+# rows it gets back into its slice of the latent buffer (zeros elsewhere), so the
+# existing latent all-reduce assembles the full latent on every rank. One node
+# (the EP group = the TP group) only.
+_K3_MEGA_TP = os.environ.get("SGLANG_K3_MEGA_TP", "0") == "1"
+
+
+def _mega_tp() -> bool:
+    return _K3_MEGA_TP and get_moe_a2a_backend().is_megamoe()
+
+
+def _moe_tp_path() -> bool:
+    """Whether the MoE region runs on every row of the TP group with a TP
+    reduction (no a2a backend, or MegaMoE under SGLANG_K3_MEGA_TP)."""
+    return get_moe_a2a_backend().is_none() or _mega_tp()
+
+
 def _uses_ep_a2a() -> bool:
     """Whether the MoE all-to-all backend is an EP a2a one, which moves each
     row to its experts directly: the MoE region then consumes whatever rows
@@ -437,7 +458,7 @@ def _uses_ep_a2a() -> bool:
     no TP reduce anywhere in it."""
     _a2a_backend = get_moe_a2a_backend()
     return (
-        _a2a_backend.is_megamoe()
+        (_a2a_backend.is_megamoe() and not _K3_MEGA_TP)
         or _a2a_backend.is_deepep()
         or _a2a_backend.is_mooncake()
         or _a2a_backend.is_ascend_fuseep()
@@ -722,7 +743,7 @@ class KimiK3MoE(nn.Module):
         # control of weight layout.
         if not (get_platform().is_cuda or get_platform().is_hip):
             return
-        if self.shared_experts is not None and get_moe_a2a_backend().is_none():
+        if self.shared_experts is not None and _moe_tp_path():
             mods = [
                 self.shared_experts.gate_up_proj,
                 self.gate,
@@ -753,7 +774,7 @@ class KimiK3MoE(nn.Module):
 
     @cached_property
     def _routed_needs_reduce(self):
-        return self.tp_size > 1 and get_moe_a2a_backend().is_none()
+        return self.tp_size > 1 and _moe_tp_path()
 
     @cached_property
     def _eligible_for_fused_front(self) -> bool:
@@ -767,7 +788,7 @@ class KimiK3MoE(nn.Module):
             and self.shared_experts is not None
             and self._front_w is not None
             and not self._front_is_ep_pair
-            and get_moe_a2a_backend().is_none()
+            and _moe_tp_path()
             and self.shared_experts.down_proj.weight.dtype
             in (torch.bfloat16, torch.float16)
         )
@@ -1307,7 +1328,32 @@ class KimiK3MoE(nn.Module):
             experts.num_local_experts,
         )
 
+    def _forward_routed_mega_tp(self, hidden_states, router_logits, routed_input, latent):
+        """SGLANG_K3_MEGA_TP: every TP rank holds every row. This rank feeds
+        MegaMoE its contiguous 1/TP block of the rows (MegaMoE dispatches them
+        to the expert owners and combines the full top-k sum back here), writes
+        those latent rows and zeros the rest; the latent all-reduce that
+        follows then sums exactly one contribution per row."""
+        topk_output = self.topk(hidden_states, router_logits)
+        n = routed_input.shape[0]
+        world = self.tp_size
+        per = (n + world - 1) // world
+        start = min(n, get_parallel().tp_rank * per)
+        end = min(n, start + per)
+        shard = SimpleNamespace(
+            topk_ids=topk_output.topk_ids[start:end],
+            topk_weights=topk_output.topk_weights[start:end],
+        )
+        y = self._forward_mega_experts(routed_input[start:end], shard)
+        latent.zero_()
+        if end > start:
+            latent[start:end].copy_(y)
+
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
+        if self._use_mega_moe:
+            return self._forward_routed_mega_tp(
+                hidden_states, router_logits, routed_input, latent
+            )
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input, self._route_quant_local_experts())
         try:
@@ -1418,11 +1464,18 @@ class KimiK3MoE(nn.Module):
                 )
             else:
                 self._forward_routed(hidden_states, router_logits, routed_input, latent)
-            with torch.cuda.stream(self.alt_stream):
+            if self._use_mega_moe:
+                # MegaMoE is a persistent whole-grid kernel that synchronizes
+                # with its peers: keep the shared experts and their AR off a
+                # side stream so nothing competes for its SMs.
                 self._forward_shared(gate_up, shared_output)
-                # low-SM pull so the side-stream AR leaves the SMs to the
-                # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
                 k3_ar_fusion.all_reduce_low_sm(shared_output, num_blocks=4, unroll=8)
+            else:
+                with torch.cuda.stream(self.alt_stream):
+                    self._forward_shared(gate_up, shared_output)
+                    # low-SM pull so the side-stream AR leaves the SMs to the
+                    # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
+                    k3_ar_fusion.all_reduce_low_sm(shared_output, num_blocks=4, unroll=8)
             current_stream.wait_stream(self.alt_stream)
             # The latent AR must stay serialized after the shared AR (both
             # reuse the v2 pull semaphores); the join above does it.
