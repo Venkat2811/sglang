@@ -22,7 +22,13 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.environ import envs
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
+from sglang.srt.speculative.ngram_prompt_lookup import (
+    PromptLookup,
+    chain_arrays,
+    chain_from_tree,
+)
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
@@ -112,6 +118,17 @@ class NGRAMWorker(BaseSpecWorker):
         self.device = get_device().device
 
         self.adaptive_controller = None
+        self.chain_draft = envs.SGLANG_NGRAM_CHAIN_DRAFT.get()
+        pld_min_match = envs.SGLANG_NGRAM_PROMPT_LOOKUP_MIN_MATCH.get()
+        self.prompt_lookup = (
+            PromptLookup(min_match=pld_min_match) if pld_min_match > 0 else None
+        )
+        if self.prompt_lookup is not None and not self.chain_draft:
+            raise ValueError(
+                "SGLANG_NGRAM_PROMPT_LOOKUP_MIN_MATCH needs SGLANG_NGRAM_CHAIN_DRAFT=1."
+            )
+        self._pld_steps = 0
+        self._pld_hits = 0
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
@@ -299,6 +316,8 @@ class NGRAMWorker(BaseSpecWorker):
         req_drafts, mask = self.ngram_corpus.batch_get(
             req_ids, batch_tokens, total_lens
         )
+        if self.chain_draft:
+            req_drafts, mask = self._chain_drafts(batch, req_drafts, mask)
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it
@@ -306,6 +325,44 @@ class NGRAMWorker(BaseSpecWorker):
             f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
         )
         return req_drafts, mask
+
+    def _chain_drafts(
+        self, batch: ScheduleBatch, req_drafts: np.ndarray, mask: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        k1 = self.draft_token_num
+        stride = k1
+        use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
+        last_tokens = []
+        chains = []
+        for i, req in enumerate(batch.reqs):
+            tree_tokens = req_drafts[i * k1 : (i + 1) * k1]
+            last_tokens.append(int(tree_tokens[0]))
+            chain = chain_from_tree(
+                tree_tokens, mask[i * k1 * k1 : (i + 1) * k1 * k1], k1
+            )
+            if self.prompt_lookup is not None:
+                pending = (
+                    self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
+                    if use_prev_tokens
+                    else []
+                )
+                self.prompt_lookup.sync(
+                    req.rid, req.origin_input_ids, req.output_ids, pending
+                )
+                match_len, lookup = self.prompt_lookup.draft(req.rid, k1 - 1)
+                self._pld_steps += 1
+                if match_len > 0 and lookup:
+                    chain = lookup
+                    self._pld_hits += 1
+            chains.append(chain)
+        if self.prompt_lookup is not None and self._pld_steps >= 20000:
+            logger.info(
+                "NGRAM prompt lookup: %.1f%% of request-steps drafted from the prompt",
+                100.0 * self._pld_hits / self._pld_steps,
+            )
+            self._pld_steps = 0
+            self._pld_hits = 0
+        return chain_arrays(last_tokens, chains, k1)
 
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
         # Decode-only: extend goes through the plain target forward, and an
@@ -326,7 +383,9 @@ class NGRAMWorker(BaseSpecWorker):
         # Pre-sync: only needs seq_lens_cpu, so build before the blocking
         # accept sync inside _prepare_draft_tokens.
         ones_masks = None
-        if USE_FULL_MASK and not _is_cpu:
+        # Chain-only verify backends (Kimi-K3 MLA + KDA) never read the full mask.
+        use_full_mask = USE_FULL_MASK and not _is_cpu and not self.chain_draft
+        if use_full_mask:
             ones_masks = [
                 torch.ones(
                     (self.draft_token_num, batch.seq_lens_cpu[i]), device=self.device
@@ -355,7 +414,7 @@ class NGRAMWorker(BaseSpecWorker):
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
-        if USE_FULL_MASK and not _is_cpu:
+        if use_full_mask:
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
@@ -536,6 +595,8 @@ class NGRAMWorker(BaseSpecWorker):
             departed_rids = self._prev_decode_rids - cur_rids
             if departed_rids:
                 self.ngram_corpus.erase_match_state(list(departed_rids))
+                if self.prompt_lookup is not None:
+                    self.prompt_lookup.erase(list(departed_rids))
             self._prev_decode_rids = cur_rids
             batch.forward_mode = ForwardMode.DECODE
 

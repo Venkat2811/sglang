@@ -1443,6 +1443,12 @@ class Envs:
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+    # Verify NGRAM drafts as one chain (first-child path) for chain-only verify backends such as
+    # Kimi-K3's MLA + KDA, and skip the full custom mask those backends never read.
+    SGLANG_NGRAM_CHAIN_DRAFT = EnvBool(False)
+    # Prompt-lookup NGRAM drafts over the request's own prompt and output: the minimum suffix match
+    # in tokens (0 = off). Shorter matches fall back to the corpus draft.
+    SGLANG_NGRAM_PROMPT_LOOKUP_MIN_MATCH = EnvInt(0)
 
     # ===================================================================
     # Multimodal processing
