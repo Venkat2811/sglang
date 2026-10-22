@@ -72,6 +72,73 @@ def plan_block_splits(
     torch.clamp((tiles + target - 1) // target, 1, smax, out=out)
 
 
+def _skip_empty_split_stores_enabled() -> bool:
+    return os.environ.get("SGLANG_CUTEDSL_MLA_VAR_SPLIT_SKIP_EMPTY", "1") == "1"
+
+
+_PATCHED_FP8_CLASS = None
+
+# flashinfer 0.7.1 cute-dsl MLA decode, compute warps: a DCP split slot with no K
+# tile stores O = 0 and LSE = -inf. The split reducer reads slot 0 of an empty
+# request and never a slot past the request's nonempty split count, so only
+# slot 0 needs the store; with var split-KV most grid slots are past it.
+_EMPTY_STORE_OLD = """                elif cutlass.const_expr(self.enable_dcp):
+                    self.store_empty_dcp_work(
+                        mO,
+                        mLSE,
+                        mAccO,
+                        mAccLSE,
+                        blk_coord,
+                        q_begin,
+                        valid_q_rows,
+                        tidx,
+                    )
+"""
+_EMPTY_STORE_NEW = """                elif cutlass.const_expr(self.enable_dcp):
+                    if blk_coord[3] == 0:
+                        self.store_empty_dcp_work(
+                            mO,
+                            mLSE,
+                            mAccO,
+                            mAccLSE,
+                            blk_coord,
+                            q_begin,
+                            valid_q_rows,
+                            tidx,
+                        )
+"""
+
+
+def _patched_fp8_class():
+    """Load a copy of flashinfer's fp8 MLA decode module with the empty-slot store
+    limited to slot 0 (written to a real file so the CuTe DSL can read its source)."""
+    global _PATCHED_FP8_CLASS
+    if _PATCHED_FP8_CLASS is not None:
+        return _PATCHED_FP8_CLASS
+    import importlib.util
+    import inspect
+    import tempfile
+
+    from flashinfer.cute_dsl.attention.monolithic import mla_decode_fp8 as base
+
+    src = inspect.getsource(base)
+    if src.count(_EMPTY_STORE_OLD) != 1:
+        raise RuntimeError("flashinfer mla_decode_fp8 changed; empty-slot store patch does not apply")
+    src = src.replace(_EMPTY_STORE_OLD, _EMPTY_STORE_NEW)
+    d = tempfile.mkdtemp(prefix="sglang_cutedsl_mla_vs_")
+    path = os.path.join(d, "mla_decode_fp8_vs.py")
+    with open(path, "w") as f:
+        f.write(src)
+    name = base.__name__ + "_vs"
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    mod.__package__ = base.__package__
+    spec.loader.exec_module(mod)
+    _PATCHED_FP8_CLASS = mod.BlackwellMultiHeadLatentAttentionForwardFP8
+    logger.info("cute-dsl MLA var split-KV: empty split slots past slot 0 skip their store (%s)", path)
+    return _PATCHED_FP8_CLASS
+
+
 class CuteDslMLAVarSplitDecode:
     """Direct launcher of the monolithic cute-dsl MLA decode with var split-KV."""
 
@@ -103,7 +170,20 @@ class CuteDslMLAVarSplitDecode:
         key = (q_dtype, out_dtype)
         k = self._kernels.get(key)
         if k is None:
-            k = self._impl._get_compiled_mla_kernel(
+            k = self._compile(q_dtype, out_dtype)
+            self._kernels[key] = k
+        return k
+
+    def _compile(self, q_dtype: torch.dtype, out_dtype: torch.dtype):
+        patched = _skip_empty_split_stores_enabled() and q_dtype == torch.float8_e4m3fn
+        orig = self._impl.BlackwellMultiHeadLatentAttentionForwardFP8
+        compile_fn = self._impl._get_compiled_mla_kernel
+        if patched:
+            # Compile from a patched copy of the fp8 kernel class; the stock path keeps its own.
+            self._impl.BlackwellMultiHeadLatentAttentionForwardFP8 = _patched_fp8_class()
+            compile_fn = compile_fn.__wrapped__
+        try:
+            return compile_fn(
                 torch_dtype=q_dtype,
                 torch_out_dtype=out_dtype,
                 page_size=self.page_size,
@@ -123,8 +203,8 @@ class CuteDslMLAVarSplitDecode:
                 enable_dcp=True,
                 cp_world=self.cp_world,
             )
-            self._kernels[key] = k
-        return k
+        finally:
+            self._impl.BlackwellMultiHeadLatentAttentionForwardFP8 = orig
 
     def run(
         self,
