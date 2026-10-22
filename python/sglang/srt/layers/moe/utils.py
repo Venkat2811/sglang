@@ -742,10 +742,20 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
     )
 
 
+def k3_mega_tp() -> bool:
+    """SGLANG_K3_MEGA_TP=1 with --moe-a2a-backend megamoe: Kimi-K3 runs MegaMoE
+    as the routed-expert kernel inside the plain TP path (every rank keeps every
+    row), not as an EP all-to-all over row shards (models/kimi_k3.py)."""
+    return (
+        os.environ.get("SGLANG_K3_MEGA_TP", "0") == "1"
+        and get_moe_a2a_backend().is_megamoe()
+    )
+
+
 def is_moe_input_scattered_across_dp_ranks() -> bool:
     """Whether sparse MoE routing runs on a DP-local token shard."""
     return (
-        not get_moe_a2a_backend().is_none()
+        (not get_moe_a2a_backend().is_none() and not k3_mega_tp())
         or should_use_flashinfer_cutlass_moe_fp4_allgather()
         or get_parallel().dwdp_size > 1
     )
