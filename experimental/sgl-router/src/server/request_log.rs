@@ -76,7 +76,7 @@ impl Lifecycle {
         });
         self.emit(
             "admit",
-            json!({"admission_inflight":active,"admission_capacity":capacity,"queue_length":0}),
+            || json!({"admission_inflight":active,"admission_capacity":capacity,"queue_length":0}),
         );
     }
     pub fn route(
@@ -88,7 +88,6 @@ impl Lifecycle {
         streaming: bool,
         bootstrap_room: Option<u64>,
     ) {
-        let extra = json!({"engine_rid":engine_rid,"prefill_url":prefill,"decode_url":decode,"bootstrap_room":bootstrap_room,"candidates":candidates});
         if self.selection.is_empty() {
             self.candidates(candidates.clone(), None);
         }
@@ -102,12 +101,12 @@ impl Lifecycle {
         route.engine_rid = engine_rid.map(str::to_owned);
         route.prefill_url = prefill.into();
         route.decode_url = decode.map(str::to_owned);
-        let candidates = route.candidates.clone();
         drop(route);
         self.observation.lock().unwrap().streaming = streaming;
-        let mut extra = extra;
-        extra["candidates"] = candidates.into();
-        self.emit("route", extra);
+        self.emit("route", || {
+            let route = self.route.lock().unwrap();
+            json!({"engine_rid":engine_rid,"prefill_url":prefill,"decode_url":decode,"bootstrap_room":bootstrap_room,"candidates":route.candidates})
+        });
     }
     pub fn candidates(&self, candidates: Vec<Value>, predicted: Option<u64>) {
         self.selection.record(candidates, predicted);
@@ -115,7 +114,7 @@ impl Lifecycle {
     pub fn progress(&self, source: &'static str) {
         if !self.first.swap(true, Ordering::Relaxed) {
             let _ = self.first_ms.set(self.started.elapsed().as_millis() as u64);
-            self.emit("first_progress", json!({"source":source}));
+            self.emit("first_progress", || json!({"source":source}));
         }
     }
     pub fn fail(&self, reason: &'static str) {
@@ -177,15 +176,18 @@ impl Lifecycle {
             self.fail("response_error_event");
         }
     }
-    fn emit(&self, event: &str, extra: Value) {
+    fn emit(&self, event: &str, extra: impl FnOnce() -> Value) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
         let Some(ctx) = self.context.get() else {
             return;
         };
         let mut fields = json!({"event":event,"request_id":ctx.id,"model_id":ctx.model,"endpoint":ctx.endpoint,"elapsed_ms":self.started.elapsed().as_millis() as u64});
-        if let Value::Object(extra) = extra {
+        if let Value::Object(extra) = extra() {
             fields.as_object_mut().unwrap().extend(extra);
         }
-        tracing::info!(lifecycle_json=%fields,"request_lifecycle");
+        tracing::debug!(lifecycle_json=%fields,"request_lifecycle");
     }
 }
 impl Drop for Lifecycle {
@@ -215,7 +217,7 @@ impl Drop for Lifecycle {
             _ if error => "error",
             _ => "abort",
         };
-        self.emit(event,json!({"engine_rid":route.engine_rid,"prefill_url":route.prefill_url,"decode_url":route.decode_url,
+        self.emit(event,|| json!({"engine_rid":route.engine_rid,"prefill_url":route.prefill_url,"decode_url":route.decode_url,
             "prompt_tokens":prompt_tokens,"completion_tokens":completion_tokens,"finish_reason":finish_reason,"first_progress_ms":self.first_ms.get(),"duration_ms":self.started.elapsed().as_millis() as u64,"reason":self.reason.get().copied().unwrap_or(""),"predicted_cached_tokens":route.predicted.unwrap_or(0),"prediction_known":route.predicted.is_some(),
             "actual_cached_tokens":actual.unwrap_or(0),"actual_cache_known":actual.is_some(),"cache_actual_source":if route.decode_url.is_some() {"prefill_response"}else {"client_response"},"client_reported_cached_tokens":client_actual.unwrap_or(0),"client_cache_known":client_actual.is_some()}));
     }

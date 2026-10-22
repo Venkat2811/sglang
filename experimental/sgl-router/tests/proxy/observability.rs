@@ -124,6 +124,8 @@ async fn lifecycle_records_late_errors_and_admission_cleanup_with_bounded_metric
             "0",
             "--rate-limit-tokens-per-second",
             "1",
+            "--log-level",
+            "debug",
             "--log-format",
             "json",
             "--shutdown-drain-secs",

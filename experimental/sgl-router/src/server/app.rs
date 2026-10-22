@@ -149,25 +149,34 @@ async fn access_log_and_record(
         // them empty and falls back to the status for its outcome, which is all
         // the status can say.
         let log_ctx = resp.extensions().get::<RequestLogContext>();
-        tracing::info!(
-            pod_id = %pod_id(),
-            request_id = %request_id,
-            method = %method,
-            path = %path,
-            status = status.as_u16(),
-            outcome = log_ctx
-                .map(|c| c.outcome)
-                .unwrap_or_else(|| outcome_from_status(status.as_u16()))
-                .as_str(),
-            worker = log_ctx.map(|c| c.worker_url.as_str()).unwrap_or(""),
-            engine_rid = log_ctx
-                .and_then(|c| c.engine_rid.as_deref())
-                .unwrap_or(""),
-            model = log_ctx.map(|c| c.model_id.as_str()).unwrap_or(""),
-            stream = log_ctx.is_some_and(|c| c.streaming),
-            latency_ms,
-            "http_request",
-        );
+        macro_rules! record_request {
+            ($level:ident) => {
+                tracing::$level!(
+                    pod_id = %pod_id(),
+                    request_id = %request_id,
+                    method = %method,
+                    path = %path,
+                    status = status.as_u16(),
+                    outcome = log_ctx
+                        .map(|c| c.outcome)
+                        .unwrap_or_else(|| outcome_from_status(status.as_u16()))
+                        .as_str(),
+                    worker = log_ctx.map(|c| c.worker_url.as_str()).unwrap_or(""),
+                    engine_rid = log_ctx
+                        .and_then(|c| c.engine_rid.as_deref())
+                        .unwrap_or(""),
+                    model = log_ctx.map(|c| c.model_id.as_str()).unwrap_or(""),
+                    stream = log_ctx.is_some_and(|c| c.streaming),
+                    latency_ms,
+                    "http_request",
+                );
+            };
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            record_request!(debug);
+        } else {
+            record_request!(info);
+        }
     }
     resp.map(|body| crate::server::inflight::track_body(body, inflight))
 }
@@ -400,6 +409,68 @@ mod tests {
 
     fn captured(buf: &Arc<Mutex<Vec<u8>>>) -> String {
         String::from_utf8(buf.lock().unwrap().clone()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn lifecycle_and_429_logs_require_debug_without_losing_metrics() {
+        use crate::server::admission::{Admission, RequestScope};
+        for level in [tracing::Level::INFO, tracing::Level::DEBUG] {
+            prime_tracing_callsites();
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(level)
+                .with_writer(VecWriter(buf.clone()))
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let mut ctx = AppContext::stub();
+            ctx.config.server.admission.max_concurrent_requests = Some(1);
+            ctx.admission = Admission::new(&ctx.config.server.admission);
+            let ctx = Arc::new(ctx);
+            let headers = axum::http::HeaderMap::new();
+            let scope = RequestScope::enter_request(&ctx, "/v1/completions", &headers).unwrap();
+            scope.life.progress("worker");
+            assert!(RequestScope::enter_request(&ctx, "/v1/completions", &headers).is_err());
+            scope.life.complete();
+            drop(scope);
+            let response = Router::new()
+                .route("/reject", get(|| async { StatusCode::TOO_MANY_REQUESTS }))
+                .layer(middleware::from_fn_with_state(
+                    ctx.clone(),
+                    access_log_and_record,
+                ))
+                .oneshot(
+                    Request::builder()
+                        .uri("/reject")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            drop(response);
+            assert!(ctx
+                .admission
+                .render_metrics()
+                .contains("outcome=\"rejected\"} 1"));
+            assert!(ctx.metrics.render().contains("status_code=\"429\""));
+            let logs = captured(&buf);
+            assert_eq!(
+                logs.contains("request_lifecycle"),
+                level == tracing::Level::DEBUG,
+                "{logs}"
+            );
+            assert_eq!(
+                logs.contains("http_request"),
+                level == tracing::Level::DEBUG,
+                "{logs}"
+            );
+            if level == tracing::Level::DEBUG {
+                for event in ["admit", "first_progress", "finish", "reject"] {
+                    assert!(logs.contains(event), "{event}: {logs}");
+                }
+            }
+        }
     }
 
     /// Metric labels must stay bounded: standard verbs pass through, but an

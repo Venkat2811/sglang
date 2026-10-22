@@ -162,7 +162,7 @@ impl RequestScope {
                 Ok(scope)
             }
             Err(error) => {
-                tracing::info!(event="reject",request_id=%id,endpoint,reason=error.error_code(),"request_lifecycle");
+                tracing::debug!(event="reject",request_id=%id,endpoint,reason=error.error_code(),"request_lifecycle");
                 Err(error)
             }
         }
