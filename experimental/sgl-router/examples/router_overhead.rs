@@ -23,9 +23,9 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Parser)]
@@ -67,8 +67,11 @@ enum Command {
 }
 
 fn now_ns() -> u64 {
-    static ORIGIN: OnceLock<Instant> = OnceLock::new();
-    ORIGIN.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    // Share a time base with independent process and router-metric samples.
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -90,6 +93,9 @@ impl Default for Timing {
 struct WorkerRecord {
     arrived_ns: u64,
     emitted_ns: Vec<u64>,
+    active_on_arrival: usize,
+    active_at_emission: Vec<usize>,
+    finished_ns: Option<u64>,
     path: String,
     input_ids: bool,
 }
@@ -109,10 +115,20 @@ struct WorkerState {
     bootstrap: u16,
 }
 
-struct Active(Arc<AtomicUsize>);
+struct Active {
+    common: Workers,
+    id: String,
+}
 impl Drop for Active {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.common
+            .records
+            .lock()
+            .unwrap()
+            .get_mut(&self.id)
+            .unwrap()
+            .finished_ns = Some(now_ns());
+        self.common.active.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -156,17 +172,23 @@ async fn generation(
     if total == 0 || total > 8192 {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let active_on_arrival = state.common.active.fetch_add(1, Ordering::SeqCst) + 1;
     state.common.records.lock().unwrap().insert(
         id.clone(),
         WorkerRecord {
             arrived_ns,
             emitted_ns: Vec::with_capacity(total),
+            active_on_arrival,
+            active_at_emission: Vec::with_capacity(total),
+            finished_ns: None,
             path: uri.path().to_owned(),
             input_ids: body.get("input_ids").is_some(),
         },
     );
-    state.common.active.fetch_add(1, Ordering::SeqCst);
-    let active = Active(Arc::clone(&state.common.active));
+    let active = Active {
+        common: state.common.clone(),
+        id: id.clone(),
+    };
     let timing = state.common.timing.lock().unwrap().clone();
     let first = tokio::time::Instant::now() + Duration::from_secs_f64(timing.delay_ms / 1000.0);
     let chunks = stream::unfold(
@@ -190,15 +212,14 @@ async fn generation(
                     ""
                 }
             ));
-            state
-                .common
-                .records
-                .lock()
-                .unwrap()
-                .get_mut(&id)
-                .unwrap()
-                .emitted_ns
-                .push(now_ns());
+            {
+                let mut records = state.common.records.lock().unwrap();
+                let record = records.get_mut(&id).unwrap();
+                record.emitted_ns.push(now_ns());
+                record
+                    .active_at_emission
+                    .push(state.common.active.load(Ordering::SeqCst));
+            }
             Some((
                 Ok::<_, std::io::Error>(wire),
                 (index + 1, state, id, active),
@@ -422,6 +443,19 @@ async fn run(
         .tcp_nodelay(true)
         .timeout(Duration::from_secs(900))
         .build()?;
+    // Keep one connection pool exclusive to each active request through EOF.
+    // Concurrent checkouts from a shared HTTP/1 pool can queue a request
+    // behind a stream that already has response headers.
+    let lane_clients = Arc::new(Mutex::new(
+        (0..concurrency)
+            .map(|_| {
+                reqwest::Client::builder()
+                    .tcp_nodelay(true)
+                    .timeout(Duration::from_secs(900))
+                    .build()
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    ));
     client
         .delete(format!("{workers}/bench/stats"))
         .send()
@@ -453,16 +487,24 @@ async fn run(
     let wall_start = now_ns();
     let records: Vec<_> = stream::iter((0..requests).map(|index| {
         let (band, body) = &prepared[index % prepared.len()];
-        request(
-            client.clone(),
-            format!("{router}/v1/chat/completions"),
-            band.clone(),
-            body.clone(),
-        )
+        let clients = Arc::clone(&lane_clients);
+        let url = format!("{router}/v1/chat/completions");
+        let band = band.clone();
+        let body = body.clone();
+        async move {
+            let client = clients.lock().unwrap().pop().expect("one client per lane");
+            let record = request(client.clone(), url, band, body).await;
+            clients.lock().unwrap().push(client);
+            record
+        }
     }))
     .buffer_unordered(concurrency)
     .collect()
     .await;
+    ensure!(
+        lane_clients.lock().unwrap().len() == concurrency,
+        "client lease leaked"
+    );
     let cpu_seconds = (cpu_ticks(router_pid)? - cpu_start) as f64 / ticks_per_second;
     let wall_seconds = (now_ns() - wall_start) as f64 / 1e9;
     let snapshot: Value = client
