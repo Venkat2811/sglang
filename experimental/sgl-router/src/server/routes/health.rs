@@ -70,7 +70,7 @@ pub async fn server_info(State(ctx): State<Arc<AppContext>>) -> axum::Json<serde
     axum::Json(serde_json::json!({
         "served_model_name": ctx.config.model.id,
         "worker_count": ctx.registry.len(),
-        "max_concurrent_requests": ctx.config.server.admission.max_concurrent_requests,
+        "max_concurrent_requests": ctx.admission.capacity(),
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }

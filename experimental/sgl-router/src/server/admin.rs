@@ -75,12 +75,84 @@ fn redact_url(url: &str) -> String {
 struct Cap {
     max_concurrent_requests: usize,
 }
-async fn cap(State(ctx): State<Arc<AppContext>>, Json(body): Json<Cap>) -> Json<Value> {
+async fn cap(
+    State(ctx): State<Arc<AppContext>>,
+    Json(body): Json<Cap>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if body.max_concurrent_requests == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"max_concurrent_requests must be greater than zero"})),
+        ));
+    }
     let previous = ctx.admission.capacity();
     ctx.admission
         .set_capacity(Some(body.max_concurrent_requests));
     tracing::info!(previous_capacity=?previous,capacity=?ctx.admission.capacity(),inflight=ctx.admission.active(),"admission cap changed");
-    Json(
+    Ok(Json(
         json!({"max_concurrent_requests":ctx.admission.capacity(),"inflight":ctx.admission.active()}),
-    )
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn context() -> Arc<AppContext> {
+        let mut ctx = AppContext::stub();
+        ctx.config.server.admission.max_concurrent_requests = Some(2);
+        ctx.admission = crate::server::admission::Admission::new(&ctx.config.server.admission);
+        Arc::new(ctx)
+    }
+
+    async fn put_cap(ctx: Arc<AppContext>, value: usize) -> axum::response::Response {
+        router(ctx)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/cap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"max_concurrent_requests":value}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn zero_cap_is_rejected_without_disabling_admission() {
+        let ctx = context();
+        assert_eq!(
+            put_cap(ctx.clone(), 0).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(ctx.admission.capacity(), Some(2));
+        assert_eq!(put_cap(ctx.clone(), 1).await.status(), StatusCode::OK);
+        assert_eq!(ctx.admission.capacity(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn server_info_reports_the_live_admin_cap() {
+        let ctx = context();
+        assert_eq!(put_cap(ctx.clone(), 3).await.status(), StatusCode::OK);
+        let response = crate::server::app::build_router(ctx)
+            .oneshot(
+                Request::builder()
+                    .uri("/server_info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["max_concurrent_requests"], 3);
+    }
 }
