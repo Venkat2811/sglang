@@ -153,7 +153,7 @@ def fused_experts_deepep_ll_to_flashinfer_mxfp4(
             device=hidden_states.device,
             dtype=torch.bfloat16,
         )
-    deepep_ll_scatter(gemm2_out, row_map, out, perm=permuted_idx, masked_m=masked_m)
+    deepep_ll_scatter(gemm2_out, row_map, out, perm=permuted_idx)
     return DeepEPLLCombineInput(
         hidden_states=out, topk_ids=topk_ids, topk_weights=topk_weights
     )
