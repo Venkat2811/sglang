@@ -23,6 +23,7 @@ sets ``smax`` as ``xN`` (N times the stock split) or an absolute count
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import os
@@ -146,10 +147,18 @@ class CuteDslMLAVarSplitDecode:
                  qk_rope_head_dim: int, page_size: int, cp_world: int):
         from flashinfer.cute_dsl.attention.monolithic import mla_decode as impl
         from flashinfer.cute_dsl.attention.monolithic.mla_helpers import MAX_SPLITS
-        from flashinfer.utils import device_support_pdl
+        from flashinfer.utils import device_support_pdl, get_compute_capability
 
         self._impl = impl
         self._max_splits = MAX_SPLITS
+        # flashinfer 0.7.2: the compile entry takes the target arch first. Its stock
+        # launches size the split reducer to the split count, but a var split-KV
+        # kernel must keep the generic reducer (MAX_SPLITS), as in 0.7.1.
+        self._arch = None
+        if "arch" in inspect.signature(impl._get_compiled_mla_kernel).parameters:
+            from flashinfer.cute_dsl.utils import cute_dsl_compile_arch
+
+            self._arch = cute_dsl_compile_arch(*get_compute_capability(device))
         self.num_sms = impl.get_num_sm(device)
         self.num_heads = num_heads
         self.kv_lora_rank = kv_lora_rank
@@ -183,7 +192,9 @@ class CuteDslMLAVarSplitDecode:
             self._impl.BlackwellMultiHeadLatentAttentionForwardFP8 = _patched_fp8_class()
             compile_fn = compile_fn.__wrapped__
         try:
+            extra = {} if self._arch is None else {"arch": self._arch}
             return compile_fn(
+                **extra,
                 torch_dtype=q_dtype,
                 torch_out_dtype=out_dtype,
                 page_size=self.page_size,
