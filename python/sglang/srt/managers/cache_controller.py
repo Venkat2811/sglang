@@ -355,6 +355,11 @@ class HiCacheController:
         self.host_mem_release_queue: Optional[Queue[torch.Tensor]] = None
 
         self.device = self.mem_pool_device.device
+        # The rank's GPU index, read on the rank's own thread. self.device can be the
+        # bare string "cuda", which torch.cuda.set_device rejects.
+        self.storage_thread_device = (
+            torch.cuda.current_device() if str(self.device).startswith("cuda") else None
+        )
         self.transfer_layer_id_max = self.mem_pool_device.layer_num
         self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
@@ -1204,8 +1209,8 @@ class HiCacheController:
         """
         Auxiliary function conducting IO operations for prefetching.
         """
-        if str(self.device).startswith("cuda"):
-            torch.cuda.set_device(self.device)
+        if self.storage_thread_device is not None:
+            torch.cuda.set_device(self.storage_thread_device)
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
@@ -1404,8 +1409,8 @@ class HiCacheController:
         """
         Manage backup operations from host memory to storage backend.
         """
-        if str(self.device).startswith("cuda"):
-            torch.cuda.set_device(self.device)
+        if self.storage_thread_device is not None:
+            torch.cuda.set_device(self.storage_thread_device)
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
