@@ -36,13 +36,14 @@ if TYPE_CHECKING:
 def _uniform_rows() -> bool:
     """Whether every EP rank dispatches at most as many tokens as this one.
 
-    True inside decode graph capture and the FlashInfer autotune pass when the
-    DP groups replay one synchronized bucket (or there is one DP group: equal
-    SP-MoE shards). Eager forwards keep the static slab bound.
+    Opt-in (SGLANG_DEEPEP_MXFP4_UNIFORM_ROWS=1): True inside decode graph
+    capture and the FlashInfer autotune pass when the DP groups replay one
+    synchronized bucket (or there is one DP group: equal SP-MoE shards). Eager
+    forwards keep the static slab bound. On HGX B300 (EP8, cap 16) the static
+    bound measured as fast, so it stays the default.
     """
-    forced = envs.SGLANG_DEEPEP_MXFP4_UNIFORM_ROWS.get()
-    if forced is not None:
-        return forced
+    if not envs.SGLANG_DEEPEP_MXFP4_UNIFORM_ROWS.get():
+        return False
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         _flashinfer_autotune_active,
     )
